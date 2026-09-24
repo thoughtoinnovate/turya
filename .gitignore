@@ -1,0 +1,10 @@
+target/
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+*.pem
+*.key
+*.log
+.DS_Store
