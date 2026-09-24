@@ -28,7 +28,7 @@
 ## Step 0: Workspace Setup & Cargo Initialization
 
 ### 0.1 Create Root `Cargo.toml`
-- **File**: `/home/hunk/work/playground/Cargo.toml`
+- **File**: `/home/dev/workspace/turya/Cargo.toml`
 - **Action**: Create new file.
 - **Content**:
 ```toml
@@ -71,7 +71,7 @@ cargo check
 This crate defines all bidirectional commands (UI $\rightarrow$ Engine) and events (Engine $\rightarrow$ UI).
 
 ### 1.1 Create `crates/turya-protocol/Cargo.toml`
-- **File**: `/home/hunk/work/playground/crates/turya-protocol/Cargo.toml`
+- **File**: `/home/dev/workspace/turya/crates/turya-protocol/Cargo.toml`
 - **Content**:
 ```toml
 [package]
@@ -85,7 +85,7 @@ serde_json = { workspace = true }
 ```
 
 ### 1.2 Create `crates/turya-protocol/src/lib.rs`
-- **File**: `/home/hunk/work/playground/crates/turya-protocol/src/lib.rs`
+- **File**: `/home/dev/workspace/turya/crates/turya-protocol/src/lib.rs`
 - **Content**:
 ```rust
 use serde::{Deserialize, Serialize};
@@ -211,7 +211,7 @@ cargo test -p turya-protocol
 Built-in primitive tools: `view_file`, `write_file`, `edit_file`, and `run_bash`.
 
 ### 2.1 Create `crates/turya-tools/Cargo.toml`
-- **File**: `/home/hunk/work/playground/crates/turya-tools/Cargo.toml`
+- **File**: `/home/dev/workspace/turya/crates/turya-tools/Cargo.toml`
 - **Content**:
 ```toml
 [package]
@@ -228,7 +228,7 @@ thiserror = { workspace = true }
 ```
 
 ### 2.2 Create `crates/turya-tools/src/lib.rs`
-- **File**: `/home/hunk/work/playground/crates/turya-tools/src/lib.rs`
+- **File**: `/home/dev/workspace/turya/crates/turya-tools/src/lib.rs`
 - **Content**:
 ```rust
 use async_trait::async_trait;
@@ -398,7 +398,7 @@ cargo check -p turya-tools
 The microkernel: Master Agentic Loop, Permission Broker, and Provider Abstraction.
 
 ### 3.1 Create `crates/turya-core/Cargo.toml`
-- **File**: `/home/hunk/work/playground/crates/turya-core/Cargo.toml`
+- **File**: `/home/dev/workspace/turya/crates/turya-core/Cargo.toml`
 - **Content**:
 ```toml
 [package]
@@ -417,7 +417,7 @@ tracing = { workspace = true }
 ```
 
 ### 3.2 Create `crates/turya-core/src/provider.rs`
-- **File**: `/home/hunk/work/playground/crates/turya-core/src/provider.rs`
+- **File**: `/home/dev/workspace/turya/crates/turya-core/src/provider.rs`
 - **Content**:
 ```rust
 use async_trait::async_trait;
@@ -463,7 +463,7 @@ impl LlmProvider for MockProvider {
 ```
 
 ### 3.3 Create `crates/turya-core/src/permissions.rs`
-- **File**: `/home/hunk/work/playground/crates/turya-core/src/permissions.rs`
+- **File**: `/home/dev/workspace/turya/crates/turya-core/src/permissions.rs`
 - **Content**:
 ```rust
 use turya_protocol::{PermissionDecision, PermissionMode, RiskLevel};
@@ -516,7 +516,7 @@ impl PermissionBroker {
 ```
 
 ### 3.4 Create `crates/turya-core/src/engine.rs`
-- **File**: `/home/hunk/work/playground/crates/turya-core/src/engine.rs`
+- **File**: `/home/dev/workspace/turya/crates/turya-core/src/engine.rs`
 - **Content**:
 ```rust
 use crate::permissions::PermissionBroker;
@@ -535,14 +535,14 @@ pub struct EngineState {
 
 pub struct TuryaEngine {
     provider: Arc<dyn LlmProvider>,
-    tools: Arc<dyn turya_protocol::ToolProvider>, // Strict Dependency Inversion
+    tools: Arc<ToolRegistry>,
     permissions: Arc<PermissionBroker>,
 }
 
 impl TuryaEngine {
     pub fn new(
         provider: Arc<dyn LlmProvider>, 
-        tools: Arc<dyn turya_protocol::ToolProvider>, 
+        tools: Arc<ToolRegistry>, 
         mode: PermissionMode
     ) -> Self {
         Self {
@@ -638,7 +638,7 @@ impl TuryaEngine {
 ```
 
 ### 3.5 Create `crates/turya-core/src/lib.rs`
-- **File**: `/home/hunk/work/playground/crates/turya-core/src/lib.rs`
+- **File**: `/home/dev/workspace/turya/crates/turya-core/src/lib.rs`
 - **Content**:
 ```rust
 pub mod engine;
@@ -670,7 +670,8 @@ mod tests {
             ],
         });
 
-        let engine = TuryaEngine::new(mock_provider, PermissionMode::Open);
+        let tools = Arc::new(turya_tools::ToolRegistry::standard());
+        let engine = TuryaEngine::new(mock_provider, tools, PermissionMode::Open);
         let (event_tx, mut event_rx) = mpsc::channel(32);
         let (_perm_tx, perm_rx) = mpsc::channel(1);
 
@@ -713,7 +714,7 @@ cargo test -p turya-core
 Decouples the Core Engine from any UI using an event-driven channel interface.
 
 ### 4.1 Create `crates/turya-server/Cargo.toml`
-- **File**: `/home/hunk/work/playground/crates/turya-server/Cargo.toml`
+- **File**: `/home/dev/workspace/turya/crates/turya-server/Cargo.toml`
 - **Content**:
 ```toml
 [package]
@@ -730,7 +731,7 @@ tracing = { workspace = true }
 ```
 
 ### 4.2 Create `crates/turya-server/src/lib.rs`
-- **File**: `/home/hunk/work/playground/crates/turya-server/src/lib.rs`
+- **File**: `/home/dev/workspace/turya/crates/turya-server/src/lib.rs`
 - **Content**:
 ```rust
 use turya_core::TuryaEngine;
@@ -742,8 +743,8 @@ pub struct TuryaSession {
     engine: Arc<TuryaEngine>,
     cmd_rx: mpsc::Receiver<TuryaCommand>,
     event_tx: mpsc::Sender<TuryaEvent>,
-    perm_tx: mpsc::Sender<(String, PermissionDecision)>,
-    perm_rx: Option<mpsc::Receiver<(String, PermissionDecision)>>,
+    active_perm_tx: Option<mpsc::Sender<(String, PermissionDecision)>>,
+    turn_counter: usize,
 }
 
 impl TuryaSession {
@@ -752,38 +753,41 @@ impl TuryaSession {
         cmd_rx: mpsc::Receiver<TuryaCommand>,
         event_tx: mpsc::Sender<TuryaEvent>,
     ) -> Self {
-        let (perm_tx, perm_rx) = mpsc::channel(16);
         Self {
             engine,
             cmd_rx,
             event_tx,
-            perm_tx,
-            perm_rx: Some(perm_rx),
+            active_perm_tx: None,
+            turn_counter: 0,
         }
     }
 
     pub async fn run_loop(mut self) {
-        let mut perm_rx = self.perm_rx.take().unwrap();
-
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
                 TuryaCommand::SubmitPrompt { prompt, mode } => {
                     let engine = self.engine.clone();
                     let event_tx = self.event_tx.clone();
-                    // Each turn takes ownership of the perm_rx or shares a dispatcher
-                    let (turn_perm_tx, turn_perm_rx) = mpsc::channel(8);
                     
-                    // Proxy permissions
-                    let perm_tx_clone = self.perm_tx.clone();
+                    // Route permission decisions specifically for this active turn
+                    let (turn_perm_tx, turn_perm_rx) = mpsc::channel(16);
+                    self.active_perm_tx = Some(turn_perm_tx);
+
+                    let turn_id = format!("turn_{}", self.turn_counter);
+                    self.turn_counter += 1;
 
                     tokio::spawn(async move {
-                        engine.run_turn("turn_1", &prompt, mode, event_tx, turn_perm_rx).await;
+                        engine.run_turn(&turn_id, &prompt, mode, event_tx, turn_perm_rx).await;
                     });
                 }
                 TuryaCommand::ResolvePermission { request_id, decision } => {
-                    let _ = self.perm_tx.send((request_id, decision)).await;
+                    // Forward permission decision directly to the active turn
+                    if let Some(ref tx) = self.active_perm_tx {
+                        let _ = tx.send((request_id, decision)).await;
+                    }
                 }
                 TuryaCommand::AbortTurn => {
+                    self.active_perm_tx = None;
                     let _ = self.event_tx.send(TuryaEvent::Error { message: "Turn aborted by user".to_string() }).await;
                 }
                 _ => {}
@@ -805,7 +809,7 @@ cargo check -p turya-server
 The responsive Terminal UI built with `ratatui` and `crossterm`.
 
 ### 5.1 Create `crates/turya-tui/Cargo.toml`
-- **File**: `/home/hunk/work/playground/crates/turya-tui/Cargo.toml`
+- **File**: `/home/dev/workspace/turya/crates/turya-tui/Cargo.toml`
 - **Content**:
 ```toml
 [package]
@@ -822,7 +826,7 @@ futures = { workspace = true }
 ```
 
 ### 5.2 Create `crates/turya-tui/src/lib.rs`
-- **File**: `/home/hunk/work/playground/crates/turya-tui/src/lib.rs`
+- **File**: `/home/dev/workspace/turya/crates/turya-tui/src/lib.rs`
 - **Content**:
 ```rust
 use crossterm::{
@@ -999,7 +1003,7 @@ cargo check -p turya-tui
 The unified binary combining Engine, Mock/Anthropic Provider, Server, and TUI.
 
 ### 6.1 Create `crates/turya-cli/Cargo.toml`
-- **File**: `/home/hunk/work/playground/crates/turya-cli/Cargo.toml`
+- **File**: `/home/dev/workspace/turya/crates/turya-cli/Cargo.toml`
 - **Content**:
 ```toml
 [package]
@@ -1009,6 +1013,7 @@ edition = "2021"
 
 [dependencies]
 turya-protocol = { path = "../turya-protocol" }
+turya-tools = { path = "../turya-tools" }
 turya-core = { path = "../turya-core" }
 turya-server = { path = "../turya-server" }
 turya-tui = { path = "../turya-tui" }
@@ -1017,12 +1022,13 @@ clap = { version = "4.5", features = ["derive"] }
 ```
 
 ### 6.2 Create `crates/turya-cli/src/main.rs`
-- **File**: `/home/hunk/work/playground/crates/turya-cli/src/main.rs`
+- **File**: `/home/dev/workspace/turya/crates/turya-cli/src/main.rs`
 - **Content**:
 ```rust
 use clap::Parser;
 use turya_core::{LlmProvider, TuryaEngine, MockProvider, ProviderStep};
 use turya_protocol::{PermissionMode, ToolCall};
+use turya_tools::ToolRegistry;
 use turya_server::TuryaSession;
 use turya_tui::TuiApp;
 use std::sync::Arc;
@@ -1053,7 +1059,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     });
 
-    let engine = Arc::new(TuryaEngine::new(mock_provider, PermissionMode::ReviewForMe));
+    let tools = Arc::new(ToolRegistry::standard());
+    let engine = Arc::new(TuryaEngine::new(mock_provider, tools, PermissionMode::ReviewForMe));
 
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (event_tx, event_rx) = mpsc::channel(64);

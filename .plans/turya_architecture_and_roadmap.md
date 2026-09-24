@@ -147,7 +147,7 @@ Because the core engine is decoupled, streaming events (like `TokenDelta` or `St
 ## 3. Performance & Low-End Machine Optimizations (The Rust Edge)
 
 To ensure Turya feels instantaneous even on a 10-year-old laptop, the architecture enforces strict performance constraints:
-1. **Zero-Cost Dependency Injection (Microkernel)**: `turya-core` is entirely decoupled. It communicates with plugins (tools, providers) using trait objects (`Arc<dyn ToolProvider>`), allowing the core binary to remain incredibly small.
+1. **Zero-Cost Dependency Injection (Microkernel)**: `turya-core` is entirely decoupled. It communicates with plugins (tools, providers) using registries and providers (`Arc<ToolRegistry>`, `Arc<dyn LlmProvider>`), allowing the core binary to remain incredibly small.
 2. **Trimmed Async Runtimes**: We strictly avoid the `tokio = { features = ["full"] }` trap. We only compile `rt-multi-thread`, `net`, and `fs`, reducing the final statically linked binary size by ~40%.
 3. **I/O Bound Caching (SQLite WAL Mode)**: All session events stream to `turya.db`. To prevent disk I/O bottlenecks on old HDDs, Turya enforces SQLite Write-Ahead Logging (WAL) mode and batches inserts asynchronously.
 4. **Memory-Mapped Files (`memmap2`)**: When Turya needs to parse a 5GB log file or CSV for a Wasm plugin, it uses memory-mapping (`mmap`). This avoids loading the entire file into RAM, entirely preventing Out-Of-Memory (OOM) crashes on low-spec machines.
