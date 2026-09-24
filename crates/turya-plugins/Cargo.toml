@@ -1,0 +1,15 @@
+[package]
+name = "turya-plugins"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+wasm = ["extism"]
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+extism = { workspace = true, optional = true }

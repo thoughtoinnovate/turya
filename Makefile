@@ -33,4 +33,4 @@ e2e:
 	@echo "Starting E2E simulation with turya-sim-llm..."
 	# We pass TURYA_SIM_MODE to force the engine to use the deterministic MockProvider
 	# rather than reaching out to Anthropic/OpenAI, ensuring tests are free and fast.
-	TURYA_SIM_MODE=1 cargo test --workspace --test '*' --features "sim-llm" -- --nocapture
+	TURYA_SIM_MODE=1 cargo test --workspace -- --nocapture

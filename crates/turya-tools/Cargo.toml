@@ -1,0 +1,11 @@
+[package]
+name = "turya-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+turya-protocol = { path = "../turya-protocol" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

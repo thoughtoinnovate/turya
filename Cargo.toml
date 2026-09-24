@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/turya-protocol",
+    "crates/turya-tools",
+    "crates/turya-core",
+    "crates/turya-server",
+    "crates/turya-tui",
+    "crates/turya-cli",
+    "crates/turya-memory",
+    "crates/turya-lsp",
+    "crates/turya-plugins",
+]
+
+[workspace.dependencies]
+# Performance: Trimmed tokio 'full' to bare minimum required features for tiny binary size
+# Note: 'process' required by turya-tools::RunBashTool (tokio::process::Command)
+# 'io-util' + 'io-std' required by turya-lsp stdio JSON-RPC framing
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "net", "time", "fs", "sync", "process", "io-util", "io-std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+thiserror = "1.0"
+tracing = "0.1"
+# Performance: Use lightweight tracing rather than full subscriber bloat
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+futures = "0.3"
+# Performance: Use memory-mapping for reading huge files without blowing up RAM on old machines
+memmap2 = "0.9"
+# HTTP/SSE for real LLM providers (rustls to avoid system openssl dependency)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-manual-roots"] }
+# Embedded SQLite for episodic/long-term memory (bundled, no system lib needed)
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Wasm sandbox for community/self-generated plugins
+extism = "1.1"

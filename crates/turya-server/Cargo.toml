@@ -1,0 +1,11 @@
+[package]
+name = "turya-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+turya-protocol = { path = "../turya-protocol" }
+turya-core = { path = "../turya-core" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
