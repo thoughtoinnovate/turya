@@ -9,7 +9,7 @@
 
 ### Rule 1.1: Never Commit Personal System Home Paths
 - **FORBIDDEN**: Never write, hardcode, or commit personal system filesystem paths such as:
-  - `/home/<username>/` (e.g., `/home/hunk/...`, `/home/john/...`)
+  - `/home/<username>/` (e.g., `/home/user/...`, `/home/developer/...`)
   - `/Users/<username>/`
   - `C:\Users\<username>\`
   - Any local directory structures tied to a specific developer's machine.
