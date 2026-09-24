@@ -6,11 +6,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-pub struct EngineState {
-    pub permission_broker: PermissionBroker,
-    pub pending_permission: Option<(String, tokio::sync::oneshot::Sender<PermissionDecision>)>,
-}
-
 pub struct TuryaEngine {
     provider: Arc<dyn LlmProvider>,
     tools: Arc<ToolRegistry>,
