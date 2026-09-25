@@ -86,6 +86,13 @@ impl SlashRegistry {
                 kind: CommandKind::Local,
                 source: CommandSource::Builtin,
             },
+            SlashCommand {
+                name: "thinking",
+                description: "Toggle reasoning visibility",
+                hint: "",
+                kind: CommandKind::Local,
+                source: CommandSource::Builtin,
+            },
         ] {
             reg.register(cmd);
         }
@@ -194,7 +201,7 @@ mod tests {
     #[test]
     fn builtins_registered_once() {
         let reg = registry();
-        assert_eq!(reg.filter("").len(), 5);
+        assert_eq!(reg.filter("").len(), 6);
         let mut dup = registry();
         dup.register(SlashCommand {
             name: "models",
@@ -203,7 +210,7 @@ mod tests {
             kind: CommandKind::Local,
             source: CommandSource::Plugin,
         });
-        assert_eq!(dup.filter("").len(), 5);
+        assert_eq!(dup.filter("").len(), 6);
         assert_eq!(
             dup.get("models").unwrap().description,
             "Browse providers & switch model"
@@ -216,7 +223,10 @@ mod tests {
         let names: Vec<_> = reg.filter("mo").iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["models"]);
         let all: Vec<_> = reg.filter("").iter().map(|c| c.name).collect();
-        assert_eq!(all, vec!["auth", "clear", "efforts", "help", "models"]);
+        assert_eq!(
+            all,
+            vec!["auth", "clear", "efforts", "help", "models", "thinking"]
+        );
         let ci: Vec<_> = reg.filter("MO").iter().map(|c| c.name).collect();
         assert_eq!(ci, vec!["models"]);
         assert!(reg.filter("zzz").is_empty());
@@ -246,7 +256,7 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "auth");
         // Bare slash lists everything.
-        assert_eq!(c.matches("/", &reg).len(), 5);
+        assert_eq!(c.matches("/", &reg).len(), 6);
     }
 
     #[test]
@@ -259,8 +269,8 @@ mod tests {
         // Out-of-range selection clamps to last row.
         let all = c.matches("/", &reg);
         let rows = popup_rows(&all, 99);
-        assert_eq!(rows.len(), 5);
-        assert!(rows[4].starts_with("❯"));
+        assert_eq!(rows.len(), 6);
+        assert!(rows[5].starts_with("❯"));
         assert!(rows[0].starts_with("  "));
         assert!(popup_rows(&[], 0).is_empty());
     }

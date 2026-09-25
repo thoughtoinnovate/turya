@@ -287,6 +287,17 @@ impl HostServices {
                     .await;
                 true
             }
+            TuryaCommand::GetProviderState => {
+                let (provider, model, via) = self.describe_selection();
+                events
+                    .send(TuryaEvent::ProviderState {
+                        provider,
+                        model,
+                        via,
+                    })
+                    .await;
+                true
+            }
             TuryaCommand::BeginAuthFlow { provider, method } => {
                 self.begin_flow(provider.clone(), method.clone(), events)
                     .await;
@@ -377,12 +388,19 @@ impl HostServices {
             Ok(p) => {
                 self.engine.set_provider(p);
                 HostConfig {
-                    provider: Some(id),
-                    model: Some(model),
+                    provider: Some(id.clone()),
+                    model: Some(model.clone()),
                 }
                 .save(&self.config_path);
-                // Optimistic toast is rendered client-side on dispatch;
-                // failures arrive as Error events above.
+                // Push truth (not optimism): clients correct their labels here.
+                let (_, _, via) = self.describe_selection();
+                events
+                    .send(TuryaEvent::ProviderState {
+                        provider: id,
+                        model,
+                        via,
+                    })
+                    .await;
             }
             Err(e) => {
                 events
@@ -392,6 +410,53 @@ impl HostServices {
                     .await;
             }
         }
+    }
+
+    /// Current selection + credential source, without touching the network
+    /// (no refresh, no listing). Answers `GetProviderState`.
+    fn describe_selection(&self) -> (String, String, String) {
+        let cfg = HostConfig::load(&self.config_path);
+        let id = cfg.provider.unwrap_or_else(|| "anthropic".to_string());
+        let model = cfg.model.unwrap_or_else(|| {
+            self.registry
+                .get(&id)
+                .and_then(|p| p.models().first().map(|m| m.id.clone()))
+                .unwrap_or_default()
+        });
+        (id.clone(), model, self.credential_via(&id))
+    }
+
+    /// Credential provenance without resolving (resolving may refresh over
+    /// the network — too heavy for a status query).
+    fn credential_via(&self, provider: &str) -> String {
+        let plugin = match self.registry.get(provider) {
+            Some(p) => p,
+            None => return "mock".to_string(),
+        };
+        let env_hit = plugin.auth_methods().iter().any(|m| match m {
+            turya_core::AuthMethodKind::ApiKey { env_var } => std::env::var(env_var)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false),
+            _ => false,
+        });
+        if env_hit {
+            return "env".to_string();
+        }
+        if self
+            .store
+            .get(&turya_auth::api_key_account(provider))
+            .is_some()
+        {
+            return "stored-key".to_string();
+        }
+        if self
+            .store
+            .get(&turya_auth::oauth_refresh_account(provider))
+            .is_some()
+        {
+            return "oauth".to_string();
+        }
+        "mock".to_string()
     }
 
     async fn begin_flow(&self, provider: String, method: String, events: &HostEventSink) {
@@ -860,8 +925,14 @@ mod tests {
         out
     }
 
+    /// Env vars are process-global: tests that set/remove provider keys and
+    /// tests that assert their absence must never run concurrently.
+    /// Async-aware mutex: never hold a std guard across awaits.
+    static ENV_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn list_providers_without_creds_uses_static() {
+        let _guard = ENV_GUARD.lock().await;
         let (host, tx, mut rx) = harness();
         let sink = HostEventSink::new(tx);
         // No creds configured: router must still answer from static lists
@@ -925,6 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn switch_accepts_cached_live_only_model() {
+        let _guard = ENV_GUARD.lock().await;
         // Regression: the /models browser offered gemini-flash-latest (live)
         // but the switch rejected it (static-only validation).
         let saved_env = std::env::var("GEMINI_API_KEY").ok();
@@ -1049,6 +1121,74 @@ mod tests {
                 .await
         );
         assert!(!host.handle(&TuryaCommand::AbortTurn, &sink).await);
+    }
+
+    #[tokio::test]
+    async fn get_provider_state_reports_defaults_offline() {
+        // No config file, no creds: defaults without touching the network.
+        let _ = std::fs::remove_file("/tmp/turya-host-router-test-config.toml");
+        let (host, tx, mut rx) = harness();
+        let sink = HostEventSink::new(tx);
+        assert!(host.handle(&TuryaCommand::GetProviderState, &sink).await);
+        let evts = drain(&mut rx);
+        let state = evts.iter().find_map(|e| match e {
+            TuryaEvent::ProviderState {
+                provider,
+                model,
+                via,
+            } => Some((provider.clone(), model.clone(), via.clone())),
+            _ => None,
+        });
+        let (provider, model, via) = state.expect("ProviderState event");
+        assert_eq!(provider, "anthropic");
+        assert!(!model.is_empty());
+        assert_eq!(via, "mock");
+    }
+
+    #[tokio::test]
+    async fn successful_switch_pushes_provider_state() {
+        let _guard = ENV_GUARD.lock().await;
+        let saved = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::set_var("ANTHROPIC_API_KEY", "fake-key-for-offline-test");
+        let _ = std::fs::remove_file("/tmp/turya-host-router-test-config.toml");
+        let (host, tx, mut rx) = harness();
+        let sink = HostEventSink::new(tx);
+        assert!(
+            host.handle(
+                &TuryaCommand::UpdateConfig {
+                    permission_mode: None,
+                    provider: Some("anthropic".to_string()),
+                    model: Some("claude-sonnet-4-5".to_string()),
+                },
+                &sink,
+            )
+            .await
+        );
+        let evts = drain(&mut rx);
+        assert!(
+            !evts.iter().any(|e| matches!(e, TuryaEvent::Error { .. })),
+            "unexpected error: {evts:?}"
+        );
+        let state = evts.iter().find_map(|e| match e {
+            TuryaEvent::ProviderState {
+                provider,
+                model,
+                via,
+            } => Some((provider.clone(), model.clone(), via.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            state,
+            Some((
+                "anthropic".to_string(),
+                "claude-sonnet-4-5".to_string(),
+                "env".to_string()
+            ))
+        );
+        match saved {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
     }
 
     #[test]

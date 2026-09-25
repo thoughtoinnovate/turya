@@ -91,6 +91,9 @@ pub enum TuryaCommand {
     CancelAuthFlow {
         flow_id: String,
     },
+    /// Ask the host for the current provider selection (answered with
+    /// `ProviderState`; drives the status bar without guessing).
+    GetProviderState,
 }
 
 /// Events broadcast by the Turya Core Engine to all connected UIs/Clients
@@ -149,6 +152,14 @@ pub enum TuryaEvent {
     /// Model catalog changed for a provider (refresh finished).
     CatalogUpdated {
         provider: String,
+    },
+    /// Current provider selection (answers `GetProviderState`; also pushed
+    /// after every successful switch so clients never guess).
+    ProviderState {
+        provider: String,
+        model: String,
+        /// Credential source: `env | stored-key | oauth | mock`.
+        via: String,
     },
 }
 
@@ -241,6 +252,19 @@ mod tests {
             }],
         };
         let s = serde_json::to_string(&listed).unwrap();
+        let back: TuryaEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), s);
+
+        // Provider selection state round-trips too.
+        let cmd = TuryaCommand::GetProviderState;
+        let s = serde_json::to_string(&cmd).unwrap();
+        assert!(s.contains("GetProviderState"));
+        let evt = TuryaEvent::ProviderState {
+            provider: "gemini".to_string(),
+            model: "gemini-2.5-flash".to_string(),
+            via: "stored-key".to_string(),
+        };
+        let s = serde_json::to_string(&evt).unwrap();
         let back: TuryaEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), s);
     }

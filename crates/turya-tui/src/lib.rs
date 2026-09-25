@@ -8,7 +8,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::Line,
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
@@ -23,12 +23,13 @@ pub mod flows;
 use flows::{AuthFlow, AuthStage, BrowserFlow, BrowserMode, Flow};
 use slash::{Completer, SlashRegistry};
 
-/// Centered overlay rect sitting just above the input pane.
+/// Centered overlay rect sitting just above the input pane (which sits
+/// above the 1-row status bar, hence the +4 offset).
 fn centered_popup(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height.saturating_sub(4)).max(3);
     let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h + 3);
+    let y = area.y + area.height.saturating_sub(h + 4);
     Rect {
         x,
         y,
@@ -59,11 +60,62 @@ enum EscAction {
     AbortTurn,
 }
 
+/// Render a user prompt into the transcript (pure).
+fn format_user_message(prompt: &str) -> String {
+    format!("\n👤 {prompt}\n")
+}
+
+/// Truncate to `max` bytes on a char boundary (pure).
+fn truncate_preview(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [+{} chars]", &s[..end], s.len() - end)
+}
+
+/// Render a tool result as log lines: summary + bounded output preview.
+/// Without this, successful calls look like nothing happened.
+fn format_tool_result(tool_name: &str, res: &turya_protocol::ToolResult) -> Vec<String> {
+    if res.success {
+        let mut out = vec![format!("✔ {tool_name} (call {})", res.call_id)];
+        let preview = res.output.trim();
+        if !preview.is_empty() {
+            out.push(format!(
+                "  {}",
+                truncate_preview(preview, 300).replace('\n', "\n  ")
+            ));
+        }
+        out
+    } else {
+        vec![format!(
+            "✘ {tool_name} (call {}) failed: {}",
+            res.call_id,
+            res.error.as_deref().unwrap_or("unknown error")
+        )]
+    }
+}
+
 pub struct TuiApp {
     input: String,
+    /// Single chronological transcript: user messages, assistant tokens,
+    /// tool activity, and toasts all render here (no separate tool box).
     streamed_text: String,
-    tool_logs: Vec<String>,
     pending_permission: Option<(String, String)>, // (request_id, action)
+    /// call_id → tool name, filled on Initiated, drained on Completed, so
+    /// result lines can name the tool (`ToolResult` carries no name).
+    pending_tools: std::collections::HashMap<String, String>,
+    /// Active provider selection: (provider, model, via). Set optimistically
+    /// on switch, corrected by `ProviderState` events from the host.
+    provider: Option<(String, String, String)>,
+    /// Character counts for the status bar (token estimates ≈ chars/4).
+    sent_chars: usize,
+    recv_chars: usize,
+    /// Reasoning visibility toggle (`/thinking`). Display-only for now.
+    show_thinking: bool,
     registry: SlashRegistry,
     completer: Option<Completer>,
     flow: Flow,
@@ -83,13 +135,65 @@ impl TuiApp {
         Self {
             input: String::new(),
             streamed_text: String::new(),
-            tool_logs: Vec::new(),
             pending_permission: None,
+            pending_tools: std::collections::HashMap::new(),
+            provider: None,
+            sent_chars: 0,
+            recv_chars: 0,
+            show_thinking: true,
             registry: SlashRegistry::with_builtins(),
             completer: None,
             flow: Flow::None,
             pending_auth: None,
         }
+    }
+
+    /// Append one line to the transcript (the single home for chat, tool
+    /// activity, and toasts — there is no separate tool box).
+    fn log_line(&mut self, line: String) {
+        self.streamed_text.push_str(&line);
+        self.streamed_text.push('\n');
+    }
+
+    /// Format a character count as estimated tokens (≈ chars/4).
+    fn fmt_tokens(chars: usize) -> String {
+        let t = chars / 4;
+        if t >= 1000 {
+            format!("{:.1}k", t as f64 / 1000.0)
+        } else {
+            t.to_string()
+        }
+    }
+
+    /// One-line status bar: provider/model, token estimates, thinking flag.
+    /// Token counts are char-based estimates (≈), clearly marked — true
+    /// provider usage blocks are a follow-up.
+    fn status_line(&self) -> String {
+        let model = self
+            .provider
+            .as_ref()
+            .map(|(p, m, via)| format!("{p}/{m} ({via})"))
+            .unwrap_or_else(|| "no provider".to_string());
+        format!(
+            " {} │ ↑{} ↓{}≈tok │ think:{} │ Esc stop · Ctrl+C quit",
+            model,
+            Self::fmt_tokens(self.sent_chars),
+            Self::fmt_tokens(self.recv_chars),
+            if self.show_thinking { "on" } else { "off" },
+        )
+    }
+
+    /// Submit a prompt: echo it into the transcript (so your messages are
+    /// visible) and forward it to the engine.
+    async fn submit_prompt(&mut self, prompt: String, cmd_tx: &mpsc::Sender<TuryaCommand>) {
+        self.sent_chars += prompt.len();
+        self.streamed_text.push_str(&format_user_message(&prompt));
+        let _ = cmd_tx
+            .send(TuryaCommand::SubmitPrompt {
+                prompt,
+                mode: AgentMode::Build,
+            })
+            .await;
     }
 
     fn esc_action(&self) -> EscAction {
@@ -124,10 +228,16 @@ impl TuiApp {
                 }
                 "clear" => {
                     self.streamed_text.clear();
-                    self.tool_logs.clear();
+                }
+                "thinking" => {
+                    self.show_thinking = !self.show_thinking;
+                    self.log_line(format!(
+                        "ℹ reasoning display {}",
+                        if self.show_thinking { "on" } else { "off" }
+                    ));
                 }
                 _ => {
-                    self.tool_logs.push(format!("ℹ /{name} is coming soon"));
+                    self.log_line(format!("ℹ /{name} is coming soon"));
                 }
             },
             _ => match name {
@@ -146,7 +256,7 @@ impl TuiApp {
                     }
                 }
                 _ => {
-                    self.tool_logs.push(format!("ℹ unknown command /{name}"));
+                    self.log_line(format!("ℹ unknown command /{name}"));
                 }
             },
         }
@@ -231,7 +341,10 @@ impl TuiApp {
                             _ => {
                                 if let Some((pid, mid)) = b.selected_model() {
                                     // Pending toast: failures arrive as Error events.
-                                    self.tool_logs.push(format!("→ switching to {pid}/{mid}…"));
+                                    // Optimistic label too, corrected by ProviderState.
+                                    self.provider =
+                                        Some((pid.clone(), mid.clone(), "…".to_string()));
+                                    self.log_line(format!("→ switching to {pid}/{mid}…"));
                                     self.flow = Flow::None;
                                     let _ = cmd_tx
                                         .send(TuryaCommand::UpdateConfig {
@@ -355,8 +468,7 @@ impl TuiApp {
                         ));
                         return;
                     }
-                    self.tool_logs
-                        .push(format!("ℹ unknown provider '{target}'"));
+                    self.log_line(format!("ℹ unknown provider '{target}'"));
                 }
                 if let Flow::Browser(ref mut b) = self.flow {
                     b.set_providers(views);
@@ -400,14 +512,13 @@ impl TuiApp {
                         "✔ {provider} connected via {method}. Back to /models."
                     ));
                 }
-                self.tool_logs
-                    .push(format!("✔ {provider} connected via {method}"));
+                self.log_line(format!("✔ {provider} connected via {method}"));
             }
             TuryaEvent::AuthFlowFailed { reason, .. } => {
                 if let Flow::Auth(ref mut a) = self.flow {
                     a.stage = AuthStage::Failed(reason.clone());
                 } else {
-                    self.tool_logs.push(format!("⚠ auth failed: {reason}"));
+                    self.log_line(format!("⚠ auth failed: {reason}"));
                 }
             }
             TuryaEvent::CatalogUpdated { .. } => {
@@ -428,9 +539,9 @@ impl TuiApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3), // Header
-                Constraint::Min(5),    // Content & Streamed Text
-                Constraint::Length(5), // Tool Activity Log
+                Constraint::Min(5),    // Chat transcript (tools inline)
                 Constraint::Length(3), // Input Box / Permission Prompt
+                Constraint::Length(1), // Status bar (no borders: 1 row)
             ])
             .split(f.area());
 
@@ -447,24 +558,12 @@ impl TuiApp {
         .block(Block::default().borders(Borders::ALL).title("Status"));
         f.render_widget(header, chunks[0]);
 
-        // 2. Chat Stream
+        // 2. Chat transcript (user messages, assistant tokens, tool
+        // activity, and toasts share one chronological stream).
         let chat = Paragraph::new(self.streamed_text.as_str())
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title("Assistant"));
         f.render_widget(chat, chunks[1]);
-
-        // 3. Tool Activity
-        let logs: Vec<Line> = self
-            .tool_logs
-            .iter()
-            .map(|l| Line::from(Span::raw(l)))
-            .collect();
-        let tools_widget = Paragraph::new(logs).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Tool Activity"),
-        );
-        f.render_widget(tools_widget, chunks[2]);
 
         // 4. Input or Permission Prompt
         if let Some((_, ref action)) = self.pending_permission {
@@ -492,7 +591,14 @@ impl TuiApp {
             f.render_widget(input_widget, chunks[3]);
         }
 
-        // 5. Slash autocomplete popup (overlay above the input pane).
+        // 5. Status bar: single borderless row — provider/model, token
+        // estimates (≈), thinking flag. Every row earns its place.
+        f.render_widget(
+            Paragraph::new(self.status_line()).style(Style::default().fg(Color::DarkGray)),
+            chunks[4],
+        );
+
+        // 6. Slash autocomplete popup (overlay above the input pane).
         if let Some(ref comp) = self.completer {
             let matches = comp.matches(&self.input, &self.registry);
             let rows: Vec<Line> = slash::popup_rows(&matches, comp.selected)
@@ -508,7 +614,7 @@ impl TuiApp {
             }
         }
 
-        // 6. Flow overlay (/models browser, /auth stages).
+        // 7. Flow overlay (/models browser, /auth stages).
         match &self.flow {
             Flow::None => {}
             Flow::Browser(b) => {
@@ -564,6 +670,10 @@ impl TuiApp {
         let mut terminal = Terminal::new(backend)?;
 
         let mut reader = EventStream::new();
+
+        // Ask the host for the current selection so the status bar shows
+        // truth from the first frame (the host answers with ProviderState).
+        let _ = cmd_tx.send(TuryaCommand::GetProviderState).await;
 
         loop {
             terminal.draw(|f| {
@@ -647,10 +757,7 @@ impl TuiApp {
                                         if self.input.trim() == "/" {
                                             self.completer = None;
                                             let prompt = std::mem::take(&mut self.input);
-                                            let _ = cmd_tx.send(TuryaCommand::SubmitPrompt {
-                                                prompt,
-                                                mode: AgentMode::Build,
-                                            }).await;
+                                            self.submit_prompt(prompt, &cmd_tx).await;
                                         } else if let Some((name, args)) =
                                             slash::dispatch_completion(
                                                 &self.input,
@@ -675,10 +782,7 @@ impl TuiApp {
                             KeyCode::Backspace => { self.input.pop(); }
                             KeyCode::Enter if !self.input.trim().is_empty() => {
                                 let prompt = std::mem::take(&mut self.input);
-                                let _ = cmd_tx.send(TuryaCommand::SubmitPrompt {
-                                    prompt,
-                                    mode: AgentMode::Build,
-                                }).await;
+                                self.submit_prompt(prompt, &cmd_tx).await;
                             }
                             _ => {}
                         }
@@ -689,13 +793,22 @@ impl TuiApp {
                     self.feed_flow_event(&evt);
                     match evt {
                         TuryaEvent::TokenDelta { chunk } => {
+                            self.recv_chars += chunk.len();
                             self.streamed_text.push_str(&chunk);
                         }
                         TuryaEvent::ToolCallInitiated(call) => {
-                            self.tool_logs.push(format!("Invoking: {}", call.tool_name));
+                            self.log_line(format!("⚡ {}", call.tool_name));
+                            self.pending_tools
+                                .insert(call.call_id.clone(), call.tool_name.clone());
                         }
                         TuryaEvent::ToolCallCompleted(res) => {
-                            self.tool_logs.push(format!("Result (call {}): success={}", res.call_id, res.success));
+                            let name = self
+                                .pending_tools
+                                .remove(&res.call_id)
+                                .unwrap_or_else(|| "tool".to_string());
+                            for line in format_tool_result(&name, &res) {
+                                self.log_line(line);
+                            }
                         }
                         TuryaEvent::PermissionRequested { request_id, action, .. } => {
                             self.pending_permission = Some((request_id, action));
@@ -704,7 +817,15 @@ impl TuiApp {
                             self.streamed_text.push_str("\n[Turn Finished]\n");
                         }
                         TuryaEvent::Error { message } => {
-                            self.tool_logs.push(format!("⚠ {message}"));
+                            self.log_line(format!("⚠ {message}"));
+                        }
+                        TuryaEvent::ProviderState {
+                            provider,
+                            model,
+                            via,
+                        } => {
+                            // Host truth corrects the optimistic switch label.
+                            self.provider = Some((provider, model, via));
                         }
                         _ => {}
                     }
@@ -778,7 +899,7 @@ mod tests {
         app.pending_auth = Some("nope".to_string());
         app.feed_flow_event(&listed());
         assert!(matches!(app.flow, Flow::Browser(_)));
-        assert!(app.tool_logs.iter().any(|l| l.contains("unknown provider")));
+        assert!(app.streamed_text.contains("unknown provider"));
     }
 
     #[test]
@@ -807,10 +928,7 @@ mod tests {
             Flow::Auth(a) => assert!(matches!(a.stage, AuthStage::Done(_))),
             _ => panic!("expected auth flow"),
         }
-        assert!(app
-            .tool_logs
-            .iter()
-            .any(|l| l.contains("connected via api-key")));
+        assert!(app.streamed_text.contains("connected via api-key"));
     }
 
     #[test]
@@ -820,7 +938,7 @@ mod tests {
             flow_id: "f9".to_string(),
             reason: "bad code".to_string(),
         });
-        assert!(app.tool_logs.iter().any(|l| l.contains("bad code")));
+        assert!(app.streamed_text.contains("bad code"));
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -999,6 +1117,108 @@ mod tests {
             }
             other => panic!("expected UpdateConfig, got {:?}", other),
         }
-        assert!(app.tool_logs.iter().any(|l| l.contains("switching to")));
+        assert!(app.streamed_text.contains("switching to"));
+    }
+
+    #[tokio::test]
+    async fn submit_prompt_echoes_into_transcript() {
+        let mut app = TuiApp::new();
+        let (tx, mut rx) = mpsc::channel(32);
+        app.submit_prompt("understand codebase".to_string(), &tx)
+            .await;
+        assert!(app.streamed_text.contains("understand codebase"));
+        assert!(app.streamed_text.contains("👤"));
+        match rx.recv().await.expect("expected a command") {
+            TuryaCommand::SubmitPrompt { prompt, .. } => {
+                assert_eq!(prompt, "understand codebase")
+            }
+            other => panic!("expected SubmitPrompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_lines_name_tool_and_preview_output() {
+        use turya_protocol::{ToolCall, ToolResult};
+        let mut app = TuiApp::new();
+        // Correlate via the Initiated event, like the live loop does.
+        app.feed_flow_event(&TuryaEvent::ToolCallInitiated(ToolCall {
+            call_id: "g1".to_string(),
+            tool_name: "run_bash".to_string(),
+            parameters: serde_json::json!({}),
+        }));
+        app.feed_flow_event(&TuryaEvent::ToolCallCompleted(ToolResult {
+            call_id: "g1".to_string(),
+            success: true,
+            output: "line1\nline2\n".to_string(),
+            error: None,
+        }));
+        assert!(app.streamed_text.contains("✔ run_bash"));
+        assert!(app.streamed_text.contains("line1"));
+
+        // Unknown call ids still render (never silent, never panics).
+        app.feed_flow_event(&TuryaEvent::ToolCallCompleted(ToolResult {
+            call_id: "zzz".to_string(),
+            success: false,
+            output: String::new(),
+            error: Some("boom".to_string()),
+        }));
+        assert!(app.streamed_text.contains("✘ tool"));
+        assert!(app.streamed_text.contains("boom"));
+    }
+
+    #[test]
+    fn truncate_preview_is_char_safe_and_bounded() {
+        assert_eq!(truncate_preview("short", 300), "short");
+        let big = "x".repeat(1000);
+        let out = truncate_preview(&big, 300);
+        assert!(out.len() < 1000 && out.contains("[+"));
+        // Multi-byte boundary: never splits a char.
+        let emoji = "😀".repeat(100);
+        let out = truncate_preview(&emoji, 10);
+        assert!(out.chars().count() <= 20);
+    }
+
+    #[test]
+    fn status_line_shows_provider_counters_and_thinking() {
+        let mut app = TuiApp::new();
+        // No provider yet.
+        assert!(app.status_line().contains("no provider"));
+        assert!(app.status_line().contains("think:on"));
+        app.feed_flow_event(&TuryaEvent::ProviderState {
+            provider: "gemini".to_string(),
+            model: "gemini-2.5-flash".to_string(),
+            via: "stored-key".to_string(),
+        });
+        let line = app.status_line();
+        assert!(line.contains("gemini/gemini-2.5-flash"));
+        assert!(line.contains("stored-key"));
+        // Counters format as estimated tokens.
+        app.sent_chars = 4000;
+        app.recv_chars = 8000;
+        let line = app.status_line();
+        assert!(line.contains("↑1.0k") && line.contains("↓2.0k"));
+        // Thinking toggle flips the indicator.
+        app.show_thinking = false;
+        assert!(app.status_line().contains("think:off"));
+    }
+
+    #[test]
+    fn fmt_tokens_scales() {
+        assert_eq!(TuiApp::fmt_tokens(0), "0");
+        assert_eq!(TuiApp::fmt_tokens(399), "99");
+        assert_eq!(TuiApp::fmt_tokens(4000), "1.0k");
+        assert_eq!(TuiApp::fmt_tokens(10400), "2.6k");
+    }
+
+    #[tokio::test]
+    async fn thinking_command_toggles_flag() {
+        let mut app = TuiApp::new();
+        let (tx, _rx) = mpsc::channel(32);
+        assert!(app.show_thinking);
+        app.dispatch_slash("thinking", "", &tx).await;
+        assert!(!app.show_thinking);
+        assert!(app.streamed_text.contains("reasoning display off"));
+        app.dispatch_slash("thinking", "", &tx).await;
+        assert!(app.show_thinking);
     }
 }

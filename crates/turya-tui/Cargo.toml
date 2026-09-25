@@ -1,6 +1,6 @@
 [package]
 name = "turya-tui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -9,3 +9,6 @@ ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { workspace = true }
 futures = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1.0"

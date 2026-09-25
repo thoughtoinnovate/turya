@@ -3237,11 +3237,12 @@ dependencies = [
 
 [[package]]
 name = "turya-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossterm",
  "futures",
  "ratatui",
+ "serde_json",
  "tokio",
  "turya-protocol",
 ]

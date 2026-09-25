@@ -106,14 +106,34 @@ impl GeminiProvider {
 
     /// Translate one decoded SSE JSON payload into steps (pure: unit-tested).
     /// `call_seq` numbers synthetic call ids (`gcall_<n>`).
+    ///
+    /// Two silence traps handled here so turns never look empty:
+    /// - `thought: true` parts (thinking models): surfaced as text.
+    /// - `promptFeedback.blockReason`: surfaced as a visible warning.
     fn steps_from_payload(payload: &serde_json::Value, call_seq: &mut usize) -> Vec<ProviderStep> {
         let mut steps = Vec::new();
+        if let Some(reason) = payload
+            .get("promptFeedback")
+            .and_then(|f| f.get("blockReason"))
+            .and_then(|r| r.as_str())
+        {
+            steps.push(ProviderStep::Token(format!(
+                "⚠ response blocked by safety filter: {reason}"
+            )));
+        }
         let empty = vec![];
         let candidates = payload
             .get("candidates")
             .and_then(|c| c.as_array())
             .unwrap_or(&empty);
         for cand in candidates {
+            if let Some(reason) = cand.get("finishReason").and_then(|r| r.as_str()) {
+                if reason == "SAFETY" {
+                    steps.push(ProviderStep::Token(
+                        "⚠ response stopped by safety filter".to_string(),
+                    ));
+                }
+            }
             let parts = cand
                 .get("content")
                 .and_then(|c| c.get("parts"))
@@ -124,6 +144,8 @@ impl GeminiProvider {
             };
             for part in parts {
                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    // Thought parts and answer text both stream visibly;
+                    // styling them apart is a /thinking display follow-up.
                     steps.push(ProviderStep::Token(text.to_string()));
                 }
                 if let Some(fc) = part.get("functionCall") {
@@ -382,6 +404,46 @@ mod tests {
         // Empty/unknown payloads yield nothing, never panic.
         assert!(GeminiProvider::steps_from_payload(&json!({}), &mut seq).is_empty());
         assert!(GeminiProvider::steps_from_payload(&json!({"candidates":[]}), &mut seq).is_empty());
+    }
+
+    #[test]
+    fn thought_parts_stream_visibly() {
+        // Thinking-model reasoning must not vanish into empty turns.
+        let payload = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "Let me look at the repo layout. ", "thought": true},
+                    {"text": "Here it is."},
+                ]}
+            }]
+        });
+        let mut seq = 0;
+        let steps = GeminiProvider::steps_from_payload(&payload, &mut seq);
+        assert_eq!(steps.len(), 2);
+        match &steps[0] {
+            ProviderStep::Token(t) => assert!(t.contains("repo layout")),
+            _ => panic!("thought text must stream"),
+        }
+    }
+
+    #[test]
+    fn safety_blocks_surface_instead_of_empty_turns() {
+        let payload = json!({
+            "promptFeedback": {"blockReason": "SAFETY"},
+            "candidates": []
+        });
+        let mut seq = 0;
+        let steps = GeminiProvider::steps_from_payload(&payload, &mut seq);
+        assert_eq!(steps.len(), 1);
+        match &steps[0] {
+            ProviderStep::Token(t) => assert!(t.contains("SAFETY")),
+            _ => panic!("block reason must surface"),
+        }
+        let payload = json!({
+            "candidates": [{"finishReason": "SAFETY"}]
+        });
+        let steps = GeminiProvider::steps_from_payload(&payload, &mut seq);
+        assert!(matches!(steps[..], [ProviderStep::Token(_)]));
     }
 
     #[test]
