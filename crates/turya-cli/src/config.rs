@@ -23,6 +23,8 @@ pub struct TuryaConfig {
     /// Per-turn step budgets (`/steps`).
     pub max_steps: Option<usize>,
     pub max_tool_calls: Option<u32>,
+    /// Reasoning effort for subsequent turns (`/efforts`).
+    pub effort: Option<String>,
     /// Automatic context compaction (Phase B).
     pub auto_compact: Option<bool>,
     /// Approximate recent tokens kept verbatim beside a compaction summary.
@@ -56,6 +58,7 @@ impl Default for TuryaConfig {
             permission_mode: None,
             max_steps: None,
             max_tool_calls: None,
+            effort: None,
             auto_compact: Some(true),
             keep_tokens: Some(15_000),
             queue_behavior: Some("steer".to_string()),

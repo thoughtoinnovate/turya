@@ -19,6 +19,21 @@ pub struct AnthropicProvider {
     api_key: String,
     pub model: String,
     pub max_tokens: u32,
+    /// Reasoning effort level, behind a lock: the provider is shared and
+    /// effort is set mid-session through `LlmProvider::set_effort`.
+    effort: std::sync::RwLock<Option<String>>,
+}
+
+/// Thinking budgets for each effort level (see the Gemini provider for why
+/// this scale exists).
+const EFFORT_BUDGETS: [(&str, u32); 3] = [("low", 1024), ("medium", 8192), ("high", 24576)];
+
+/// Map an effort level to a thinking-token budget.
+pub fn thinking_budget(level: &str) -> Option<u32> {
+    EFFORT_BUDGETS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(level))
+        .map(|(_, budget)| *budget)
 }
 
 impl AnthropicProvider {
@@ -27,6 +42,7 @@ impl AnthropicProvider {
             api_key,
             model,
             max_tokens: 4096,
+            effort: std::sync::RwLock::new(None),
         }
     }
 
@@ -148,6 +164,11 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    fn set_effort(&self, level: Option<String>) {
+        // Interior mutability: the provider is shared as an Arc and swapped
+        // mid-session, so effort is set through a lock rather than a field.
+        *self.effort.write().unwrap() = level;
+    }
     async fn generate_turn(
         &self,
         transcript: &Transcript,
@@ -206,13 +227,19 @@ impl LlmProvider for AnthropicProvider {
             })
             .collect();
 
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "max_tokens": self.max_tokens,
             "stream": true,
             "tools": Self::tool_schemas(),
             "messages": messages,
         });
+        let effort = self.effort.read().unwrap().clone();
+        if let Some(budget) = effort.as_deref().and_then(thinking_budget) {
+            // `thinking` requires a temperature of 1, which is the default;
+            // sending both would be rejected.
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
 
         let client = reqwest::Client::new();
         let resp = client
@@ -388,4 +415,10 @@ mod tests {
 
     // NOTE: live `list_models` is covered by the ignored live test pattern
     // (STEP 8); unit tests never touch the network (deterministic suite).
+    #[test]
+    fn effort_levels_map_to_thinking_budgets() {
+        assert_eq!(thinking_budget("low"), Some(1024));
+        assert_eq!(thinking_budget("high"), Some(24576));
+        assert_eq!(thinking_budget("extreme"), None);
+    }
 }

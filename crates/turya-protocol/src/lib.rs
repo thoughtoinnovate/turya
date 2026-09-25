@@ -402,6 +402,12 @@ pub enum TuryaCommand {
         max_steps: Option<usize>,
         max_tool_calls: Option<u32>,
     },
+    /// Ask what reasoning effort levels the active model accepts.
+    QueryEfforts,
+    /// Set the reasoning effort for subsequent turns.
+    SetEffort {
+        effort: Option<String>,
+    },
     /// Compact the session (`/compact`). `focus` is the user's optional
     /// instruction, e.g. "focus on the auth bug fix".
     Compact {
@@ -456,6 +462,16 @@ pub enum TuryaEvent {
     SessionResumed {
         session: Box<SessionMeta>,
         transcript: Transcript,
+    },
+    /// What the active model supports, and what is currently selected.
+    /// `efforts` is empty when the source does not say, and
+    /// `supported` is `None` when we genuinely do not know - which is
+    /// different from "this model cannot reason".
+    EffortsChanged {
+        model: String,
+        supported: Option<bool>,
+        efforts: Vec<String>,
+        current: Option<String>,
     },
     /// Queue state, emitted whenever it changes so a client can show a
     /// count without tracking commands itself.

@@ -24,6 +24,23 @@ pub struct GeminiProvider {
     credential: String,
     bearer: bool,
     pub model: String,
+    /// Reasoning effort level (`low`/`medium`/`high`), if the user set one.
+    /// Behind a lock because the provider is shared and effort is set
+    /// mid-session through the optional `LlmProvider::set_effort` capability.
+    effort: std::sync::RwLock<Option<String>>,
+}
+
+/// Thinking budgets for each effort level. A fixed scale, documented here
+/// because it *is* a choice: `0` disables thinking, and the top of the range
+/// is deliberately bounded so a "high" request cannot stall a long turn.
+const EFFORT_BUDGETS: [(&str, i64); 3] = [("low", 1024), ("medium", 8192), ("high", 24576)];
+
+/// Map an effort level to a thinking-token budget.
+pub fn thinking_budget(level: &str) -> Option<i64> {
+    EFFORT_BUDGETS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(level))
+        .map(|(_, budget)| *budget)
 }
 
 impl GeminiProvider {
@@ -32,12 +49,14 @@ impl GeminiProvider {
             credential: api_key,
             bearer: false,
             model,
+            effort: std::sync::RwLock::new(None),
         }
     }
 
     pub fn connect_with(creds: &ResolvedCreds, model: &str) -> Self {
         Self {
             credential: creds.token.clone(),
+            effort: std::sync::RwLock::new(None),
             bearer: creds.via == "oauth",
             model: model.to_string(),
         }
@@ -62,7 +81,7 @@ impl GeminiProvider {
     /// ride as `functionResponse` inside a `user` turn (the convention the
     /// Generative Language API requires for function results), and files
     /// become `inlineData`/`fileData` parts.
-    fn request_body(transcript: &Transcript) -> serde_json::Value {
+    fn request_body(&self, transcript: &Transcript) -> serde_json::Value {
         let contents: Vec<serde_json::Value> = transcript
             .to_messages()
             .iter()
@@ -116,10 +135,17 @@ impl GeminiProvider {
                 json!({ "role": role, "parts": parts })
             })
             .collect();
-        json!({
+        let mut body = json!({
             "contents": contents,
             "tools": [{"functionDeclarations": Self::function_declarations()}],
-        })
+        });
+        let effort = self.effort.read().unwrap().clone();
+        if let Some(budget) = effort.as_deref().and_then(thinking_budget) {
+            body["generationConfig"] = json!({
+                "thinkingConfig": { "thinkingBudget": budget }
+            });
+        }
+        body
     }
 
     fn function_declarations() -> serde_json::Value {
@@ -301,13 +327,18 @@ impl GeminiProvider {
 
 #[async_trait]
 impl LlmProvider for GeminiProvider {
+    fn set_effort(&self, level: Option<String>) {
+        // Interior mutability: the provider is shared as an Arc and swapped
+        // mid-session, so effort is set through a lock rather than a field.
+        *self.effort.write().unwrap() = level;
+    }
     async fn generate_turn(
         &self,
         transcript: &Transcript,
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         let (url, bearer) = self.request_target();
-        let body = Self::request_body(transcript);
+        let body = self.request_body(transcript);
         let client = reqwest::Client::new();
         let mut req = client.post(&url).header("content-type", "application/json");
         if let Some(token) = bearer {
@@ -426,7 +457,8 @@ mod tests {
         t.push(turya_protocol::Part::UserText {
             text: "hi".to_string(),
         });
-        let body = GeminiProvider::request_body(&t);
+        let provider = GeminiProvider::new("k".to_string(), "m".to_string());
+        let body = provider.request_body(&t);
         let decls = body
             .pointer("/tools/0/functionDeclarations")
             .and_then(|d| d.as_array())
@@ -460,7 +492,8 @@ mod tests {
             truncated: false,
         });
 
-        let body = GeminiProvider::request_body(&t);
+        let provider = GeminiProvider::new("k".to_string(), "m".to_string());
+        let body = provider.request_body(&t);
         let contents = body.get("contents").and_then(|c| c.as_array()).unwrap();
         // user turn, then the model turn (text + functionCall merged), then
         // the function response as a user turn.
@@ -492,7 +525,8 @@ mod tests {
             arguments: serde_json::json!({}),
             signature: Some("sig-1".to_string()),
         });
-        let body = GeminiProvider::request_body(&t);
+        let provider = GeminiProvider::new("k".to_string(), "m".to_string());
+        let body = provider.request_body(&t);
         let contents = body.get("contents").and_then(|c| c.as_array()).unwrap();
         assert_eq!(contents[0]["role"], "user");
     }
@@ -528,7 +562,8 @@ mod tests {
             arguments: call.parameters.clone(),
             signature: call.signature.clone(),
         });
-        let body = GeminiProvider::request_body(&t);
+        let provider = GeminiProvider::new("k".to_string(), "m".to_string());
+        let body = provider.request_body(&t);
         let parts = body
             .pointer("/contents/1/parts/0")
             .expect("model turn part exists");
@@ -551,7 +586,8 @@ mod tests {
             arguments: serde_json::json!({}),
             signature: None,
         });
-        let body = GeminiProvider::request_body(&t);
+        let provider = GeminiProvider::new("k".to_string(), "m".to_string());
+        let body = provider.request_body(&t);
         let part = &body["contents"][1]["parts"][0];
         assert!(part.get("thoughtSignature").is_none(), "{part}");
     }
@@ -649,5 +685,40 @@ mod tests {
         assert!(!url.contains("key="));
         assert!(!url.contains("ya29"));
         assert_eq!(bearer.as_deref(), Some("Bearer ya29.test"));
+    }
+    #[test]
+    fn effort_levels_map_to_thinking_budgets() {
+        assert_eq!(thinking_budget("low"), Some(1024));
+        assert_eq!(thinking_budget("MEDIUM"), Some(8192));
+        assert_eq!(thinking_budget("high"), Some(24576));
+        assert_eq!(
+            thinking_budget("extreme"),
+            None,
+            "unknown level is not guessed"
+        );
+    }
+
+    #[test]
+    fn setting_an_effort_changes_the_request() {
+        let provider = GeminiProvider::new("k".to_string(), "m".to_string());
+        let mut t = Transcript::new("s");
+        t.push(turya_protocol::Part::UserText {
+            text: "hi".to_string(),
+        });
+        let plain = provider.request_body(&t);
+        assert!(
+            plain.get("generationConfig").is_none(),
+            "no effort means the provider default"
+        );
+
+        provider.set_effort(Some("high".to_string()));
+        let thinking = provider.request_body(&t);
+        assert_eq!(
+            thinking["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            24576
+        );
+
+        provider.set_effort(None);
+        assert!(provider.request_body(&t).get("generationConfig").is_none());
     }
 }

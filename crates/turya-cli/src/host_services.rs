@@ -242,6 +242,67 @@ impl HostServices {
                 }
                 true
             }
+            TuryaCommand::QueryEfforts => {
+                let (provider, model) = self.current_selection();
+                let reasoning = self.cached_reasoning(&provider, &model);
+                events
+                    .send(TuryaEvent::EffortsChanged {
+                        model,
+                        supported: reasoning.reasoning.supported,
+                        efforts: reasoning.reasoning.efforts.clone(),
+                        current: self.effort(),
+                    })
+                    .await;
+                true
+            }
+            TuryaCommand::SetEffort { effort } => {
+                // Validate against what the model actually advertises: an
+                // invented level would be silently ignored by the provider.
+                let (provider, model) = self.current_selection();
+                let reasoning = self.cached_reasoning(&provider, &model);
+                match &effort {
+                    None => {
+                        self.set_effort(None);
+                        self.engine.provider().set_effort(None);
+                        events
+                            .send(TuryaEvent::EffortsChanged {
+                                model,
+                                supported: reasoning.reasoning.supported,
+                                efforts: reasoning.reasoning.efforts.clone(),
+                                current: None,
+                            })
+                            .await;
+                    }
+                    Some(level) => {
+                        // Apply it to the live provider, not just the file:
+                        // a setting the engine never sees is a lie.
+                        self.engine.provider().set_effort(Some(level.clone()));
+                        if !reasoning.reasoning.efforts.is_empty()
+                            && !reasoning.reasoning.supports_effort(level)
+                        {
+                            events
+                                .send(TuryaEvent::Error {
+                                    message: format!(
+                                        "{model} accepts {:?}; '{level}' is not one of them",
+                                        reasoning.reasoning.efforts
+                                    ),
+                                })
+                                .await;
+                            return true;
+                        }
+                        self.set_effort(Some(level.clone()));
+                        events
+                            .send(TuryaEvent::EffortsChanged {
+                                model,
+                                supported: reasoning.reasoning.supported,
+                                efforts: reasoning.reasoning.efforts.clone(),
+                                current: Some(level.clone()),
+                            })
+                            .await;
+                    }
+                }
+                true
+            }
             TuryaCommand::ContextReport => {
                 let report = self.context_report().await;
                 events.send(TuryaEvent::TokenDelta { chunk: report }).await;
@@ -447,6 +508,45 @@ impl HostServices {
                 Arc::new(store)
             })
             .map_err(|e| format!("cannot open the session store: {e}"))
+    }
+
+    /// The provider/model the session is actually using.
+    fn current_selection(&self) -> (String, String) {
+        let cfg = HostConfig::load(&self.config_path);
+        (
+            cfg.provider.unwrap_or_else(|| "anthropic".to_string()),
+            cfg.model.unwrap_or_default(),
+        )
+    }
+
+    /// Cached catalog facts for a model, or empty facts when unknown.
+    fn cached_reasoning(&self, provider: &str, model: &str) -> turya_catalog::ModelFacts {
+        self.catalog
+            .cached_models(provider)
+            .into_iter()
+            .find(|m| m.id == model)
+            .map(|m| turya_catalog::ModelFacts {
+                context: m.context_window,
+                input: m.input_limit,
+                output: m.output_limit,
+                tool_call: m.supports_tools,
+                attachment: m.supports_attachments,
+                reasoning: m.reasoning,
+                input_modalities: m.input_modalities,
+            })
+            .unwrap_or_default()
+    }
+
+    /// The selected effort, persisted next to the other settings.
+    fn effort(&self) -> Option<String> {
+        let (cfg, _) = crate::config::TuryaConfig::load(&self.config_path);
+        cfg.effort.clone()
+    }
+
+    fn set_effort(&self, effort: Option<String>) {
+        let (mut cfg, _) = crate::config::TuryaConfig::load(&self.config_path);
+        cfg.effort = effort;
+        let _ = cfg.save(&self.config_path);
     }
 
     /// Human-readable context breakdown for `/context`. Every number is an

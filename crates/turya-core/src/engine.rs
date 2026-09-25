@@ -94,6 +94,12 @@ impl TuryaEngine {
         }
     }
 
+    /// The active provider, so the host can adjust optional capabilities
+    /// (effort) without owning the concrete type.
+    pub fn provider(&self) -> Arc<dyn LlmProvider> {
+        self.provider.read().unwrap().clone()
+    }
+
     /// Hot-swap the active provider (used by `/models` switching).
     pub fn set_provider(&self, provider: Arc<dyn LlmProvider>) {
         *self.provider.write().unwrap() = provider;

@@ -383,8 +383,10 @@ pub struct TuiApp {
     /// Character counts for the status bar (token estimates ≈ chars/4).
     sent_chars: usize,
     recv_chars: usize,
-    /// Reasoning visibility toggle (`/thinking`). Display-only for now.
+    /// Reasoning visibility toggle (`/thinking`). Display-only, and honest:
+    /// `None` means the catalog has not told us whether the model reasons.
     show_thinking: bool,
+    reasoning_supported: Option<bool>,
     /// Write recall history to disk. Off in tests so they stay hermetic.
     persist_history: bool,
     /// Optional background tints; off unless the user opts in.
@@ -453,6 +455,7 @@ impl TuiApp {
             sent_chars: 0,
             recv_chars: 0,
             show_thinking: true,
+            reasoning_supported: None,
             prompt_history: Vec::new(),
             history_cursor: None,
             stashed_draft: String::new(),
@@ -1153,6 +1156,20 @@ impl TuiApp {
                     "context" => {
                         let _ = cmd_tx.send(TuryaCommand::ContextReport).await;
                     }
+                    "efforts" => {
+                        // `/efforts` asks the host, which is the only side that
+                        // knows the catalog. We never guess a level list here.
+                        let arg = args.trim().to_string();
+                        let _ = cmd_tx
+                            .send(if arg.is_empty() || arg.eq_ignore_ascii_case("show") {
+                                TuryaCommand::QueryEfforts
+                            } else {
+                                TuryaCommand::SetEffort {
+                                    effort: (!arg.eq_ignore_ascii_case("none")).then_some(arg),
+                                }
+                            })
+                            .await;
+                    }
                     "queue" => {
                         // `/queue <prompt>` sends the prompt to run after the
                         // current turn. It never interrupts: to change a running
@@ -1663,6 +1680,40 @@ impl TuiApp {
                 request_id, action, ..
             } => {
                 self.pending_permission = Some((request_id.clone(), action.clone()));
+            }
+            TuryaEvent::EffortsChanged {
+                model,
+                supported,
+                efforts,
+                current,
+            } => {
+                self.reasoning_supported = *supported;
+                // Three distinct states, and conflating them would lie:
+                // unsupported, unknown, and supported-with-levels.
+                match (supported, efforts.is_empty()) {
+                    (Some(false), _) => {
+                        self.log_dim(format!("ℹ {model} does not reason; no effort to set"))
+                    }
+                    (None, true) => self.log_dim(format!(
+                        "ℹ {model}: reasoning support unknown (no catalog data); \
+                         nothing to set"
+                    )),
+                    (_, true) => self.log_dim(format!(
+                        "ℹ {model} reasons but exposes no effort levels; \
+                         use /thinking to show or hide the reasoning"
+                    )),
+                    (_, false) => {
+                        let list: Vec<String> = efforts
+                            .iter()
+                            .map(|e| match current.as_deref() == Some(e.as_str()) {
+                                true => format!("❯ {e}"),
+                                false => format!("  {e}"),
+                            })
+                            .collect();
+                        self.log_dim(format!("effort for {model}: {}", list.join("  ")));
+                        self.log_dim("set one with: /efforts <level>".to_string());
+                    }
+                }
             }
             TuryaEvent::QueueChanged { pending } => {
                 // Count only: the running turn must not be interrupted by a
@@ -3451,5 +3502,88 @@ mod tests {
         assert!(text.contains('s'), "a duration is reported: {text}");
         // In-flight bookkeeping is cleaned up, not accumulated.
         assert!(app.tool_started.is_empty());
+    }
+    #[tokio::test]
+    async fn efforts_asks_the_host_rather_than_guessing_levels() {
+        let mut app = TuiApp::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.dispatch_slash("efforts", "", &tx).await;
+        assert!(matches!(rx.recv().await, Some(TuryaCommand::QueryEfforts)));
+    }
+
+    #[tokio::test]
+    async fn efforts_sets_a_level_or_clears_it() {
+        let mut app = TuiApp::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.dispatch_slash("efforts", "high", &tx).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(TuryaCommand::SetEffort {
+                effort: Some(_),
+                ..
+            })
+        ));
+        app.dispatch_slash("efforts", "none", &tx).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(TuryaCommand::SetEffort { effort: None })
+        ));
+    }
+
+    #[test]
+    fn effort_states_are_reported_distinctly() {
+        // Conflating these would tell the user a knob exists when it does not.
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&TuryaEvent::EffortsChanged {
+            model: "m".to_string(),
+            supported: Some(false),
+            efforts: vec![],
+            current: None,
+        });
+        assert!(app.transcript_text().contains("does not reason"));
+
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&TuryaEvent::EffortsChanged {
+            model: "m".to_string(),
+            supported: None,
+            efforts: vec![],
+            current: None,
+        });
+        assert!(app.transcript_text().contains("unknown"));
+
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&TuryaEvent::EffortsChanged {
+            model: "m".to_string(),
+            supported: Some(true),
+            efforts: vec!["low".to_string(), "high".to_string()],
+            current: Some("high".to_string()),
+        });
+        let text = app.transcript_text();
+        assert!(
+            text.contains("❯ high"),
+            "the current level is marked: {text}"
+        );
+        assert!(text.contains("low"), "and the others are listed: {text}");
+    }
+
+    #[test]
+    fn thinking_on_a_model_that_cannot_reason_says_so() {
+        // /thinking used to flip a flag on a model that may not reason at
+        // all, silently doing nothing.
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&TuryaEvent::EffortsChanged {
+            model: "m".to_string(),
+            supported: Some(false),
+            efforts: vec![],
+            current: None,
+        });
+        app.reasoning_supported = Some(false);
+        let (tx, _rx) = mpsc::channel(4);
+        futures::executor::block_on(app.dispatch_slash("thinking", "", &tx));
+        assert!(
+            app.transcript_text().contains("does not reason"),
+            "{}",
+            app.transcript_text()
+        );
     }
 }

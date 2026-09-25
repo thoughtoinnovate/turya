@@ -24,6 +24,13 @@ pub trait LlmProvider: Send + Sync {
         transcript: &Transcript,
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String>;
+
+    /// Apply a reasoning-effort level to subsequent calls. An optional
+    /// capability, so the default is "this provider has no effort dial"
+    /// rather than a silently ignored setting the user believes is active.
+    /// `/efforts` reports `supported: None` for a provider that declines,
+    /// so the UI never claims a knob it cannot turn.
+    fn set_effort(&self, _level: Option<String>) {}
 }
 
 /// Deterministic mock provider for tests and bootstrap verification
