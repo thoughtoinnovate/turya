@@ -93,6 +93,13 @@ impl SlashRegistry {
                 kind: CommandKind::Local,
                 source: CommandSource::Builtin,
             },
+            SlashCommand {
+                name: "steps",
+                description: "Set per-turn budgets: /steps [model_calls] [tool_calls]",
+                hint: "8 32",
+                kind: CommandKind::Local,
+                source: CommandSource::Builtin,
+            },
         ] {
             reg.register(cmd);
         }
@@ -201,7 +208,7 @@ mod tests {
     #[test]
     fn builtins_registered_once() {
         let reg = registry();
-        assert_eq!(reg.filter("").len(), 6);
+        assert_eq!(reg.filter("").len(), 7);
         let mut dup = registry();
         dup.register(SlashCommand {
             name: "models",
@@ -210,7 +217,7 @@ mod tests {
             kind: CommandKind::Local,
             source: CommandSource::Plugin,
         });
-        assert_eq!(dup.filter("").len(), 6);
+        assert_eq!(dup.filter("").len(), 7);
         assert_eq!(
             dup.get("models").unwrap().description,
             "Browse providers & switch model"
@@ -225,7 +232,7 @@ mod tests {
         let all: Vec<_> = reg.filter("").iter().map(|c| c.name).collect();
         assert_eq!(
             all,
-            vec!["auth", "clear", "efforts", "help", "models", "thinking"]
+            vec!["auth", "clear", "efforts", "help", "models", "steps", "thinking"]
         );
         let ci: Vec<_> = reg.filter("MO").iter().map(|c| c.name).collect();
         assert_eq!(ci, vec!["models"]);
@@ -256,7 +263,7 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "auth");
         // Bare slash lists everything.
-        assert_eq!(c.matches("/", &reg).len(), 6);
+        assert_eq!(c.matches("/", &reg).len(), 7);
     }
 
     #[test]
@@ -269,8 +276,8 @@ mod tests {
         // Out-of-range selection clamps to last row.
         let all = c.matches("/", &reg);
         let rows = popup_rows(&all, 99);
-        assert_eq!(rows.len(), 6);
-        assert!(rows[5].starts_with("❯"));
+        assert_eq!(rows.len(), 7);
+        assert!(rows[6].starts_with("❯"));
         assert!(rows[0].starts_with("  "));
         assert!(popup_rows(&[], 0).is_empty());
     }

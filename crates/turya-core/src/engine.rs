@@ -7,19 +7,33 @@ use tokio::sync::mpsc;
 use turya_protocol::{AgentMode, PermissionDecision, PermissionMode, TuryaEvent};
 use turya_tools::ToolRegistry;
 
-/// Max model calls per turn. After each pass that invokes tools, the engine
-/// re-invokes the provider with the accumulated transcript so the assistant
-/// answers *after* seeing tool results (agentic loop). Pure-text passes end
-/// the turn immediately; only runaway tool-calling hits this cap.
-const MAX_MODEL_CALLS: usize = 8;
-/// Max tool *executions* per turn. One model response can emit many
-/// `CallTool` steps, so the model-call cap alone does not bound side
-/// effects (`run_bash`, `write_file`). Generous for legit chains
-/// (explore → read → test), tight enough to stop a flood.
-const MAX_TOOL_CALLS_PER_TURN: u32 = 32;
+/// Default per-turn budgets (see `TuryaEngine::set_budgets`). A turn ends at
+/// the first of: a tool-free pass (final answer), the model-call cap, or the
+/// tool-execution cap. Sessions are unbounded — every message starts a fresh
+/// turn with a fresh budget.
+const DEFAULT_MODEL_CALLS: usize = 8;
+const DEFAULT_TOOL_CALLS: u32 = 32;
 /// Tool outputs are truncated in history: one `cat` of a huge file must not
 /// blow the context window on every follow-up call.
 const MAX_TOOL_HISTORY_CHARS: usize = 2000;
+
+/// Per-turn step budgets: model generations (cost/latency) and tool
+/// executions (side effects). One model response can emit many `CallTool`
+/// steps, so the two caps cover different risks.
+#[derive(Debug, Clone, Copy)]
+pub struct TurnBudgets {
+    pub model_calls: usize,
+    pub tool_calls: u32,
+}
+
+impl Default for TurnBudgets {
+    fn default() -> Self {
+        Self {
+            model_calls: DEFAULT_MODEL_CALLS,
+            tool_calls: DEFAULT_TOOL_CALLS,
+        }
+    }
+}
 
 pub struct TuryaEngine {
     /// Hot-swappable provider slot (Rule 3.3): `/models` switches vendors
@@ -33,6 +47,10 @@ pub struct TuryaEngine {
     /// Injected diagnostics seam (implementation lives in `turya-lsp`).
     diagnostics_hook: Option<Arc<dyn DiagnosticsHook>>,
     session_id: String,
+    /// Step budgets, hot-swappable per session via `set_budgets`
+    /// (driven by `UpdateConfig` from the host). Interior mutability:
+    /// the engine is shared as `Arc` across turns.
+    budgets: RwLock<TurnBudgets>,
 }
 
 impl TuryaEngine {
@@ -48,12 +66,27 @@ impl TuryaEngine {
             memory_hook: None,
             diagnostics_hook: None,
             session_id: "default".to_string(),
+            budgets: RwLock::new(TurnBudgets::default()),
         }
     }
 
     /// Hot-swap the active provider (used by `/models` switching).
     pub fn set_provider(&self, provider: Arc<dyn LlmProvider>) {
         *self.provider.write().unwrap() = provider;
+    }
+
+    /// Update the per-turn step budgets (`/steps` in the TUI, carried by
+    /// `UpdateConfig`). Each side is independent: `None` leaves it unchanged.
+    /// Values clamp to a minimum of 1 — a zero budget would end every turn
+    /// empty, which is never what the user asked for.
+    pub fn set_budgets(&self, model_calls: Option<usize>, tool_calls: Option<u32>) {
+        let mut b = self.budgets.write().unwrap();
+        if let Some(m) = model_calls {
+            b.model_calls = m.max(1);
+        }
+        if let Some(t) = tool_calls {
+            b.tool_calls = t.max(1);
+        }
     }
 
     pub fn with_memory_hook(mut self, hook: Arc<dyn MemoryHook>) -> Self {
@@ -101,108 +134,72 @@ impl TuryaEngine {
         // Agentic loop: each pass asks the provider for the next step given
         // everything so far. Tool results re-enter as history, so the model
         // always gets the last word (a summary, an explanation, a follow-up).
+        let budgets = *self.budgets.read().unwrap();
         let mut history: Vec<String> = Vec::new();
         let mut turn_error: Option<String> = None;
-        let mut passes = 0u32;
+        let mut passes = 0usize;
         let mut tools_last_pass = 0u32;
         let mut tool_executions = 0u32;
         let mut tool_cap_hit = false;
 
-        for _pass in 0..MAX_MODEL_CALLS {
+        for _pass in 0..budgets.model_calls {
             passes += 1;
-            let (step_tx, mut step_rx) = mpsc::channel(32);
-            let provider = self.provider.read().unwrap().clone();
-            let prompt_clone = prompt.to_string();
-            let history_clone = history.clone();
-
-            let join = tokio::spawn(async move {
-                provider
-                    .generate_turn(&prompt_clone, &history_clone, step_tx)
-                    .await
-            });
-
-            let mut assistant_text = String::new();
-            let mut tool_calls_this_pass = 0u32;
-
-            while let Some(step) = step_rx.recv().await {
-                match step {
-                    ProviderStep::Token(chunk) => {
-                        assistant_text.push_str(&chunk);
-                        let _ = event_tx.send(TuryaEvent::TokenDelta { chunk }).await;
-                    }
-                    ProviderStep::CallTool(call) => {
-                        tool_calls_this_pass += 1;
-                        // Tool budget: stop executing, but stay coherent — the
-                        // denial completes like any other result so the model
-                        // sees it in history instead of hanging.
-                        if tool_executions >= MAX_TOOL_CALLS_PER_TURN {
-                            tool_cap_hit = true;
-                            let res = turya_protocol::ToolResult {
-                                call_id: call.call_id.clone(),
-                                success: false,
-                                output: String::new(),
-                                error: Some("tool budget exhausted".to_string()),
-                            };
-                            let _ = event_tx
-                                .send(TuryaEvent::ToolCallInitiated(call.clone()))
-                                .await;
-                            let _ = event_tx.send(TuryaEvent::ToolCallCompleted(res)).await;
-                            history.push(format!(
-                                "Tool '{}' result (success=false): tool budget exhausted",
-                                call.tool_name
-                            ));
-                            continue;
-                        }
-                        tool_executions += 1;
-                        let result = self.execute_tool_call(&call, &event_tx, &mut perm_rx).await;
-                        let summary = result
-                            .error
-                            .clone()
-                            .filter(|_| !result.success)
-                            .unwrap_or_else(|| result.output.clone());
-                        history.push(format!(
-                            "Tool '{}' result (success={}): {}",
-                            call.tool_name,
-                            result.success,
-                            truncate_history(&summary, MAX_TOOL_HISTORY_CHARS)
-                        ));
-                    }
-                    ProviderStep::Finish => break,
-                }
+            let gate = ToolGate {
+                executions: &mut tool_executions,
+                cap: budgets.tool_calls,
+                execute: true,
+            };
+            let outcome = self
+                .run_pass(prompt, &mut history, &event_tx, &mut perm_rx, gate)
+                .await;
+            if outcome.tool_cap_hit {
+                tool_cap_hit = true;
             }
-
-            // Provider failures must surface: previously `let _ =` swallowed
-            // them into a silent empty turn; inside a loop that trap repeats.
-            match join.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    turn_error = Some(e);
-                    break;
-                }
-                Err(join_err) => {
-                    turn_error = Some(format!("provider task failed: {join_err}"));
-                    break;
-                }
-            }
-
-            if !assistant_text.is_empty() {
-                history.push(format!("Assistant: {assistant_text}"));
-            }
-            // A pass with no tool calls is a final answer: the turn is over.
-            tools_last_pass = tool_calls_this_pass;
-            if tool_calls_this_pass == 0 {
+            // Provider failures must surface: swallowing them here would
+            // repeat the old silent-empty-turn trap inside the loop.
+            if let Some(e) = outcome.provider_err {
+                turn_error = Some(e);
                 break;
             }
+            // Cap hit: further passes could only produce text (every tool
+            // would drop), so skip straight to the summary pass instead of
+            // burning generations. A tool-free pass is a final answer.
+            if tool_cap_hit || outcome.tool_calls == 0 {
+                tools_last_pass = outcome.tool_calls;
+                break;
+            }
+            tools_last_pass = outcome.tool_calls;
         }
 
-        if (passes as usize == MAX_MODEL_CALLS && tools_last_pass > 0) || tool_cap_hit {
+        let budget_hit = (passes == budgets.model_calls && tools_last_pass > 0) || tool_cap_hit;
+        if budget_hit {
+            // Graceful final pass (not a bare stop): one text-only summary.
+            // Tool calls here are structurally dropped — announced as denied
+            // but never executed — so the ending holds even if the model
+            // ignores the no-more-tools instruction.
+            history.push(
+                "Step budget exhausted. Summarize the work done so far and list \
+                 remaining tasks as plain text. Do not call any further tools."
+                    .to_string(),
+            );
+            let gate = ToolGate {
+                executions: &mut tool_executions,
+                cap: budgets.tool_calls,
+                execute: false,
+            };
+            let outcome = self
+                .run_pass(prompt, &mut history, &event_tx, &mut perm_rx, gate)
+                .await;
+            if let Some(e) = outcome.provider_err {
+                turn_error = Some(e);
+            }
             // The budget — not a final answer — ended the turn. Say so visibly.
             let _ = event_tx
                 .send(TuryaEvent::Error {
                     message: format!(
-                        "step budget ({MAX_MODEL_CALLS} model calls / \
-                         {MAX_TOOL_CALLS_PER_TURN} tool calls) exhausted; \
-                         showing results so far"
+                        "step budget ({} model calls / {} tool calls) exhausted; \
+                         showing results so far",
+                        budgets.model_calls, budgets.tool_calls
                     ),
                 })
                 .await;
@@ -228,6 +225,100 @@ impl TuryaEngine {
             hook.record_turn_completed(&self.session_id, turn_id, prompt, success)
                 .await;
         }
+    }
+
+    /// One model invocation: stream its steps, execute (or drop) tool calls,
+    /// accumulate transcript history. Shared by normal passes
+    /// (`execute_tools = true`) and the graceful final summary pass
+    /// (`false`: calls are announced as denied but never run, and nothing
+    /// is appended for them — the summary text is what matters).
+    async fn run_pass(
+        &self,
+        prompt: &str,
+        history: &mut Vec<String>,
+        event_tx: &mpsc::Sender<TuryaEvent>,
+        perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
+        gate: ToolGate<'_>,
+    ) -> PassOutcome {
+        let (step_tx, mut step_rx) = mpsc::channel(32);
+        let provider = self.provider.read().unwrap().clone();
+        let prompt_clone = prompt.to_string();
+        let history_clone = history.clone();
+
+        let join = tokio::spawn(async move {
+            provider
+                .generate_turn(&prompt_clone, &history_clone, step_tx)
+                .await
+        });
+
+        let mut assistant_text = String::new();
+        let mut outcome = PassOutcome {
+            tool_calls: 0,
+            tool_cap_hit: false,
+            provider_err: None,
+        };
+
+        while let Some(step) = step_rx.recv().await {
+            match step {
+                ProviderStep::Token(chunk) => {
+                    assistant_text.push_str(&chunk);
+                    let _ = event_tx.send(TuryaEvent::TokenDelta { chunk }).await;
+                }
+                ProviderStep::CallTool(call) => {
+                    outcome.tool_calls += 1;
+                    // Tool budget (or the final summary pass): stop executing,
+                    // but stay coherent — the denial completes like any other
+                    // result so the model sees it instead of hanging.
+                    if !gate.execute || *gate.executions >= gate.cap {
+                        outcome.tool_cap_hit = true;
+                        let res = turya_protocol::ToolResult {
+                            call_id: call.call_id.clone(),
+                            success: false,
+                            output: String::new(),
+                            error: Some("tool budget exhausted".to_string()),
+                        };
+                        let _ = event_tx
+                            .send(TuryaEvent::ToolCallInitiated(call.clone()))
+                            .await;
+                        let _ = event_tx.send(TuryaEvent::ToolCallCompleted(res)).await;
+                        if gate.execute {
+                            history.push(format!(
+                                "Tool '{}' result (success=false): tool budget exhausted",
+                                call.tool_name
+                            ));
+                        }
+                        continue;
+                    }
+                    *gate.executions += 1;
+                    let result = self.execute_tool_call(&call, event_tx, perm_rx).await;
+                    let summary = result
+                        .error
+                        .clone()
+                        .filter(|_| !result.success)
+                        .unwrap_or_else(|| result.output.clone());
+                    history.push(format!(
+                        "Tool '{}' result (success={}): {}",
+                        call.tool_name,
+                        result.success,
+                        truncate_history(&summary, MAX_TOOL_HISTORY_CHARS)
+                    ));
+                }
+                ProviderStep::Finish => break,
+            }
+        }
+
+        match join.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => outcome.provider_err = Some(e),
+            Err(join_err) => {
+                outcome.provider_err = Some(format!("provider task failed: {join_err}"));
+            }
+        }
+
+        if !assistant_text.is_empty() {
+            history.push(format!("Assistant: {assistant_text}"));
+        }
+        outcome
     }
 
     /// Execute one tool call: announce, permission-gate, run, announce the
@@ -370,6 +461,24 @@ impl TuryaEngine {
                 .await;
         }
     }
+}
+
+/// What one model pass did: how many tools it asked for, whether the tool
+/// cap was hit, and whether the provider itself failed.
+struct PassOutcome {
+    tool_calls: u32,
+    tool_cap_hit: bool,
+    provider_err: Option<String>,
+}
+
+/// Mutable per-pass tool state: execution counter, cap, and whether this
+/// pass may execute at all (the final summary pass may not — its calls
+/// are structurally dropped). Bundles what would otherwise be a
+/// too-many-arguments tail on `run_pass`.
+struct ToolGate<'a> {
+    executions: &'a mut u32,
+    cap: u32,
+    execute: bool,
 }
 
 /// Truncate by chars (never split a boundary) for history entries.

@@ -471,8 +471,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_loop_stops_at_model_call_budget() {
-        // A provider that never stops calling tools: 8 scripts, one per pass.
-        let scripts: Vec<Vec<ProviderStep>> = (0..8)
+        // A provider that never stops calling tools: 8 scripts, one per
+        // pass, plus a text script for the graceful final summary pass.
+        let mut scripts: Vec<Vec<ProviderStep>> = (0..8)
             .map(|i| {
                 vec![
                     tool_call(&format!("b{i}"), "nope_missing", serde_json::json!({})),
@@ -480,6 +481,10 @@ mod tests {
                 ]
             })
             .collect();
+        scripts.push(vec![
+            ProviderStep::Token("summary".to_string()),
+            ProviderStep::Finish,
+        ]);
         let provider = Arc::new(ScriptProvider::new(scripts));
         let tools = Arc::new(turya_tools::ToolRegistry::standard());
         let engine = TuryaEngine::new(provider.clone(), tools, PermissionMode::Open);
@@ -492,6 +497,7 @@ mod tests {
 
         let mut completed = false;
         let mut budget_msg = false;
+        let mut saw_summary = false;
         while let Some(evt) = event_rx.recv().await {
             match evt {
                 TuryaEvent::TurnCompleted { .. } => {
@@ -499,13 +505,110 @@ mod tests {
                     break;
                 }
                 TuryaEvent::Error { message } if message.contains("budget") => budget_msg = true,
+                TuryaEvent::TokenDelta { chunk } if chunk == "summary" => saw_summary = true,
                 _ => {}
             }
         }
 
-        assert_eq!(provider.calls(), 8, "must stop after exactly 8 model calls");
+        assert_eq!(
+            provider.calls(),
+            9,
+            "8 tool passes plus exactly one text-only summary pass"
+        );
+        assert!(saw_summary, "summary pass must stream text");
         assert!(budget_msg, "budget exhaustion must be visible");
         assert!(completed, "turn must still complete");
+        // The summary pass saw the exhaustion instruction, not more tools.
+        let seen = provider.seen_history.lock().unwrap();
+        assert!(
+            seen[8].iter().any(|h| h.contains("Step budget exhausted")),
+            "final history: {:?}",
+            seen[8]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_execution_cap_drops_extra_calls() {
+        // 40 tool calls in 2 passes against a 32-execution cap: the first 32
+        // refuse as unknown tools (fast, no side effects); the rest must be
+        // dropped by the cap with a visible denial. A text script feeds the
+        // graceful final summary pass.
+        let mut scripts: Vec<Vec<ProviderStep>> = (0..2)
+            .map(|p| {
+                let mut steps: Vec<ProviderStep> = (0..20)
+                    .map(|i| tool_call(&format!("c{p}_{i}"), "nope_missing", serde_json::json!({})))
+                    .collect();
+                steps.push(ProviderStep::Finish);
+                steps
+            })
+            .collect();
+        scripts.push(vec![
+            ProviderStep::Token("capped".to_string()),
+            ProviderStep::Finish,
+        ]);
+        let provider = Arc::new(ScriptProvider::new(scripts));
+        let tools = Arc::new(turya_tools::ToolRegistry::standard());
+        let engine = TuryaEngine::new(provider.clone(), tools, PermissionMode::Open);
+        engine.set_budgets(Some(8), Some(32));
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (_perm_tx, perm_rx) = mpsc::channel(1);
+
+        engine
+            .run_turn("loop4", "go", AgentMode::Build, event_tx, perm_rx)
+            .await;
+
+        let mut completed = false;
+        let mut cap_denials = 0u32;
+        while let Some(evt) = event_rx.recv().await {
+            match evt {
+                TuryaEvent::TurnCompleted { .. } => {
+                    completed = true;
+                    break;
+                }
+                TuryaEvent::ToolCallCompleted(res)
+                    if res.error.as_deref() == Some("tool budget exhausted") =>
+                {
+                    cap_denials += 1;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            provider.calls(),
+            3,
+            "2 tool passes plus the summary pass; cap must not loop"
+        );
+        assert_eq!(cap_denials, 8, "calls 33-40 must be dropped, not executed");
+        assert!(completed);
+    }
+
+    #[tokio::test]
+    async fn test_set_budgets_applies_per_side() {
+        // A zero-tool text turn completes in one pass under any budget; this
+        // exercises set_budgets (including the zero-clamp) without looping.
+        let provider = Arc::new(MockProvider {
+            responses: vec![ProviderStep::Token("hi".to_string()), ProviderStep::Finish],
+        });
+        let tools = Arc::new(turya_tools::ToolRegistry::standard());
+        let engine = TuryaEngine::new(provider, tools, PermissionMode::Open);
+        engine.set_budgets(Some(3), None);
+        engine.set_budgets(None, Some(0)); // clamps to 1, never 0
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (_perm_tx, perm_rx) = mpsc::channel(1);
+
+        engine
+            .run_turn("loop5", "hi", AgentMode::Build, event_tx, perm_rx)
+            .await;
+
+        let mut completed = false;
+        while let Some(evt) = event_rx.recv().await {
+            if matches!(evt, TuryaEvent::TurnCompleted { .. }) {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
     }
 
     #[tokio::test]

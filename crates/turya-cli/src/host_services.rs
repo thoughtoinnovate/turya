@@ -316,7 +316,15 @@ impl HostServices {
                 permission_mode: _,
                 provider,
                 model,
+                max_steps,
+                max_tool_calls,
             } => {
+                // Budgets apply even when no provider/model switch rides
+                // along. Infallible (engine clamps): the client echoes
+                // optimistically, like the model-switch toast.
+                if max_steps.is_some() || max_tool_calls.is_some() {
+                    self.engine.set_budgets(*max_steps, *max_tool_calls);
+                }
                 // Engine-bound switching; permission_mode passes through to session.
                 if provider.is_none() && model.is_none() {
                     return false;
@@ -982,6 +990,8 @@ mod tests {
                     permission_mode: None,
                     provider: Some("nope".to_string()),
                     model: None,
+                    max_steps: None,
+                    max_tool_calls: None,
                 },
                 &sink,
             )
@@ -992,6 +1002,31 @@ mod tests {
             e,
             TuryaEvent::Error { message } if message.contains("unknown provider")
         )));
+    }
+
+    #[tokio::test]
+    async fn budgets_only_update_applies_without_switch() {
+        let (host, tx, mut rx) = harness();
+        let sink = HostEventSink::new(tx);
+        // No provider/model: budgets apply, nothing to switch, no error.
+        let consumed = host
+            .handle(
+                &TuryaCommand::UpdateConfig {
+                    permission_mode: None,
+                    provider: None,
+                    model: None,
+                    max_steps: Some(12),
+                    max_tool_calls: Some(40),
+                },
+                &sink,
+            )
+            .await;
+        assert!(!consumed);
+        let evts = drain(&mut rx);
+        assert!(
+            !evts.iter().any(|e| matches!(e, TuryaEvent::Error { .. })),
+            "budget-only update must be silent: {evts:?}"
+        );
     }
 
     #[tokio::test]
@@ -1041,6 +1076,8 @@ mod tests {
                     permission_mode: None,
                     provider: Some("gemini".to_string()),
                     model: Some("gemini-flash-latest".to_string()),
+                    max_steps: None,
+                    max_tool_calls: None,
                 },
                 &sink,
             )
@@ -1159,6 +1196,8 @@ mod tests {
                     permission_mode: None,
                     provider: Some("anthropic".to_string()),
                     model: Some("claude-sonnet-4-5".to_string()),
+                    max_steps: None,
+                    max_tool_calls: None,
                 },
                 &sink,
             )

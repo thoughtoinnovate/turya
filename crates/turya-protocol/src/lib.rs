@@ -70,6 +70,11 @@ pub enum TuryaCommand {
         permission_mode: Option<PermissionMode>,
         provider: Option<String>,
         model: Option<String>,
+        /// Per-turn step budgets (`/steps`): model generations and tool
+        /// executions. `None` leaves that side unchanged. Additive schema:
+        /// old clients simply never send these.
+        max_steps: Option<usize>,
+        max_tool_calls: Option<u32>,
     },
     /// List registered providers and their models (drives `/models`).
     ListProviders,
@@ -223,6 +228,8 @@ mod tests {
                 permission_mode: None,
                 provider: Some("gemini".to_string()),
                 model: Some("gemini-2.5-pro".to_string()),
+                max_steps: None,
+                max_tool_calls: None,
             },
         ];
         for cmd in cmds {

@@ -24,12 +24,15 @@ use flows::{AuthFlow, AuthStage, BrowserFlow, BrowserMode, Flow};
 use slash::{Completer, SlashRegistry};
 
 /// Centered overlay rect sitting just above the input pane (which sits
-/// above the 1-row status bar, hence the +4 offset).
-fn centered_popup(area: Rect, width: u16, height: u16) -> Rect {
+/// above the 1-row status bar). `reserved_bottom` is the input height + 1
+/// so growing multiline drafts push overlays up instead of under them.
+fn centered_popup(area: Rect, width: u16, height: u16, reserved_bottom: u16) -> Rect {
     let w = width.min(area.width);
-    let h = height.min(area.height.saturating_sub(4)).max(3);
+    let h = height
+        .min(area.height.saturating_sub(reserved_bottom))
+        .max(3);
     let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h + 4);
+    let y = area.y + area.height.saturating_sub(h + reserved_bottom);
     Rect {
         x,
         y,
@@ -58,6 +61,28 @@ enum EscAction {
     CloseFlow,
     Ignore,
     AbortTurn,
+}
+
+/// One retained tool output for on-demand expansion (`Ctrl+E`).
+#[derive(Debug, Clone)]
+struct StoredOutput {
+    tool: String,
+    /// Full output text, bounded at store time.
+    full: String,
+    expanded: bool,
+}
+
+/// Bound the retained full text: expansion is for reading, not paging
+/// megabytes through the transcript.
+const MAX_STORED_OUTPUT_CHARS: usize = 4000;
+/// Bound the retained entries: old outputs age out, newest survive.
+const MAX_OUTPUT_ENTRIES: usize = 20;
+/// One transcript row: text plus its visual voice.
+#[derive(Debug, Clone)]
+struct TLine {
+    text: String,
+    /// System toasts and separators: dimmed so content stands out.
+    dim: bool,
 }
 
 /// Render a user prompt into the transcript (pure).
@@ -103,11 +128,16 @@ pub struct TuiApp {
     input: String,
     /// Single chronological transcript: user messages, assistant tokens,
     /// tool activity, and toasts all render here (no separate tool box).
-    streamed_text: String,
+    /// Rows carry their own voice: system toasts and separators render
+    /// dimmed so user/assistant/tool content stands out.
+    transcript: Vec<TLine>,
     pending_permission: Option<(String, String)>, // (request_id, action)
     /// call_id → tool name, filled on Initiated, drained on Completed, so
     /// result lines can name the tool (`ToolResult` carries no name).
     pending_tools: std::collections::HashMap<String, String>,
+    /// Retained full tool outputs for on-demand expansion (`Ctrl+E`).
+    /// Only outputs longer than the inline preview are kept, newest last.
+    tool_outputs: std::collections::VecDeque<StoredOutput>,
     /// Active provider selection: (provider, model, via). Set optimistically
     /// on switch, corrected by `ProviderState` events from the host.
     provider: Option<(String, String, String)>,
@@ -143,9 +173,10 @@ impl TuiApp {
     pub fn new() -> Self {
         Self {
             input: String::new(),
-            streamed_text: String::new(),
+            transcript: Vec::new(),
             pending_permission: None,
             pending_tools: std::collections::HashMap::new(),
+            tool_outputs: std::collections::VecDeque::new(),
             provider: None,
             sent_chars: 0,
             recv_chars: 0,
@@ -163,8 +194,120 @@ impl TuiApp {
     /// Append one line to the transcript (the single home for chat, tool
     /// activity, and toasts — there is no separate tool box).
     fn log_line(&mut self, line: String) {
-        self.streamed_text.push_str(&line);
-        self.streamed_text.push('\n');
+        self.transcript.push(TLine {
+            text: line,
+            dim: false,
+        });
+    }
+
+    /// Append a dimmed system toast (routing notices, usage hints).
+    /// Warnings, errors, and confirmations stay full-bright.
+    fn log_dim(&mut self, line: String) {
+        self.transcript.push(TLine {
+            text: line,
+            dim: true,
+        });
+    }
+
+    /// Append a (possibly multi-line) block, preserving blank lines so
+    /// rendering matches the old plain-string transcript exactly.
+    fn push_block(&mut self, text: &str, dim: bool) {
+        for line in text.split('\n') {
+            self.transcript.push(TLine {
+                text: line.to_string(),
+                dim,
+            });
+        }
+    }
+
+    /// Stream one token chunk: extend the current content line, or start a
+    /// new one when the transcript is empty or ends in a dimmed row.
+    fn push_text(&mut self, chunk: &str) {
+        match self.transcript.last_mut() {
+            Some(last) if !last.dim => last.text.push_str(chunk),
+            _ => self.transcript.push(TLine {
+                text: chunk.to_string(),
+                dim: false,
+            }),
+        }
+    }
+
+    /// Plain-text view: test assertions and scroll math. Styles live only
+    /// in `transcript_lines()` at render time.
+    fn transcript_text(&self) -> String {
+        self.transcript
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Styled rows for the chat widget.
+    fn transcript_lines(&self) -> Vec<Line<'_>> {
+        self.transcript
+            .iter()
+            .map(|l| {
+                let style = if l.dim {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                Line::styled(l.text.as_str(), style)
+            })
+            .collect()
+    }
+
+    /// Clear all transcript rows (`/clear`).
+    fn clear_transcript(&mut self) {
+        self.transcript.clear();
+    }
+
+    /// Retain a tool's full output when it exceeds the inline preview,
+    /// so `Ctrl+E` can expand it later. Failures keep their error text.
+    fn retain_output(&mut self, tool_name: &str, res: &turya_protocol::ToolResult) {
+        let full = if res.success {
+            res.output.clone()
+        } else {
+            res.error.clone().unwrap_or_default()
+        };
+        // Same bound the preview uses: at most the preview is shown inline.
+        if full.trim().len() <= 300 {
+            return;
+        }
+        let mut text: String = full.chars().take(MAX_STORED_OUTPUT_CHARS).collect();
+        if full.chars().count() > MAX_STORED_OUTPUT_CHARS {
+            text.push_str("…[stored truncated]");
+        }
+        self.tool_outputs.push_back(StoredOutput {
+            tool: tool_name.to_string(),
+            full: text,
+            expanded: false,
+        });
+        while self.tool_outputs.len() > MAX_OUTPUT_ENTRIES {
+            self.tool_outputs.pop_front();
+        }
+    }
+
+    /// Expand the most recent unexpanded output into the transcript
+    /// (`Ctrl+E`). Each entry expands once; afterwards there is nothing
+    /// left to show and the user is told so.
+    fn expand_last_output(&mut self) {
+        let next = self
+            .tool_outputs
+            .iter_mut()
+            .rev()
+            .find(|e| !e.expanded)
+            .map(|e| {
+                e.expanded = true;
+                (e.tool.clone(), e.full.clone())
+            });
+        match next {
+            Some((tool, full)) => {
+                self.log_dim(format!("── full output: {tool} ──"));
+                self.push_block(&full, false);
+            }
+            None => self.log_dim("ℹ no truncated output to expand".to_string()),
+        }
     }
 
     /// Approximate wrapped line count for scroll math (no new deps):
@@ -255,7 +398,7 @@ impl TuiApp {
     async fn submit_prompt(&mut self, prompt: String, cmd_tx: &mpsc::Sender<TuryaCommand>) {
         self.sent_chars += prompt.len();
         self.scroll_to_bottom();
-        self.streamed_text.push_str(&format_user_message(&prompt));
+        self.push_block(&format_user_message(&prompt), false);
         let _ = cmd_tx
             .send(TuryaCommand::SubmitPrompt {
                 prompt,
@@ -292,20 +435,76 @@ impl TuiApp {
                     for c in self.registry.filter("") {
                         text.push_str(&format!("  /{} — {}\n", c.name, c.description));
                     }
-                    self.streamed_text.push_str(&text);
+                    self.push_block(&text, false);
                 }
                 "clear" => {
-                    self.streamed_text.clear();
+                    self.clear_transcript();
                 }
                 "thinking" => {
                     self.show_thinking = !self.show_thinking;
-                    self.log_line(format!(
+                    self.log_dim(format!(
                         "ℹ reasoning display {}",
                         if self.show_thinking { "on" } else { "off" }
                     ));
                 }
+                "steps" => {
+                    // `/steps [model_calls] [tool_calls]`: per-turn budgets.
+                    // Bare `/steps` reports the convention (engine owns truth;
+                    // 8/32 are the shipped defaults).
+                    let parts: Vec<&str> = args.split_whitespace().collect();
+                    let parse_steps = |s: &str| s.parse::<usize>().ok().filter(|&n| n > 0);
+                    let parse_tools = |s: &str| s.parse::<u32>().ok().filter(|&n| n > 0);
+                    match parts.as_slice() {
+                        [] => self.log_dim(
+                            "ℹ usage: /steps [model_calls] [tool_calls] (defaults 8 32)"
+                                .to_string(),
+                        ),
+                        [m] => match parse_steps(m) {
+                            Some(mc) => {
+                                self.log_dim(format!("→ budgets set: {mc} model calls per turn…"));
+                                let _ = cmd_tx
+                                    .send(TuryaCommand::UpdateConfig {
+                                        permission_mode: None,
+                                        provider: None,
+                                        model: None,
+                                        max_steps: Some(mc),
+                                        max_tool_calls: None,
+                                    })
+                                    .await;
+                            }
+                            None => self.log_dim(
+                                "ℹ usage: /steps [model_calls] [tool_calls] (positive integers)"
+                                    .to_string(),
+                            ),
+                        },
+                        [m, t] => match (parse_steps(m), parse_tools(t)) {
+                            (Some(mc), Some(tc)) => {
+                                self.log_dim(format!(
+                                    "→ budgets set: {mc} model calls, {tc} tool calls per turn…"
+                                ));
+                                let _ = cmd_tx
+                                    .send(TuryaCommand::UpdateConfig {
+                                        permission_mode: None,
+                                        provider: None,
+                                        model: None,
+                                        max_steps: Some(mc),
+                                        max_tool_calls: Some(tc),
+                                    })
+                                    .await;
+                            }
+                            _ => self.log_dim(
+                                "ℹ usage: /steps [model_calls] [tool_calls] (positive integers)"
+                                    .to_string(),
+                            ),
+                        },
+                        _ => self.log_line(
+                            "ℹ usage: /steps [model_calls] [tool_calls] (positive integers)"
+                                .to_string(),
+                        ),
+                    }
+                }
                 _ => {
-                    self.log_line(format!("ℹ /{name} is coming soon"));
+                    self.log_dim(format!("ℹ /{name} is coming soon"));
                 }
             },
             _ => match name {
@@ -324,7 +523,7 @@ impl TuiApp {
                     }
                 }
                 _ => {
-                    self.log_line(format!("ℹ unknown command /{name}"));
+                    self.log_dim(format!("ℹ unknown command /{name}"));
                 }
             },
         }
@@ -412,13 +611,15 @@ impl TuiApp {
                                     // Optimistic label too, corrected by ProviderState.
                                     self.provider =
                                         Some((pid.clone(), mid.clone(), "…".to_string()));
-                                    self.log_line(format!("→ switching to {pid}/{mid}…"));
+                                    self.log_dim(format!("→ switching to {pid}/{mid}…"));
                                     self.flow = Flow::None;
                                     let _ = cmd_tx
                                         .send(TuryaCommand::UpdateConfig {
                                             permission_mode: None,
                                             provider: Some(pid),
                                             model: Some(mid),
+                                            max_steps: None,
+                                            max_tool_calls: None,
                                         })
                                         .await;
                                     return;
@@ -538,7 +739,7 @@ impl TuiApp {
                         ));
                         return;
                     }
-                    self.log_line(format!("ℹ unknown provider '{target}'"));
+                    self.log_dim(format!("ℹ unknown provider '{target}'"));
                 }
                 if let Flow::Browser(ref mut b) = self.flow {
                     b.set_providers(views);
@@ -610,7 +811,7 @@ impl TuiApp {
             }
             TuryaEvent::TokenDelta { chunk } => {
                 self.recv_chars += chunk.len();
-                self.streamed_text.push_str(chunk);
+                self.push_text(chunk);
             }
             TuryaEvent::ToolCallInitiated(call) => {
                 self.log_line(format!("⚡ {}", call.tool_name));
@@ -625,6 +826,7 @@ impl TuiApp {
                 for line in format_tool_result(&name, res) {
                     self.log_line(line);
                 }
+                self.retain_output(&name, res);
             }
             TuryaEvent::PermissionRequested {
                 request_id, action, ..
@@ -640,7 +842,7 @@ impl TuiApp {
             }
             TuryaEvent::TurnCompleted { .. } => {
                 self.turn_active = false;
-                self.log_line("────────────────────────────────────────".to_string());
+                self.log_dim("────────────────────────────────────────".to_string());
             }
             TuryaEvent::Error { message } => {
                 self.turn_active = false;
@@ -649,16 +851,24 @@ impl TuiApp {
             _ => {}
         }
     }
+    /// Input pane height: grows with the draft (Alt+Enter newlines) so
+    /// every line stays visible, capped so the transcript keeps its rows.
+    /// Includes the 2 border rows.
+    fn input_height(&self) -> u16 {
+        (self.input.lines().count().max(1) as u16 + 2).min(6)
+    }
+
     /// Render one full frame. Split out of `run()` so headless tests can
     /// drive the REAL draw path with ratatui's `TestBackend`.
     fn render(&self, f: &mut Frame) {
+        let input_h = self.input_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // Top bar: identity + live spinner
-                Constraint::Min(5),    // Chat transcript (tools inline)
-                Constraint::Length(3), // Input Box / Permission Prompt
-                Constraint::Length(1), // Status bar (no borders: 1 row)
+                Constraint::Length(1),       // Top bar: identity + live spinner
+                Constraint::Min(5),          // Chat transcript (tools inline)
+                Constraint::Length(input_h), // Input Box / Permission Prompt
+                Constraint::Length(1),       // Status bar (no borders: 1 row)
             ])
             .split(f.area());
 
@@ -674,12 +884,12 @@ impl TuiApp {
         // the bottom unless the user scrolled back (see scroll_lines_up).
         let inner_w = chunks[1].width.saturating_sub(2).max(1) as usize;
         let inner_h = chunks[1].height.saturating_sub(2) as usize;
-        let total = Self::wrapped_lines(&self.streamed_text, inner_w);
+        let total = Self::wrapped_lines(&self.transcript_text(), inner_w);
         let max_off = total.saturating_sub(inner_h).min(u16::MAX as usize);
         // Follow-bottom by default: the viewport sits max_off down, lifted
         // toward the top by the scroll-back lock.
         let off = max_off.saturating_sub(self.scroll_lines_up) as u16;
-        let chat = Paragraph::new(self.streamed_text.as_str())
+        let chat = Paragraph::new(self.transcript_lines())
             .wrap(Wrap { trim: false })
             .scroll((off, 0))
             .block(Block::default().borders(Borders::ALL).title("Assistant"));
@@ -706,7 +916,7 @@ impl TuiApp {
             let input_widget = Paragraph::new(self.input.as_str()).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Prompt (Enter send · / commands · Esc stop · Ctrl+C quit)"),
+                    .title("Prompt (Enter send · Alt+Enter newline · Ctrl+E expand · Esc stop)"),
             );
             f.render_widget(input_widget, chunks[2]);
         }
@@ -726,7 +936,8 @@ impl TuiApp {
                 .map(Line::from)
                 .collect();
             if !rows.is_empty() {
-                let area = centered_popup(f.area(), 60, (rows.len() as u16 + 2).min(9));
+                let area =
+                    centered_popup(f.area(), 60, (rows.len() as u16 + 2).min(9), input_h + 1);
                 let popup = Paragraph::new(rows)
                     .block(Block::default().borders(Borders::ALL).title("Commands"));
                 f.render_widget(ratatui::widgets::Clear, area);
@@ -740,7 +951,7 @@ impl TuiApp {
             Flow::Browser(b) => {
                 let (left, right) = flows::render_browser(b);
                 let height = (left.len().max(right.len()) as u16 + 2).min(16);
-                let area = centered_popup(f.area(), 72, height);
+                let area = centered_popup(f.area(), 72, height, input_h + 1);
                 let cols = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -765,7 +976,8 @@ impl TuiApp {
             }
             Flow::Auth(a) => {
                 let rows: Vec<Line> = flows::render_auth(a).into_iter().map(Line::from).collect();
-                let area = centered_popup(f.area(), 70, (rows.len() as u16 + 2).min(14));
+                let area =
+                    centered_popup(f.area(), 70, (rows.len() as u16 + 2).min(14), input_h + 1);
                 let popup = Paragraph::new(rows).block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -901,11 +1113,27 @@ impl TuiApp {
                                 self.completer = Some(Completer::new());
                                 self.input.push('/');
                             }
+                            // Ctrl+E expands the last truncated tool output.
+                            // Checked before the generic Char arm; quit keys
+                            // (Ctrl+C/D) are handled far above, no conflict.
+                            KeyCode::Char(c)
+                                if (c == 'e' || c == 'E')
+                                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                self.expand_last_output();
+                            }
                             KeyCode::Char(c) => self.input.push(c),
                             KeyCode::Backspace => { self.input.pop(); }
                             KeyCode::PageUp => self.scroll_up(),
                             KeyCode::PageDown => self.scroll_down(),
                             KeyCode::End => self.scroll_to_bottom(),
+                            // Alt+Enter inserts a newline (multiline draft);
+                            // most terminals deliver it as Enter+ALT.
+                            KeyCode::Enter
+                                if key.modifiers.contains(KeyModifiers::ALT) =>
+                            {
+                                self.input.push('\n');
+                            }
                             KeyCode::Enter if !self.input.trim().is_empty() => {
                                 let prompt = std::mem::take(&mut self.input);
                                 self.submit_prompt(prompt, &cmd_tx).await;
@@ -992,7 +1220,7 @@ mod tests {
         app.pending_auth = Some("nope".to_string());
         app.feed_flow_event(&listed());
         assert!(matches!(app.flow, Flow::Browser(_)));
-        assert!(app.streamed_text.contains("unknown provider"));
+        assert!(app.transcript_text().contains("unknown provider"));
     }
 
     #[test]
@@ -1021,7 +1249,7 @@ mod tests {
             Flow::Auth(a) => assert!(matches!(a.stage, AuthStage::Done(_))),
             _ => panic!("expected auth flow"),
         }
-        assert!(app.streamed_text.contains("connected via api-key"));
+        assert!(app.transcript_text().contains("connected via api-key"));
     }
 
     #[test]
@@ -1031,7 +1259,7 @@ mod tests {
             flow_id: "f9".to_string(),
             reason: "bad code".to_string(),
         });
-        assert!(app.streamed_text.contains("bad code"));
+        assert!(app.transcript_text().contains("bad code"));
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -1210,7 +1438,7 @@ mod tests {
             }
             other => panic!("expected UpdateConfig, got {:?}", other),
         }
-        assert!(app.streamed_text.contains("switching to"));
+        assert!(app.transcript_text().contains("switching to"));
     }
 
     #[tokio::test]
@@ -1219,8 +1447,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         app.submit_prompt("understand codebase".to_string(), &tx)
             .await;
-        assert!(app.streamed_text.contains("understand codebase"));
-        assert!(app.streamed_text.contains("👤"));
+        assert!(app.transcript_text().contains("understand codebase"));
+        assert!(app.transcript_text().contains("👤"));
         match rx.recv().await.expect("expected a command") {
             TuryaCommand::SubmitPrompt { prompt, .. } => {
                 assert_eq!(prompt, "understand codebase")
@@ -1245,8 +1473,8 @@ mod tests {
             output: "line1\nline2\n".to_string(),
             error: None,
         }));
-        assert!(app.streamed_text.contains("✔ run_bash"));
-        assert!(app.streamed_text.contains("line1"));
+        assert!(app.transcript_text().contains("✔ run_bash"));
+        assert!(app.transcript_text().contains("line1"));
 
         // Unknown call ids still render (never silent, never panics).
         app.feed_flow_event(&TuryaEvent::ToolCallCompleted(ToolResult {
@@ -1255,8 +1483,8 @@ mod tests {
             output: String::new(),
             error: Some("boom".to_string()),
         }));
-        assert!(app.streamed_text.contains("✘ tool"));
-        assert!(app.streamed_text.contains("boom"));
+        assert!(app.transcript_text().contains("✘ tool"));
+        assert!(app.transcript_text().contains("boom"));
     }
 
     #[test]
@@ -1312,7 +1540,7 @@ mod tests {
         assert!(app.show_thinking);
         app.dispatch_slash("thinking", "", &tx).await;
         assert!(!app.show_thinking);
-        assert!(app.streamed_text.contains("reasoning display off"));
+        assert!(app.transcript_text().contains("reasoning display off"));
         app.dispatch_slash("thinking", "", &tx).await;
         assert!(app.show_thinking);
     }
@@ -1433,5 +1661,128 @@ mod tests {
         app.scroll_up();
         app.scroll_to_bottom();
         assert_eq!(app.scroll_lines_up, 0);
+    }
+
+    #[tokio::test]
+    async fn steps_command_sends_budgets() {
+        let mut app = TuiApp::new();
+        let (tx, mut rx) = mpsc::channel(32);
+        app.dispatch_slash("steps", "12 40", &tx).await;
+        match rx.recv().await.expect("expected a command") {
+            TuryaCommand::UpdateConfig {
+                max_steps,
+                max_tool_calls,
+                provider,
+                model,
+                ..
+            } => {
+                assert_eq!(max_steps, Some(12));
+                assert_eq!(max_tool_calls, Some(40));
+                assert_eq!(provider, None);
+                assert_eq!(model, None);
+            }
+            other => panic!("expected UpdateConfig, got {other:?}"),
+        }
+        assert!(app.transcript_text().contains("budgets set"));
+    }
+
+    #[tokio::test]
+    async fn steps_command_rejects_garbage() {
+        let mut app = TuiApp::new();
+        let (tx, mut rx) = mpsc::channel(32);
+        app.dispatch_slash("steps", "lots", &tx).await;
+        assert!(rx.try_recv().is_err(), "no command on bad input");
+        assert!(app.transcript_text().contains("usage: /steps"));
+        // Bare /steps reports usage, sends nothing.
+        app.dispatch_slash("steps", "", &tx).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn input_height_grows_with_draft() {
+        let mut app = TuiApp::new();
+        assert_eq!(app.input_height(), 3);
+        app.input = "one\ntwo\nthree".to_string();
+        assert_eq!(app.input_height(), 5);
+        app.input = (0..20)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(app.input_height(), 6);
+    }
+
+    #[test]
+    fn multiline_draft_renders_all_lines() {
+        let mut app = TuiApp::new();
+        app.input = "first\nsecond".to_string();
+        let text = rendered(&app, 80, 20);
+        assert!(text.contains("first"), "line 1 lost:\n{text}");
+        assert!(text.contains("second"), "line 2 lost:\n{text}");
+    }
+
+    #[test]
+    fn ctrl_e_expands_truncated_output_once() {
+        use turya_protocol::{ToolCall, ToolResult};
+        let mut app = TuiApp::new();
+        let big = "x".repeat(500);
+        app.feed_flow_event(&TuryaEvent::ToolCallInitiated(ToolCall {
+            call_id: "g9".to_string(),
+            tool_name: "run_bash".to_string(),
+            parameters: serde_json::json!({}),
+        }));
+        app.feed_flow_event(&TuryaEvent::ToolCallCompleted(ToolResult {
+            call_id: "g9".to_string(),
+            success: true,
+            output: big.clone(),
+            error: None,
+        }));
+        // Inline shows the truncated preview, never the full text.
+        assert!(app.transcript_text().contains("[+"));
+        assert!(!app.transcript_text().contains(&big));
+        // Ctrl+E pours the full text in — exactly once.
+        app.expand_last_output();
+        assert!(app.transcript_text().contains(&big));
+        app.expand_last_output();
+        assert!(app.transcript_text().contains("no truncated output"));
+    }
+
+    #[test]
+    fn short_outputs_are_not_retained() {
+        use turya_protocol::{ToolCall, ToolResult};
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&TuryaEvent::ToolCallInitiated(ToolCall {
+            call_id: "g8".to_string(),
+            tool_name: "run_bash".to_string(),
+            parameters: serde_json::json!({}),
+        }));
+        app.feed_flow_event(&TuryaEvent::ToolCallCompleted(ToolResult {
+            call_id: "g8".to_string(),
+            success: true,
+            output: "ok".to_string(),
+            error: None,
+        }));
+        app.expand_last_output();
+        assert!(app.transcript_text().contains("no truncated output"));
+    }
+
+    #[test]
+    fn system_toasts_render_dimmed() {
+        let mut app = TuiApp::new();
+        app.log_line("content".to_string());
+        app.log_dim("toast".to_string());
+        let rows = app.transcript_lines();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].style, Style::default());
+        assert_eq!(rows[1].style, Style::default().fg(Color::DarkGray));
+    }
+
+    #[test]
+    fn token_stream_starts_new_line_after_dim() {
+        let mut app = TuiApp::new();
+        app.push_text("hel");
+        app.push_text("lo");
+        app.log_dim("───".to_string());
+        app.push_text("next");
+        assert_eq!(app.transcript_text(), "hello\n───\nnext");
     }
 }
