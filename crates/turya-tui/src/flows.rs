@@ -91,10 +91,14 @@ impl BrowserFlow {
         self.reset_selection();
     }
 
-    /// Replace the filter text (resets selection + scroll).
+    /// Replace the filter text (resets selection + scroll, but PRESERVES
+    /// the focused pane — typing must never yank focus back to providers).
     pub fn set_query(&mut self, query: String) {
         self.query = query;
-        self.reset_selection();
+        self.sel_prov = 0;
+        self.sel_model = 0;
+        self.prov_offset = 0;
+        self.model_offset = 0;
     }
 
     fn reset_selection(&mut self) {
@@ -465,6 +469,23 @@ mod tests {
         assert!(f.selected_model().is_none());
         let (left, _) = render_browser(&f);
         assert!(left.iter().any(|l| l.contains("no match")));
+    }
+
+    #[test]
+    fn query_preserves_focused_pane() {
+        // Regression: typing in model selection yanked focus back to
+        // providers, making search appear provider-only.
+        let mut f = sample();
+        f.right = true;
+        f.set_query("flash".to_string());
+        assert!(f.right, "typing must not steal pane focus");
+        assert_eq!(
+            f.selected_model(),
+            Some(("gemini".to_string(), "gemini-2.5-flash".to_string()))
+        );
+        // Clearing the query keeps the pane too.
+        f.set_query(String::new());
+        assert!(f.right);
     }
 
     #[test]
