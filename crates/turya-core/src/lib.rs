@@ -3,6 +3,7 @@ pub mod hooks;
 pub mod permissions;
 pub mod plugins;
 pub mod provider;
+pub mod tasks;
 
 pub use engine::TuryaEngine;
 pub use hooks::{DiagnosticsHook, FileDiagnostic, MemoryHook};
@@ -11,6 +12,7 @@ pub use plugins::{
     AuthMethodKind, ModelInfo, ProviderPlugin, ProviderRegistry, ResolvedCreds, UiPlugin,
 };
 pub use provider::{LlmProvider, MockProvider, ProviderStep};
+pub use tasks::{TaskId, TaskKind, TaskRegistry};
 
 #[cfg(test)]
 mod tests {
@@ -20,6 +22,7 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
+    use turya_protocol::Transcript;
     use turya_protocol::{AgentMode, PermissionMode, ToolCall, TuryaEvent};
 
     /// In-memory fake for the memory seam: records hook calls, serves canned rules.
@@ -78,6 +81,7 @@ mod tests {
                     call_id: "1".to_string(),
                     tool_name: "view_file".to_string(),
                     parameters: serde_json::json!({"path": "Cargo.toml"}),
+                    signature: None,
                 }),
                 ProviderStep::Finish,
             ],
@@ -90,7 +94,7 @@ mod tests {
 
         tokio::spawn(async move {
             engine
-                .run_turn("test_turn", "hi", AgentMode::Build, event_tx, perm_rx)
+                .run_turn("test_turn", "hi", AgentMode::Build, &[], event_tx, perm_rx)
                 .await;
         });
 
@@ -138,7 +142,7 @@ mod tests {
 
         tokio::spawn(async move {
             engine
-                .run_turn("swap", "hi", AgentMode::Build, event_tx, perm_rx)
+                .run_turn("swap", "hi", AgentMode::Build, &[], event_tx, perm_rx)
                 .await;
         });
 
@@ -167,7 +171,7 @@ mod tests {
         let (_perm_tx, perm_rx) = mpsc::channel(1);
 
         engine
-            .run_turn("t1", "hello", AgentMode::Build, event_tx, perm_rx)
+            .run_turn("t1", "hello", AgentMode::Build, &[], event_tx, perm_rx)
             .await;
         // Drain events so the sender side fully completes.
         while event_rx.recv().await.is_some() {}
@@ -191,7 +195,7 @@ mod tests {
 
         tokio::spawn(async move {
             engine
-                .run_turn("t0", "deploy", AgentMode::Build, event_tx, perm_rx)
+                .run_turn("t0", "deploy", AgentMode::Build, &[], event_tx, perm_rx)
                 .await;
         });
 
@@ -220,6 +224,7 @@ mod tests {
                     call_id: "f1".to_string(),
                     tool_name: "run_bash".to_string(),
                     parameters: serde_json::json!({"command": "exit 1"}),
+                    signature: None,
                 }),
                 ProviderStep::Finish,
             ],
@@ -232,7 +237,7 @@ mod tests {
         let (_perm_tx, perm_rx) = mpsc::channel(1);
 
         engine
-            .run_turn("t3", "break it", AgentMode::Build, event_tx, perm_rx)
+            .run_turn("t3", "break it", AgentMode::Build, &[], event_tx, perm_rx)
             .await;
         while event_rx.recv().await.is_some() {}
 
@@ -259,6 +264,7 @@ mod tests {
                         "path": target.to_string_lossy(),
                         "content": "hello",
                     }),
+                    signature: None,
                 }),
                 ProviderStep::Finish,
             ],
@@ -273,7 +279,7 @@ mod tests {
 
         tokio::spawn(async move {
             engine
-                .run_turn("t2", "write it", AgentMode::Build, event_tx, perm_rx)
+                .run_turn("t2", "write it", AgentMode::Build, &[], event_tx, perm_rx)
                 .await;
         });
 
@@ -314,6 +320,7 @@ mod tests {
                         "path": target.to_string_lossy(),
                         "content": "fn broken( {",
                     }),
+                    signature: None,
                 }),
                 ProviderStep::Finish,
             ],
@@ -333,7 +340,14 @@ mod tests {
 
         tokio::spawn(async move {
             engine
-                .run_turn("t4", "write broken", AgentMode::Build, event_tx, perm_rx)
+                .run_turn(
+                    "t4",
+                    "write broken",
+                    AgentMode::Build,
+                    &[],
+                    event_tx,
+                    perm_rx,
+                )
                 .await;
         });
 
@@ -358,12 +372,12 @@ mod tests {
     }
 
     /// Scripted provider for loop tests: serves one canned step-list per
-    /// `generate_turn` call and records the history it was given, so tests
+    /// `generate_turn` call and records the transcript it was given, so tests
     /// can assert exactly what the engine fed back. (`MockProvider` replays
     /// one script forever, which cannot model multi-pass turns.)
     struct ScriptProvider {
         scripts: Mutex<Vec<Vec<ProviderStep>>>,
-        seen_history: Mutex<Vec<Vec<String>>>,
+        seen_history: Mutex<Vec<Transcript>>,
         fail_with: Option<String>,
     }
 
@@ -391,11 +405,10 @@ mod tests {
     impl LlmProvider for ScriptProvider {
         async fn generate_turn(
             &self,
-            _prompt: &str,
-            history: &[String],
+            transcript: &Transcript,
             tx: mpsc::Sender<ProviderStep>,
         ) -> Result<(), String> {
-            self.seen_history.lock().unwrap().push(history.to_vec());
+            self.seen_history.lock().unwrap().push(transcript.clone());
             if let Some(e) = &self.fail_with {
                 return Err(e.clone());
             }
@@ -407,16 +420,139 @@ mod tests {
         }
     }
 
+    /// Every text-ish payload in a transcript, flattened. Keeps loop-test
+    /// assertions readable ("was the tool output fed back?") without
+    /// re-implementing a part matcher in each test.
+    fn transcript_text(t: &Transcript) -> String {
+        t.turns
+            .iter()
+            .flat_map(|turn| turn.parts.iter())
+            .map(|p| match p {
+                turya_protocol::Part::Text { text }
+                | turya_protocol::Part::Reasoning { text }
+                | turya_protocol::Part::Instruction { text } => text.clone(),
+                turya_protocol::Part::ToolResult { output, .. } => output.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn tool_call(id: &str, tool: &str, params: serde_json::Value) -> ProviderStep {
         ProviderStep::CallTool(ToolCall {
             call_id: id.to_string(),
             tool_name: tool.to_string(),
             parameters: params,
+            signature: None,
         })
     }
 
     // run_bash shells out to `bash`, which only exists on Unix.
     #[cfg(unix)]
+    #[tokio::test]
+    async fn test_transcript_parts_are_appended_once_and_in_order() {
+        // Five calls in one pass. The next pass must see exactly ten parts in
+        // alternating call/result order — this is the regression guard for
+        // the old deep-clone history, where re-appending on every pass made
+        // the transcript grow quadratically.
+        let provider = Arc::new(ScriptProvider::new(vec![
+            vec![
+                tool_call("k1", "nope_missing", serde_json::json!({})),
+                tool_call("k2", "nope_missing", serde_json::json!({})),
+                tool_call("k3", "nope_missing", serde_json::json!({})),
+                tool_call("k4", "nope_missing", serde_json::json!({})),
+                tool_call("k5", "nope_missing", serde_json::json!({})),
+                ProviderStep::Finish,
+            ],
+            vec![ProviderStep::Token("end".to_string()), ProviderStep::Finish],
+        ]));
+        let tools = Arc::new(turya_tools::ToolRegistry::standard());
+        let engine = TuryaEngine::new(provider.clone(), tools, PermissionMode::Open);
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let (_perm_tx, perm_rx) = mpsc::channel(1);
+
+        engine
+            .run_turn("order", "go", AgentMode::Build, &[], event_tx, perm_rx)
+            .await;
+
+        let seen = provider.seen_history.lock().unwrap();
+        let parts: Vec<_> = seen[1].turns.iter().flat_map(|t| t.parts.iter()).collect();
+        assert_eq!(parts.len(), 11, "1 user turn + 5 calls + 5 results");
+        assert!(matches!(parts[0], turya_protocol::Part::UserText { .. }));
+        for i in 0..5 {
+            match parts[1 + i * 2] {
+                turya_protocol::Part::ToolCall { call_id, .. } => {
+                    assert_eq!(call_id.as_str(), format!("k{}", i + 1));
+                }
+                other => panic!("expected ToolCall k{}, got {other:?}", i + 1),
+            }
+            match &parts[2 + i * 2] {
+                turya_protocol::Part::ToolResult { call_id, .. } => {
+                    assert_eq!(call_id.as_str(), format!("k{}", i + 1));
+                }
+                other => panic!("expected ToolResult k{}, got {other:?}", i + 1),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oversized_tool_output_is_truncated_and_flagged() {
+        // A huge result must be truncated *and* carry the flag, so providers
+        // can mark the block instead of the harness splicing a marker string.
+        let path = std::env::temp_dir().join("turya-a0-big.txt");
+        std::fs::write(&path, "x".repeat(9000)).unwrap();
+        let provider = Arc::new(ScriptProvider::new(vec![
+            vec![
+                tool_call(
+                    "big",
+                    "view_file",
+                    serde_json::json!({"path": path.to_string_lossy()}),
+                ),
+                ProviderStep::Finish,
+            ],
+            vec![ProviderStep::Token("ok".to_string()), ProviderStep::Finish],
+        ]));
+        let tools = Arc::new(turya_tools::ToolRegistry::standard());
+        let engine = TuryaEngine::new(provider.clone(), tools, PermissionMode::Open);
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let (_perm_tx, perm_rx) = mpsc::channel(1);
+
+        engine
+            .run_turn("trunc", "read it", AgentMode::Build, &[], event_tx, perm_rx)
+            .await;
+
+        let seen = provider.seen_history.lock().unwrap();
+        let result = seen[1]
+            .turns
+            .iter()
+            .flat_map(|t| t.parts.iter())
+            .find(|p| {
+                matches!(
+                    p,
+                    turya_protocol::Part::ToolResult { call_id, .. } if call_id == "big"
+                )
+            })
+            .expect("tool result recorded");
+        match result {
+            turya_protocol::Part::ToolResult {
+                output, truncated, ..
+            } => {
+                assert!(*truncated, "oversized output must be flagged");
+                assert!(
+                    output.chars().count() < 9000,
+                    "output must be truncated: {}",
+                    output.chars().count()
+                );
+                assert!(
+                    output.contains("success=true"),
+                    "prefix preserved: {output}"
+                );
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn test_loop_feeds_tool_results_back_to_provider() {
         let provider = Arc::new(ScriptProvider::new(vec![
@@ -439,7 +575,7 @@ mod tests {
         let (_perm_tx, perm_rx) = mpsc::channel(1);
 
         engine
-            .run_turn("loop1", "do it", AgentMode::Build, event_tx, perm_rx)
+            .run_turn("loop1", "do it", AgentMode::Build, &[], event_tx, perm_rx)
             .await;
 
         let mut saw_done = false;
@@ -463,8 +599,8 @@ mod tests {
         assert_eq!(provider.calls(), 2);
         let seen = provider.seen_history.lock().unwrap();
         assert!(
-            seen[1].iter().any(|h| h.contains("hello-loop")),
-            "second call history missing tool output: {:?}",
+            transcript_text(&seen[1]).contains("hello-loop"),
+            "second call transcript missing tool output: {:?}",
             seen[1]
         );
     }
@@ -492,7 +628,7 @@ mod tests {
         let (_perm_tx, perm_rx) = mpsc::channel(1);
 
         engine
-            .run_turn("loop2", "go", AgentMode::Build, event_tx, perm_rx)
+            .run_turn("loop2", "go", AgentMode::Build, &[], event_tx, perm_rx)
             .await;
 
         let mut completed = false;
@@ -521,8 +657,8 @@ mod tests {
         // The summary pass saw the exhaustion instruction, not more tools.
         let seen = provider.seen_history.lock().unwrap();
         assert!(
-            seen[8].iter().any(|h| h.contains("Step budget exhausted")),
-            "final history: {:?}",
+            transcript_text(&seen[8]).contains("Step budget exhausted"),
+            "final transcript: {:?}",
             seen[8]
         );
     }
@@ -554,7 +690,7 @@ mod tests {
         let (_perm_tx, perm_rx) = mpsc::channel(1);
 
         engine
-            .run_turn("loop4", "go", AgentMode::Build, event_tx, perm_rx)
+            .run_turn("loop4", "go", AgentMode::Build, &[], event_tx, perm_rx)
             .await;
 
         let mut completed = false;
@@ -598,7 +734,7 @@ mod tests {
         let (_perm_tx, perm_rx) = mpsc::channel(1);
 
         engine
-            .run_turn("loop5", "hi", AgentMode::Build, event_tx, perm_rx)
+            .run_turn("loop5", "hi", AgentMode::Build, &[], event_tx, perm_rx)
             .await;
 
         let mut completed = false;
@@ -620,7 +756,7 @@ mod tests {
         let (_perm_tx, perm_rx) = mpsc::channel(1);
 
         engine
-            .run_turn("loop3", "go", AgentMode::Build, event_tx, perm_rx)
+            .run_turn("loop3", "go", AgentMode::Build, &[], event_tx, perm_rx)
             .await;
 
         let mut saw_boom = false;

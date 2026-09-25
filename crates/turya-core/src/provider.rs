@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use turya_protocol::ToolCall;
+use turya_protocol::{ToolCall, Transcript};
 
 #[derive(Debug, Clone)]
 pub enum ProviderStep {
@@ -11,10 +11,17 @@ pub enum ProviderStep {
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
+    /// One model call over the current conversation.
+    ///
+    /// The transcript is the whole conversation — including the user's turn,
+    /// which the engine records before calling. There is deliberately no
+    /// separate `prompt` argument: passing it alongside the transcript is how
+    /// a user turn gets duplicated and the request ends up starting with an
+    /// assistant tool-call, which the APIs reject. The provider owns its wire
+    /// format; see `Transcript::to_messages` for the neutral projection.
     async fn generate_turn(
         &self,
-        prompt: &str,
-        history: &[String],
+        transcript: &Transcript,
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String>;
 }
@@ -28,8 +35,7 @@ pub struct MockProvider {
 impl LlmProvider for MockProvider {
     async fn generate_turn(
         &self,
-        _prompt: &str,
-        _history: &[String],
+        _transcript: &Transcript,
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         for step in &self.responses {

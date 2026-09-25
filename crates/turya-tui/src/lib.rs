@@ -14,7 +14,7 @@ use ratatui::{
 };
 use std::io::stdout;
 use tokio::sync::mpsc;
-use turya_protocol::{AgentMode, PermissionDecision, TuryaCommand, TuryaEvent};
+use turya_protocol::{AgentMode, Part, PermissionDecision, Transcript, TuryaCommand, TuryaEvent};
 
 pub mod slash;
 
@@ -232,9 +232,9 @@ impl TuiApp {
         }
     }
 
-    /// Plain-text view: test assertions and scroll math. Styles live only
-    /// in `transcript_lines()` at render time.
-    fn transcript_text(&self) -> String {
+    /// Plain-text view of the transcript: test assertions and scroll math.
+    /// Styles live only in `transcript_lines()` at render time.
+    pub fn transcript_text(&self) -> String {
         self.transcript
             .iter()
             .map(|l| l.text.as_str())
@@ -260,6 +260,67 @@ impl TuiApp {
     /// Clear all transcript rows (`/clear`).
     fn clear_transcript(&mut self) {
         self.transcript.clear();
+    }
+
+    /// Replay a stored transcript into the view (`turya resume`).
+    ///
+    /// Renders the same rows a live turn would have produced, so a resumed
+    /// session is indistinguishable from one that never quit. Tool rows keep
+    /// the collapsed head + `[+N more]` preview and are expandable with
+    /// `Ctrl+E` exactly like live ones.
+    pub fn load_transcript(&mut self, transcript: &Transcript) {
+        self.clear_transcript();
+        for turn in &transcript.turns {
+            for part in &turn.parts {
+                match part {
+                    Part::Text { text } => {
+                        self.push_block(text, false);
+                    }
+                    Part::UserText { text } => {
+                        self.push_block(&format_user_message(text), false);
+                    }
+                    Part::Reasoning { .. } | Part::Instruction { .. } => {
+                        // Harness/model scaffolding, not user-facing prose.
+                    }
+                    Part::ToolCall {
+                        call_id,
+                        tool_name,
+                        arguments,
+                        ..
+                    } => {
+                        self.log_dim(format!("▸ {tool_name} {arguments}"));
+                        self.pending_tools
+                            .insert(call_id.clone(), tool_name.clone());
+                    }
+                    Part::ToolResult {
+                        call_id,
+                        output,
+                        truncated,
+                    } => {
+                        let name = self
+                            .pending_tools
+                            .remove(call_id)
+                            .unwrap_or_else(|| "tool".to_string());
+                        let res = turya_protocol::ToolResult {
+                            call_id: call_id.clone(),
+                            success: !output.contains("success=false"),
+                            output: output.clone(),
+                            error: None,
+                        };
+                        for line in format_tool_result(&name, &res) {
+                            self.log_line(line);
+                        }
+                        if *truncated {
+                            self.retain_output(&name, &res);
+                        }
+                    }
+                    Part::Attachment(a) | Part::Image(a) => {
+                        self.log_dim(format!("📎 {} ({})", a.path.display(), a.mime));
+                    }
+                }
+            }
+        }
+        self.scroll_to_bottom();
     }
 
     /// Retain a tool's full output when it exceeds the inline preview,
@@ -403,6 +464,7 @@ impl TuiApp {
             .send(TuryaCommand::SubmitPrompt {
                 prompt,
                 mode: AgentMode::Build,
+                attachments: Vec::new(),
             })
             .await;
     }
@@ -705,8 +767,10 @@ impl TuiApp {
 
     /// Feed one protocol event into UI state. Single home for ALL event
     /// handling (transcript, tools, permissions, flows, provider label),
-    /// so headless tests drive exactly what the live loop drives.
-    fn feed_flow_event(&mut self, evt: &TuryaEvent) {
+    /// so headless tests drive exactly what the live loop drives. Public so
+    /// an embedding host (and the live model tests) can drive a session
+    /// without a terminal.
+    pub fn feed_flow_event(&mut self, evt: &TuryaEvent) {
         match evt {
             TuryaEvent::ProvidersListed { providers } => {
                 let views: Vec<flows::ProviderView> = providers
@@ -1466,6 +1530,7 @@ mod tests {
             call_id: "g1".to_string(),
             tool_name: "run_bash".to_string(),
             parameters: serde_json::json!({}),
+            signature: None,
         }));
         app.feed_flow_event(&TuryaEvent::ToolCallCompleted(ToolResult {
             call_id: "g1".to_string(),
@@ -1599,6 +1664,7 @@ mod tests {
             call_id: "g1".to_string(),
             tool_name: "run_bash".to_string(),
             parameters: serde_json::json!({}),
+            signature: None,
         }));
         assert!(app.top_line().contains("run_bash"));
         app.feed_flow_event(&TuryaEvent::ToolCallCompleted(ToolResult {
@@ -1729,6 +1795,7 @@ mod tests {
             call_id: "g9".to_string(),
             tool_name: "run_bash".to_string(),
             parameters: serde_json::json!({}),
+            signature: None,
         }));
         app.feed_flow_event(&TuryaEvent::ToolCallCompleted(ToolResult {
             call_id: "g9".to_string(),
@@ -1754,6 +1821,7 @@ mod tests {
             call_id: "g8".to_string(),
             tool_name: "run_bash".to_string(),
             parameters: serde_json::json!({}),
+            signature: None,
         }));
         app.feed_flow_event(&TuryaEvent::ToolCallCompleted(ToolResult {
             call_id: "g8".to_string(),
@@ -1774,6 +1842,85 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].style, Style::default());
         assert_eq!(rows[1].style, Style::default().fg(Color::DarkGray));
+    }
+
+    #[test]
+    fn loaded_transcript_matches_live_turn_rows() {
+        use turya_protocol::{Part, Transcript, TurnId};
+
+        // A stored transcript replays into the same rows a live turn emits.
+        let mut stored = Transcript::new("s1");
+        stored.turns.push(turya_protocol::Turn {
+            id: TurnId("t1".to_string()),
+            parts: vec![
+                Part::Text {
+                    text: "running the tests".to_string(),
+                },
+                Part::ToolCall {
+                    call_id: "c1".to_string(),
+                    tool_name: "run_bash".to_string(),
+                    arguments: serde_json::json!({"command": "make test"}),
+                    signature: None,
+                },
+                Part::ToolResult {
+                    call_id: "c1".to_string(),
+                    output: "Tool 'run_bash' result (success=true): 143 passed".to_string(),
+                    truncated: false,
+                },
+                Part::Text {
+                    text: "all green".to_string(),
+                },
+            ],
+        });
+
+        let mut app = TuiApp::new();
+        app.log_line("stale content".to_string());
+        app.load_transcript(&stored);
+        let text = app.transcript_text();
+        assert!(!text.contains("stale"), "load replaces the view");
+        assert!(text.contains("running the tests"));
+        assert!(text.contains("run_bash"), "tool head kept: {text}");
+        assert!(text.contains("143 passed"));
+        assert!(text.contains("all green"));
+        // Order is preserved: prose, then tool, then closing prose.
+        let prose = text.find("running the tests").unwrap();
+        let tool = text.find("run_bash").unwrap();
+        let closing = text.find("all green").unwrap();
+        assert!(prose < tool && tool < closing, "out of order: {text}");
+    }
+
+    #[test]
+    fn loaded_truncated_output_is_expandable() {
+        use turya_protocol::{Part, Transcript, TurnId};
+        let mut stored = Transcript::new("s1");
+        stored.turns.push(turya_protocol::Turn {
+            id: TurnId("t1".to_string()),
+            parts: vec![
+                Part::ToolCall {
+                    call_id: "c1".to_string(),
+                    tool_name: "view_file".to_string(),
+                    arguments: serde_json::json!({"path": "big.rs"}),
+                    signature: None,
+                },
+                Part::ToolResult {
+                    call_id: "c1".to_string(),
+                    output: "y".repeat(900),
+                    truncated: true,
+                },
+            ],
+        });
+        let mut app = TuiApp::new();
+        app.load_transcript(&stored);
+        app.expand_last_output();
+        assert!(app.transcript_text().contains(&"y".repeat(900)));
+    }
+
+    #[test]
+    fn empty_transcript_clears_the_view() {
+        let mut app = TuiApp::new();
+        app.log_line("old".to_string());
+        app.load_transcript(&Transcript::new("s1"));
+        assert_eq!(app.transcript_text().trim(), "");
     }
 
     #[test]

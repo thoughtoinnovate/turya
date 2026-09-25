@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use turya_core::TuryaEngine;
+use turya_core::{TaskId, TaskKind, TaskRegistry, TuryaEngine};
 use turya_protocol::{PermissionDecision, TuryaCommand, TuryaEvent};
 
 pub struct TuryaSession {
@@ -8,7 +8,11 @@ pub struct TuryaSession {
     cmd_rx: mpsc::Receiver<TuryaCommand>,
     event_tx: mpsc::Sender<TuryaEvent>,
     active_perm_tx: Option<mpsc::Sender<(String, PermissionDecision)>>,
-    active_turn: Option<(String, tokio::task::JoinHandle<()>)>,
+    /// Every live turn/subagent task. Replaces a single `active_turn` slot:
+    /// aborting one id now tears down its whole tree, so a subagent can
+    /// never outlive the turn that started it.
+    tasks: TaskRegistry,
+    active_turn: Option<TaskId>,
     turn_counter: usize,
 }
 
@@ -23,33 +27,39 @@ impl TuryaSession {
             cmd_rx,
             event_tx,
             active_perm_tx: None,
+            tasks: TaskRegistry::new(),
             active_turn: None,
             turn_counter: 0,
         }
     }
 
-    /// Kill the running turn, if any. Returns its id when something died.
+    /// Kill the running turn and anything it spawned. Returns its id when
+    /// something died.
     fn kill_active_turn(&mut self) -> Option<String> {
         self.active_perm_tx = None;
-        self.active_turn.take().map(|(id, handle)| {
-            handle.abort();
-            id
-        })
+        let id = self.active_turn.take()?;
+        self.tasks.abort_tree(&id);
+        Some(id.0)
     }
 
     pub async fn run_loop(mut self) {
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
-                TuryaCommand::SubmitPrompt { prompt, mode } => {
+                TuryaCommand::SubmitPrompt {
+                    prompt,
+                    mode,
+                    attachments,
+                } => {
                     let engine = self.engine.clone();
                     let event_tx = self.event_tx.clone();
 
                     // One active turn at a time: a stale task would interleave
                     // events into the new turn, so kill it first (silent —
                     // the new TurnStarted explains what happened).
-                    if let Some((_, stale)) = self.active_turn.take() {
-                        stale.abort();
+                    if let Some(stale) = self.active_turn.take() {
+                        self.tasks.abort_tree(&stale);
                     }
+                    self.tasks.reap();
 
                     // Route permission decisions specifically for this active turn
                     let (turn_perm_tx, turn_perm_rx) = mpsc::channel(16);
@@ -61,10 +71,18 @@ impl TuryaSession {
                     let task_turn_id = turn_id.clone();
                     let handle = tokio::spawn(async move {
                         engine
-                            .run_turn(&task_turn_id, &prompt, mode, event_tx, turn_perm_rx)
+                            .run_turn(
+                                &task_turn_id,
+                                &prompt,
+                                mode,
+                                &attachments,
+                                event_tx,
+                                turn_perm_rx,
+                            )
                             .await;
                     });
-                    self.active_turn = Some((turn_id, handle));
+                    let id = self.tasks.insert(&turn_id, TaskKind::Root, None, handle);
+                    self.active_turn = Some(id);
                 }
                 TuryaCommand::ResolvePermission {
                     request_id,
@@ -97,6 +115,9 @@ impl TuryaSession {
                 _ => {}
             }
         }
+        // Nothing may outlive the loop: a task aborted after the client
+        // disconnected would keep burning API calls with nobody watching.
+        self.tasks.drain_all().await;
     }
 }
 
@@ -119,8 +140,7 @@ mod tests {
     impl LlmProvider for GateProvider {
         async fn generate_turn(
             &self,
-            _prompt: &str,
-            _history: &[String],
+            _transcript: &turya_protocol::Transcript,
             _tx: mpsc::Sender<ProviderStep>,
         ) -> Result<(), String> {
             self.entered.notify_one();
@@ -167,6 +187,7 @@ mod tests {
             .send(TuryaCommand::SubmitPrompt {
                 prompt: "long task".to_string(),
                 mode: AgentMode::Build,
+                attachments: Vec::new(),
             })
             .await
             .unwrap();
@@ -208,6 +229,7 @@ mod tests {
             .send(TuryaCommand::SubmitPrompt {
                 prompt: "first".to_string(),
                 mode: AgentMode::Build,
+                attachments: Vec::new(),
             })
             .await
             .unwrap();
@@ -222,6 +244,7 @@ mod tests {
             .send(TuryaCommand::SubmitPrompt {
                 prompt: "second".to_string(),
                 mode: AgentMode::Build,
+                attachments: Vec::new(),
             })
             .await
             .unwrap();

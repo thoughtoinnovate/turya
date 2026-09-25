@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use turya_core::{
     AuthMethodKind, LlmProvider, ModelInfo, ProviderPlugin, ProviderStep, ResolvedCreds,
 };
-use turya_protocol::ToolCall;
+use turya_protocol::{MessagePart, ToolCall, Transcript};
 
 /// Streaming Gemini provider (Generative Language SSE).
 ///
@@ -57,12 +57,65 @@ impl GeminiProvider {
     }
 
     /// Request body for `streamGenerateContent` (pure: unit-tested).
-    fn request_body(model_prompt: &str, history: &[String]) -> serde_json::Value {
-        let mut contents: Vec<serde_json::Value> = history
+    ///
+    /// Wire mapping: assistant content carries `role: "model"`, tool results
+    /// ride as `functionResponse` inside a `user` turn (the convention the
+    /// Generative Language API requires for function results), and files
+    /// become `inlineData`/`fileData` parts.
+    fn request_body(transcript: &Transcript) -> serde_json::Value {
+        let contents: Vec<serde_json::Value> = transcript
+            .to_messages()
             .iter()
-            .map(|h| json!({"role": "user", "parts": [{"text": h}]}))
+            .map(|msg| {
+                let role = match msg.role {
+                    turya_protocol::Role::Assistant => "model",
+                    turya_protocol::Role::User => "user",
+                };
+                let parts: Vec<serde_json::Value> = msg
+                    .content
+                    .iter()
+                    .map(|p| match p {
+                        MessagePart::Text { text } | MessagePart::Reasoning { text } => {
+                            json!({ "text": text })
+                        }
+                        MessagePart::ToolUse {
+                            call_id,
+                            name,
+                            arguments,
+                            signature,
+                        } => {
+                            // The signature is a sibling of `functionCall` on
+                            // the part, not a field inside it — nesting it
+                            // inside is rejected as an unknown name.
+                            let mut part = json!({
+                                "functionCall": { "name": name, "args": arguments, "id": call_id }
+                            });
+                            if let Some(sig) = signature {
+                                part["thoughtSignature"] = json!(sig);
+                            }
+                            part
+                        }
+                        MessagePart::ToolResult {
+                            call_id, content, ..
+                        } => json!({
+                            "functionResponse": {
+                                "name": "tool_result",
+                                "response": { "result": content, "call_id": call_id }
+                            }
+                        }),
+                        MessagePart::File { path, mime } => {
+                            // Inline bytes are not read here: the engine owns
+                            // file access, and a missing file is a visible
+                            // error rather than a silent empty part.
+                            json!({
+                                "fileData": { "mimeType": mime, "fileUri": path.to_string_lossy() }
+                            })
+                        }
+                    })
+                    .collect();
+                json!({ "role": role, "parts": parts })
+            })
             .collect();
-        contents.push(json!({"role": "user", "parts": [{"text": model_prompt}]}));
         json!({
             "contents": contents,
             "tools": [{"functionDeclarations": Self::function_declarations()}],
@@ -159,6 +212,12 @@ impl GeminiProvider {
                         call_id: format!("gcall_{}", *call_seq),
                         tool_name: name.to_string(),
                         parameters: args,
+                        // Required on replay: the API rejects a functionCall
+                        // part without the signature the model emitted.
+                        signature: part
+                            .get("thoughtSignature")
+                            .and_then(|s| s.as_str())
+                            .map(str::to_string),
                     }));
                 }
             }
@@ -244,12 +303,11 @@ impl GeminiProvider {
 impl LlmProvider for GeminiProvider {
     async fn generate_turn(
         &self,
-        prompt: &str,
-        history: &[String],
+        transcript: &Transcript,
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         let (url, bearer) = self.request_target();
-        let body = Self::request_body(prompt, history);
+        let body = Self::request_body(transcript);
         let client = reqwest::Client::new();
         let mut req = client.post(&url).header("content-type", "application/json");
         if let Some(token) = bearer {
@@ -364,7 +422,11 @@ mod tests {
 
     #[test]
     fn request_body_maps_tools_to_function_declarations() {
-        let body = GeminiProvider::request_body("hi", &["earlier".to_string()]);
+        let mut t = Transcript::new("s");
+        t.push(turya_protocol::Part::UserText {
+            text: "hi".to_string(),
+        });
+        let body = GeminiProvider::request_body(&t);
         let decls = body
             .pointer("/tools/0/functionDeclarations")
             .and_then(|d| d.as_array())
@@ -372,7 +434,126 @@ mod tests {
         assert_eq!(decls.len(), 3);
         assert!(decls.iter().any(|d| d["name"] == "run_bash"));
         let contents = body.get("contents").and_then(|c| c.as_array()).unwrap();
-        assert_eq!(contents.len(), 2);
+        assert_eq!(contents.len(), 1, "one user turn is one turn");
+        assert_eq!(contents[0]["role"], "user");
+    }
+
+    #[test]
+    fn request_body_uses_model_role_and_function_response_pairing() {
+        let mut t = Transcript::new("s");
+        t.start_turn("t1");
+        t.push(turya_protocol::Part::UserText {
+            text: "list the files".to_string(),
+        });
+        t.push(turya_protocol::Part::Text {
+            text: "looking".to_string(),
+        });
+        t.push(turya_protocol::Part::ToolCall {
+            call_id: "c1".to_string(),
+            tool_name: "run_bash".to_string(),
+            arguments: serde_json::json!({"command": "ls"}),
+            signature: Some("sig-1".to_string()),
+        });
+        t.push(turya_protocol::Part::ToolResult {
+            call_id: "c1".to_string(),
+            output: "ok".to_string(),
+            truncated: false,
+        });
+
+        let body = GeminiProvider::request_body(&t);
+        let contents = body.get("contents").and_then(|c| c.as_array()).unwrap();
+        // user turn, then the model turn (text + functionCall merged), then
+        // the function response as a user turn.
+        assert_eq!(contents.len(), 3, "got: {contents:?}");
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "list the files");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[1]["parts"][0]["text"], "looking");
+        assert_eq!(contents[1]["parts"][1]["functionCall"]["name"], "run_bash");
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["response"]["call_id"],
+            "c1"
+        );
+    }
+
+    #[test]
+    fn a_request_never_opens_with_an_assistant_function_call() {
+        // Regression guard for the live 400: the API requires a function call
+        // to follow a user turn, so the transcript's first turn must be the
+        // user's, however the model replies.
+        let mut t = Transcript::new("s");
+        t.push(turya_protocol::Part::UserText {
+            text: "hello".to_string(),
+        });
+        t.push(turya_protocol::Part::ToolCall {
+            call_id: "c1".to_string(),
+            tool_name: "run_bash".to_string(),
+            arguments: serde_json::json!({}),
+            signature: Some("sig-1".to_string()),
+        });
+        let body = GeminiProvider::request_body(&t);
+        let contents = body.get("contents").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(contents[0]["role"], "user");
+    }
+
+    #[test]
+    fn thought_signature_is_replayed_beside_the_function_call() {
+        // Both directions matter: the signature must be *captured* from the
+        // response and *replayed* on the part, not nested inside functionCall.
+        let payload = json!({
+            "candidates": [{ "content": { "parts": [{
+                "functionCall": { "name": "run_bash", "args": {"command": "ls"} },
+                "thoughtSignature": "SIG-123"
+            }]}}]
+        });
+        let mut seq = 0;
+        let steps = GeminiProvider::steps_from_payload(&payload, &mut seq);
+        let call = steps
+            .iter()
+            .find_map(|s| match s {
+                ProviderStep::CallTool(c) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("function call parsed");
+        assert_eq!(call.signature.as_deref(), Some("SIG-123"));
+
+        let mut t = Transcript::new("s");
+        t.push(turya_protocol::Part::UserText {
+            text: "go".to_string(),
+        });
+        t.push(turya_protocol::Part::ToolCall {
+            call_id: call.call_id.clone(),
+            tool_name: call.tool_name.clone(),
+            arguments: call.parameters.clone(),
+            signature: call.signature.clone(),
+        });
+        let body = GeminiProvider::request_body(&t);
+        let parts = body
+            .pointer("/contents/1/parts/0")
+            .expect("model turn part exists");
+        assert_eq!(
+            parts["thoughtSignature"], "SIG-123",
+            "signature must sit beside functionCall: {parts}"
+        );
+        assert_eq!(parts["functionCall"]["name"], "run_bash");
+    }
+
+    #[test]
+    fn a_call_without_a_signature_omits_the_field() {
+        let mut t = Transcript::new("s");
+        t.push(turya_protocol::Part::UserText {
+            text: "go".to_string(),
+        });
+        t.push(turya_protocol::Part::ToolCall {
+            call_id: "c1".to_string(),
+            tool_name: "run_bash".to_string(),
+            arguments: serde_json::json!({}),
+            signature: None,
+        });
+        let body = GeminiProvider::request_body(&t);
+        let part = &body["contents"][1]["parts"][0];
+        assert!(part.get("thoughtSignature").is_none(), "{part}");
     }
 
     #[test]

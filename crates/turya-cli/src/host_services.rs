@@ -1152,6 +1152,7 @@ mod tests {
                     &TuryaCommand::SubmitPrompt {
                         prompt: "hi".to_string(),
                         mode: turya_protocol::AgentMode::Build,
+                        attachments: Vec::new(),
                     },
                     &sink,
                 )

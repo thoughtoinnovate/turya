@@ -1,15 +1,12 @@
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use turya_cli::{auth_cmd, host_services, update};
 use turya_core::{LlmProvider, MockProvider, ProviderStep, TuryaEngine};
 use turya_protocol::{PermissionMode, ToolCall};
 use turya_server::TuryaSession;
 use turya_tools::ToolRegistry;
 use turya_tui::TuiApp;
-
-mod auth_cmd;
-mod host_services;
-mod update;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -275,6 +272,7 @@ async fn select_provider(
                     call_id: "init_call".to_string(),
                     tool_name: "view_file".to_string(),
                     parameters: serde_json::json!({ "path": "Cargo.toml" }),
+                    signature: None,
                 }),
                 ProviderStep::Token("\nRepository read complete. Ready for tasks.".to_string()),
                 ProviderStep::Finish,

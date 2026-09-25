@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use turya_core::{
     AuthMethodKind, LlmProvider, ModelInfo, ProviderPlugin, ProviderStep, ResolvedCreds,
 };
-use turya_protocol::ToolCall;
+use turya_protocol::{MessagePart, ToolCall, Transcript};
 
 /// Streaming Anthropic Messages provider (SSE).
 pub struct AnthropicProvider {
@@ -150,15 +150,61 @@ impl AnthropicProvider {
 impl LlmProvider for AnthropicProvider {
     async fn generate_turn(
         &self,
-        prompt: &str,
-        history: &[String],
+        transcript: &Transcript,
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
-        let mut messages: Vec<serde_json::Value> = history
+        let messages: Vec<serde_json::Value> = transcript
+            .to_messages()
             .iter()
-            .map(|h| json!({"role": "user", "content": h}))
+            .map(|msg| {
+                let role = match msg.role {
+                    turya_protocol::Role::Assistant => "assistant",
+                    turya_protocol::Role::User => "user",
+                };
+                let content: Vec<serde_json::Value> = msg
+                    .content
+                    .iter()
+                    .map(|p| match p {
+                        MessagePart::Text { text } => json!({ "type": "text", "text": text }),
+                        // Thinking blocks are re-sent as plain text: the API
+                        // requires the signed original block, and a
+                        // reconstructed one is rejected. Losing the signature
+                        // costs cache reuse, not correctness.
+                        MessagePart::Reasoning { text } => json!({ "type": "text", "text": text }),
+                        MessagePart::ToolUse {
+                            call_id,
+                            name,
+                            arguments,
+                            ..
+                        } => json!({
+                            "type": "tool_use", "id": call_id, "name": name, "input": arguments
+                        }),
+                        MessagePart::ToolResult {
+                            call_id,
+                            content,
+                            is_error,
+                            truncated,
+                        } => {
+                            let mut block = json!({
+                                "type": "tool_result", "tool_use_id": call_id, "content": content
+                            });
+                            if *is_error {
+                                block["is_error"] = json!(true);
+                            }
+                            if *truncated {
+                                block["_truncated"] = json!(true);
+                            }
+                            block
+                        }
+                        MessagePart::File { path, mime } => json!({
+                            "type": "document",
+                            "source": { "type": "file", "media_type": mime, "url": path.to_string_lossy() }
+                        }),
+                    })
+                    .collect();
+                json!({ "role": role, "content": content })
+            })
             .collect();
-        messages.push(json!({"role": "user", "content": prompt}));
 
         let body = json!({
             "model": self.model,
@@ -252,6 +298,8 @@ impl LlmProvider for AnthropicProvider {
                                     call_id,
                                     tool_name: name,
                                     parameters: params,
+                                    // Anthropic signs thinking blocks, not calls.
+                                    signature: None,
                                 }))
                                 .await;
                         }

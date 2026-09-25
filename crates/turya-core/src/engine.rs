@@ -4,7 +4,7 @@ use crate::provider::{LlmProvider, ProviderStep};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
-use turya_protocol::{AgentMode, PermissionDecision, PermissionMode, TuryaEvent};
+use turya_protocol::{AgentMode, Part, PermissionDecision, PermissionMode, Transcript, TuryaEvent};
 use turya_tools::ToolRegistry;
 
 /// Default per-turn budgets (see `TuryaEngine::set_budgets`). A turn ends at
@@ -109,6 +109,7 @@ impl TuryaEngine {
         turn_id: &str,
         prompt: &str,
         mode: AgentMode,
+        attachments: &[turya_protocol::Attachment],
         event_tx: mpsc::Sender<TuryaEvent>,
         mut perm_rx: mpsc::Receiver<(String, PermissionDecision)>,
     ) {
@@ -135,7 +136,20 @@ impl TuryaEngine {
         // everything so far. Tool results re-enter as history, so the model
         // always gets the last word (a summary, an explanation, a follow-up).
         let budgets = *self.budgets.read().unwrap();
-        let mut history: Vec<String> = Vec::new();
+        let mut transcript = Transcript::new(&self.session_id);
+        transcript.start_turn(turn_id);
+        // The user's turn is recorded here, once. Providers serialize the
+        // transcript as-is; there is no separate prompt to append.
+        transcript.push(Part::UserText {
+            text: prompt.to_string(),
+        });
+        for attachment in attachments {
+            transcript.push(if attachment.mime.starts_with("image/") {
+                Part::Image(attachment.clone())
+            } else {
+                Part::Attachment(attachment.clone())
+            });
+        }
         let mut turn_error: Option<String> = None;
         let mut passes = 0usize;
         let mut tools_last_pass = 0u32;
@@ -150,8 +164,13 @@ impl TuryaEngine {
                 execute: true,
             };
             let outcome = self
-                .run_pass(prompt, &mut history, &event_tx, &mut perm_rx, gate)
+                .run_pass(&transcript, &event_tx, &mut perm_rx, gate)
                 .await;
+            // Appended here, not inside `run_pass`: the provider only ever
+            // borrows the transcript, so no pass ever deep-copies the
+            // history. This is the O(n)-per-call clone that used to make a
+            // long turn quadratic.
+            transcript.extend(outcome.parts);
             if outcome.tool_cap_hit {
                 tool_cap_hit = true;
             }
@@ -177,19 +196,20 @@ impl TuryaEngine {
             // Tool calls here are structurally dropped — announced as denied
             // but never executed — so the ending holds even if the model
             // ignores the no-more-tools instruction.
-            history.push(
-                "Step budget exhausted. Summarize the work done so far and list \
-                 remaining tasks as plain text. Do not call any further tools."
+            transcript.push(Part::Instruction {
+                text: "Step budget exhausted. Summarize the work done so far and list \
+                       remaining tasks as plain text. Do not call any further tools."
                     .to_string(),
-            );
+            });
             let gate = ToolGate {
                 executions: &mut tool_executions,
                 cap: budgets.tool_calls,
                 execute: false,
             };
             let outcome = self
-                .run_pass(prompt, &mut history, &event_tx, &mut perm_rx, gate)
+                .run_pass(&transcript, &event_tx, &mut perm_rx, gate)
                 .await;
+            transcript.extend(outcome.parts);
             if let Some(e) = outcome.provider_err {
                 turn_error = Some(e);
             }
@@ -228,34 +248,33 @@ impl TuryaEngine {
     }
 
     /// One model invocation: stream its steps, execute (or drop) tool calls,
-    /// accumulate transcript history. Shared by normal passes
-    /// (`execute_tools = true`) and the graceful final summary pass
+    /// and return the parts this pass produced. Shared by normal passes
+    /// (`gate.execute = true`) and the graceful final summary pass
     /// (`false`: calls are announced as denied but never run, and nothing
-    /// is appended for them — the summary text is what matters).
+    /// is recorded for them — the summary text is what matters).
+    ///
+    /// Takes the transcript by shared borrow and never mutates it, so no
+    /// pass copies the history; the caller appends the returned parts.
     async fn run_pass(
         &self,
-        prompt: &str,
-        history: &mut Vec<String>,
+        transcript: &Transcript,
         event_tx: &mpsc::Sender<TuryaEvent>,
         perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
         gate: ToolGate<'_>,
     ) -> PassOutcome {
         let (step_tx, mut step_rx) = mpsc::channel(32);
         let provider = self.provider.read().unwrap().clone();
-        let prompt_clone = prompt.to_string();
-        let history_clone = history.clone();
+        let transcript = transcript.clone();
 
-        let join = tokio::spawn(async move {
-            provider
-                .generate_turn(&prompt_clone, &history_clone, step_tx)
-                .await
-        });
+        let join = tokio::spawn(async move { provider.generate_turn(&transcript, step_tx).await });
 
         let mut assistant_text = String::new();
+        let mut parts: Vec<Part> = Vec::new();
         let mut outcome = PassOutcome {
             tool_calls: 0,
             tool_cap_hit: false,
             provider_err: None,
+            parts: Vec::new(),
         };
 
         while let Some(step) = step_rx.recv().await {
@@ -266,6 +285,12 @@ impl TuryaEngine {
                 }
                 ProviderStep::CallTool(call) => {
                     outcome.tool_calls += 1;
+                    parts.push(Part::ToolCall {
+                        call_id: call.call_id.clone(),
+                        tool_name: call.tool_name.clone(),
+                        arguments: call.parameters.clone(),
+                        signature: call.signature.clone(),
+                    });
                     // Tool budget (or the final summary pass): stop executing,
                     // but stay coherent — the denial completes like any other
                     // result so the model sees it instead of hanging.
@@ -282,10 +307,14 @@ impl TuryaEngine {
                             .await;
                         let _ = event_tx.send(TuryaEvent::ToolCallCompleted(res)).await;
                         if gate.execute {
-                            history.push(format!(
-                                "Tool '{}' result (success=false): tool budget exhausted",
-                                call.tool_name
-                            ));
+                            parts.push(Part::ToolResult {
+                                call_id: call.call_id.clone(),
+                                output: format!(
+                                    "Tool '{}' (success=false): tool budget exhausted",
+                                    call.tool_name
+                                ),
+                                truncated: false,
+                            });
                         }
                         continue;
                     }
@@ -296,12 +325,15 @@ impl TuryaEngine {
                         .clone()
                         .filter(|_| !result.success)
                         .unwrap_or_else(|| result.output.clone());
-                    history.push(format!(
-                        "Tool '{}' result (success={}): {}",
-                        call.tool_name,
-                        result.success,
-                        truncate_history(&summary, MAX_TOOL_HISTORY_CHARS)
-                    ));
+                    let recorded = truncate_history(&summary, MAX_TOOL_HISTORY_CHARS);
+                    parts.push(Part::ToolResult {
+                        call_id: call.call_id.clone(),
+                        output: format!(
+                            "Tool '{}' result (success={}): {recorded}",
+                            call.tool_name, result.success
+                        ),
+                        truncated: recorded.chars().count() < summary.chars().count(),
+                    });
                 }
                 ProviderStep::Finish => break,
             }
@@ -316,8 +348,11 @@ impl TuryaEngine {
         }
 
         if !assistant_text.is_empty() {
-            history.push(format!("Assistant: {assistant_text}"));
+            parts.push(Part::Text {
+                text: assistant_text,
+            });
         }
+        outcome.parts = parts;
         outcome
     }
 
@@ -469,6 +504,8 @@ struct PassOutcome {
     tool_calls: u32,
     tool_cap_hit: bool,
     provider_err: Option<String>,
+    /// Parts this pass produced; the caller appends them to the transcript.
+    parts: Vec<Part>,
 }
 
 /// Mutable per-pass tool state: execution counter, cap, and whether this
