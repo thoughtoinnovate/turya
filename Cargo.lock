@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "turya-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "hex",
@@ -3369,7 +3369,7 @@ dependencies = [
 
 [[package]]
 name = "turya-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crossterm",
  "futures",

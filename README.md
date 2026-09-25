@@ -82,6 +82,52 @@ turya update --version v0.1.2   # explicit pin (may downgrade)
 Both verify SHA256 checksums, keep a `.bak` backup of the replaced binary, and
 re-verify via `turya --version` afterwards.
 
+`turya` is pre-1.0 and makes **no backward-compatibility promise**: every
+release may break config, sessions, and internal contracts. State that does not
+match the current version is backed up and rebuilt, never migrated.
+
+## Using turya
+
+```bash
+turya                       # interactive session
+turya sessions              # list stored sessions
+turya resume <id>           # continue one (its conversation is replayed)
+turya export <id>           # one session as newline-delimited JSON
+turya auth login gemini     # store a credential
+turya auth status           # what is authenticated, and where it is stored
+```
+
+### Keys
+
+| Key | Does |
+|-----|------|
+| `Enter` | Send the prompt |
+| `Alt+Enter` | Newline in the prompt |
+| `Up` / `Down` | Recall previous prompts (when no popup is open) |
+| `@` | Pick a file to attach to the next prompt |
+| `PageUp` / `PageDown` | Scroll the transcript |
+| Mouse wheel | Scroll, when the terminal supports capture (`/settings mouse`) |
+| `Ctrl+E` | Show the full output of the last truncated tool call |
+| `Esc` | Close a popup, then stop the running turn. Never quits. |
+| `Ctrl+C` / `Ctrl+D` | Quit, from anywhere |
+
+### Slash commands
+
+`/help` `/models` `/auth` `/efforts` `/thinking` `/steps` `/queue` `/compact`
+`/context` `/sessions` `/settings` `/clear`
+
+| Command | Does |
+|---------|------|
+| `/models` | Browse providers and switch model |
+| `/auth` | Sign in; shows where a credential is stored |
+| `/efforts [level\|none]` | Show or set reasoning effort for the current model |
+| `/steps [model_calls] [tool_calls]` | Per-turn budgets (default 8 / 32) |
+| `/queue [prompt\|clear]` | Queue a follow-up to run after the current turn |
+| `/compact [focus]` | Summarise older turns to free context |
+| `/context` | Context usage against the model window |
+| `/sessions [id]` | List sessions; with an id, resume it |
+| `/settings [key value]` | Tints and mouse capture |
+
 ## Cutting a Release
 
 1. Bump the version in `crates/turya-cli/Cargo.toml` (single source of truth).
