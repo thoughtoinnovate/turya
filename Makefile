@@ -1,5 +1,14 @@
 .PHONY: help build build-release test install install-release clean nuke e2e
 
+# The dev image exports CARGO_HOME=/opt/cargo globally, but that dir is an
+# empty root-owned skeleton (no registry cache, not writable), while the
+# pre-populated registry cache and write permission live in ~/.cargo. Pin it
+# here so every target works out of the box (otherwise even `make build`
+# fails re-resolving + downloading into /opt/cargo, os error 13).
+# Override per-invocation if you know what you are doing:
+#   make CARGO_HOME=/custom/path install
+export CARGO_HOME := $(HOME)/.cargo
+
 # Default target
 help:
 	@echo "Turya Dev Make Commands:"
@@ -21,17 +30,14 @@ build-release:
 test:
 	cargo test --workspace
 
-# NOTE: install pins CARGO_HOME to $(HOME)/.cargo on the command line.
-# The dev image exports CARGO_HOME=/opt/cargo globally, but that dir is an
-# empty root-owned skeleton (no registry cache, not writable), while the
-# pre-populated cache and write permission live in ~/.cargo. Without this,
-# `cargo install` fails on `.crates.toml` / registry writes (os error 13)
-# and re-resolves + re-downloads instead of reusing the workspace lockfile.
+# NOTE: relies on the CARGO_HOME pin above: the image-wide
+# CARGO_HOME=/opt/cargo is an empty root-owned skeleton, and `cargo install`
+# needs registry + `.crates.toml` writes that only succeed under ~/.cargo.
 install:
-	CARGO_HOME=$(HOME)/.cargo cargo install --path crates/turya-cli --force
+	cargo install --path crates/turya-cli --force
 
 install-release:
-	CARGO_HOME=$(HOME)/.cargo cargo install --path crates/turya-cli --release --force
+	cargo install --path crates/turya-cli --release --force
 
 clean:
 	cargo clean
