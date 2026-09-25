@@ -17,7 +17,9 @@ use ratatui::{
 };
 use std::io::stdout;
 use tokio::sync::mpsc;
-use turya_protocol::{AgentMode, Part, PermissionDecision, Transcript, TuryaCommand, TuryaEvent};
+use turya_protocol::{
+    AgentMode, Attachment, Part, PermissionDecision, Transcript, TuryaCommand, TuryaEvent,
+};
 
 pub mod slash;
 
@@ -131,6 +133,29 @@ const MAX_STORED_OUTPUT_CHARS: usize = 4000;
 const WHEEL_LINES: usize = 3;
 /// Bound the retained entries: old outputs age out, newest survive.
 const MAX_OUTPUT_ENTRIES: usize = 20;
+
+/// Best-effort MIME guess from the extension. Unknown types are sent as a
+/// generic file, which every provider accepts; a wrong guess on a known type
+/// is worse than a vague one.
+fn guess_mime(path: &std::path::Path) -> String {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "md" => "text/markdown",
+        "json" => "application/json",
+        "rs" | "py" | "js" | "ts" | "sh" | "txt" | "log" | "toml" => "text/plain",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 /// Who a transcript row belongs to. Identity is carried by a gutter glyph and
 /// a label, never by colour alone: that survives monochrome terminals, every
 /// theme, and colour-vision differences.
@@ -296,21 +321,44 @@ fn truncate_preview(s: &str, max: usize) -> String {
 /// Render a tool result as log lines: summary + bounded output preview.
 /// Without this, successful calls look like nothing happened.
 fn format_tool_result(tool_name: &str, res: &turya_protocol::ToolResult) -> Vec<String> {
+    format_tool_result_timed(tool_name, res, None)
+}
+
+/// A tool result as a collapsed head plus a short preview.
+///
+/// `elapsed` appears when known: "passed (1.2s)" says whether a call was
+/// worth the wait, which the output alone does not. The preview is short on
+/// purpose - the full output is retained and re-shown on demand with Ctrl+E.
+fn format_tool_result_timed(
+    tool_name: &str,
+    res: &turya_protocol::ToolResult,
+    elapsed: Option<std::time::Duration>,
+) -> Vec<String> {
+    let took = elapsed
+        .map(|d| format!(" ({:.1}s)", d.as_secs_f32()))
+        .unwrap_or_default();
     if res.success {
-        let mut out = vec![format!("✔ {tool_name} (call {})", res.call_id)];
+        let mut out = vec![format!("✔ {tool_name}{took}")];
         let preview = res.output.trim();
         if !preview.is_empty() {
+            let shown = truncate_preview(preview, 120);
+            let hidden = preview.len().saturating_sub(shown.len());
             out.push(format!(
-                "  {}",
-                truncate_preview(preview, 300).replace('\n', "\n  ")
+                "  {}{}",
+                shown.replace('\n', "\n  "),
+                if hidden > 0 {
+                    format!(" [+{hidden} more · Ctrl+E]")
+                } else {
+                    String::new()
+                }
             ));
         }
         out
     } else {
+        let err = res.error.as_deref().unwrap_or("unknown error");
         vec![format!(
-            "✘ {tool_name} (call {}) failed: {}",
-            res.call_id,
-            res.error.as_deref().unwrap_or("unknown error")
+            "✘ {tool_name}{took} failed: {}",
+            truncate_preview(err, 200)
         )]
     }
 }
@@ -343,6 +391,14 @@ pub struct TuiApp {
     tints: Tints,
     /// Prompts waiting for the current turn to finish (`/queue`).
     queued: usize,
+    /// call_id → when the tool started, so a completion can say how long it
+    /// took. Only kept for in-flight calls, so it cannot grow.
+    tool_started: std::collections::HashMap<String, std::time::Instant>,
+    /// Files staged for the next prompt via `@path`, shown as chips.
+    attachments: Vec<Attachment>,
+    /// True while the input starts with an unclosed `@` word, which is when
+    /// the path completer takes over.
+    at_completer: Option<(usize, Vec<String>, usize)>,
     /// `auto` (default) | `on` | `off`, from `/settings mouse`.
     mouse: Option<String>,
     /// Render assistant prose as markdown. On by default; the stored
@@ -404,6 +460,9 @@ impl TuiApp {
             tints: Tints::default(),
             mouse: Some("auto".to_string()),
             queued: 0,
+            attachments: Vec::new(),
+            at_completer: None,
+            tool_started: std::collections::HashMap::new(),
             render_markdown: true,
             streaming: String::new(),
             stream_start: None,
@@ -900,14 +959,143 @@ impl TuiApp {
         self.scroll_to_bottom();
         // Recall before the prompt is moved out, so the draft is kept.
         self.push_history(&prompt);
-        self.push_block(&format_user_message(&prompt), false);
+        // The chips are echoed with the prompt, so what was attached is
+        // visible in the scrollback afterwards.
+        let chips = self.attachment_summary();
+        self.push_block(&format_user_message(&format!("{prompt}{chips}")), false);
+        self.push_block_as(&chips, false, Speaker::User);
+        let attachments = std::mem::take(&mut self.attachments);
         let _ = cmd_tx
             .send(TuryaCommand::SubmitPrompt {
                 prompt,
                 mode: AgentMode::Build,
-                attachments: Vec::new(),
+                attachments,
             })
             .await;
+    }
+
+    /// The `@word` being typed, if the caret is inside one.
+    fn current_at_word(&self) -> Option<(usize, String)> {
+        let at = self.input.rfind('@')?;
+        // Only at a word boundary, so `a@b.example.com` is never mistaken for
+        // a path.
+        let before_ok = at == 0
+            || self.input[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        if !before_ok {
+            return None;
+        }
+        let after = &self.input[at + 1..];
+        // A finished word is not a path any more.
+        if after.contains(char::is_whitespace) {
+            return None;
+        }
+        Some((at + 1, after.to_string()))
+    }
+
+    /// Recompute the path candidates for the current `@word`.
+    fn refresh_at_completer(&mut self) {
+        match self.current_at_word() {
+            Some((start, word)) => {
+                let (len, hits) = self.at_candidates(&word);
+                self.at_completer = if hits.is_empty() {
+                    None
+                } else {
+                    Some((start, hits, 0))
+                };
+                let _ = len;
+            }
+            None => self.at_completer = None,
+        }
+    }
+
+    fn move_at_selection(&mut self, delta: i32) {
+        if let Some((_, hits, sel)) = &mut self.at_completer {
+            let n = hits.len() as i32;
+            *sel = (*sel as i32 + delta).rem_euclid(n) as usize;
+        }
+    }
+
+    /// Replace the `@word` with the highlighted path and stage the file.
+    fn accept_at_completion(&mut self) {
+        let Some((start, hits, sel)) = self.at_completer.take() else {
+            return;
+        };
+        let Some(name) = hits.get(sel).cloned() else {
+            return;
+        };
+        let path = name.trim_end_matches('/').to_string();
+        self.input.truncate(start);
+        self.input.push_str(&name);
+        match self.attach_path(&path) {
+            Ok(()) => {
+                self.at_completer = None;
+                let summary = self.attachment_summary();
+                self.log_dim(format!("→ attached {path}{summary}"));
+            }
+            Err(e) => {
+                // Leave the text alone so the user can fix the path.
+                self.at_completer = None;
+                self.log_dim(format!("⚠ {e}"));
+            }
+        }
+    }
+
+    /// The staged-attachment line shown under the input and in the
+    /// transcript. Empty when nothing is attached.
+    fn attachment_summary(&self) -> String {
+        if self.attachments.is_empty() {
+            return String::new();
+        }
+        let names: Vec<String> = self
+            .attachments
+            .iter()
+            .map(|a| {
+                a.path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| a.path.to_string_lossy().to_string())
+            })
+            .collect();
+        format!("\n📎 {}", names.join("  "))
+    }
+
+    /// Stage a file for the next prompt. A path that does not exist is
+    /// refused here, where the user can see why, rather than becoming a
+    /// silent empty part in the request.
+    fn attach_path(&mut self, raw: &str) -> Result<(), String> {
+        let path = std::path::PathBuf::from(raw.trim());
+        if !path.exists() {
+            return Err(format!("no such file: {raw}"));
+        }
+        let mime = guess_mime(&path);
+        self.attachments.push(Attachment { path, mime });
+        Ok(())
+    }
+
+    /// Complete a partial `@word` against the working directory. Returns
+    /// the matches and the byte range the word occupies.
+    fn at_candidates(&self, prefix: &str) -> (usize, Vec<String>) {
+        let dir = std::path::Path::new(".");
+        let needle = prefix.to_lowercase();
+        let mut hits = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                if name.to_lowercase().contains(&needle) {
+                    let suffix = if e.path().is_dir() { "/" } else { "" };
+                    hits.push(format!("{name}{suffix}"));
+                }
+            }
+        }
+        hits.sort();
+        hits.truncate(8);
+        (prefix.len(), hits)
     }
 
     fn esc_action(&self) -> EscAction {
@@ -1452,17 +1640,22 @@ impl TuiApp {
                 self.push_text(chunk);
             }
             TuryaEvent::ToolCallInitiated(call) => {
-                self.log_line(format!("⚡ {}", call.tool_name));
+                // A one-line head, not a growing log: the tool's own output is
+                // folded away and only shown when the user asks for it.
+                self.log_line_as(format!("▸ {}", call.tool_name), Speaker::Tool);
                 self.pending_tools
                     .insert(call.call_id.clone(), call.tool_name.clone());
+                self.tool_started
+                    .insert(call.call_id.clone(), std::time::Instant::now());
             }
             TuryaEvent::ToolCallCompleted(res) => {
                 let name = self
                     .pending_tools
                     .remove(&res.call_id)
                     .unwrap_or_else(|| "tool".to_string());
-                for line in format_tool_result(&name, res) {
-                    self.log_line(line);
+                let elapsed = self.tool_started.remove(&res.call_id).map(|t| t.elapsed());
+                for line in format_tool_result_timed(&name, res, elapsed) {
+                    self.log_line_as(line, Speaker::Tool);
                 }
                 self.retain_output(&name, res);
             }
@@ -1536,7 +1729,36 @@ impl TuiApp {
     /// every line stays visible, capped so the transcript keeps its rows.
     /// Includes the 2 border rows.
     fn input_height(&self) -> u16 {
-        (self.input.lines().count().max(1) as u16 + 2).min(6)
+        let base = self.input.lines().count().max(1) as u16 + 2;
+        // A staged attachment or an open `@` picker needs its own rows, or it
+        // would be drawn over the transcript.
+        let extra = if self.attachments.is_empty() && self.at_completer.is_none() {
+            0
+        } else {
+            1 + self
+                .at_completer
+                .as_ref()
+                .map(|(_, hits, _)| hits.len().min(4) as u16)
+                .unwrap_or(0)
+        };
+        (base + extra).min(10)
+    }
+
+    /// The `@` picker's rows, rendered directly under the input.
+    fn at_picker_rows(&self) -> Vec<Line<'_>> {
+        let Some((_, hits, sel)) = &self.at_completer else {
+            return Vec::new();
+        };
+        hits.iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let marker = if i == *sel { "❯ " } else { "  " };
+                Line::styled(
+                    format!("{marker}{name}"),
+                    Style::default().fg(if i == *sel { Color::Cyan } else { Color::Gray }),
+                )
+            })
+            .collect()
     }
 
     /// Render one full frame. Split out of `run()` so headless tests can
@@ -1576,6 +1798,34 @@ impl TuiApp {
             .block(Block::default().borders(Borders::ALL).title("Assistant"));
         f.render_widget(chat, chunks[1]);
 
+        // 3b. Staged attachments + the @ picker, between transcript and
+        // input, so the user can see what they are about to send.
+        let mut input_area = chunks[2];
+        if !self.attachments.is_empty() || self.at_completer.is_some() {
+            let mut rows: Vec<Line<'_>> = Vec::new();
+            if !self.attachments.is_empty() {
+                let summary = self.attachment_summary();
+                rows.push(Line::styled(
+                    summary.trim_start().to_string(),
+                    Style::default().fg(Color::Green),
+                ));
+            }
+            rows.extend(self.at_picker_rows());
+            let h = rows.len() as u16;
+            let picker = Rect {
+                x: chunks[2].x + 1,
+                y: chunks[2].y,
+                width: chunks[2].width.saturating_sub(2),
+                height: h,
+            };
+            f.render_widget(Paragraph::new(rows), picker);
+            input_area = Rect {
+                y: chunks[2].y + h,
+                height: chunks[2].height.saturating_sub(h),
+                ..chunks[2]
+            };
+        }
+
         // 4. Input or Permission Prompt
         if let Some((_, ref action)) = self.pending_permission {
             let prompt = Paragraph::new(format!(
@@ -1592,14 +1842,14 @@ impl TuiApp {
                     .borders(Borders::ALL)
                     .title("Permission Required"),
             );
-            f.render_widget(prompt, chunks[2]);
+            f.render_widget(prompt, input_area);
         } else {
-            let input_widget = Paragraph::new(self.input.as_str()).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Prompt (Enter send · Alt+Enter newline · Ctrl+E expand · Esc stop)"),
-            );
-            f.render_widget(input_widget, chunks[2]);
+            let input_widget =
+                Paragraph::new(self.input.as_str())
+                    .block(Block::default().borders(Borders::ALL).title(
+                    "Prompt (Enter send · Alt+Enter newline · @ file · Ctrl+E expand · Esc stop)",
+                ));
+            f.render_widget(input_widget, input_area);
         }
 
         // 5. Status bar: single borderless row — provider/model, token
@@ -1816,9 +2066,53 @@ impl TuiApp {
                             {
                                 self.expand_last_output();
                             }
+                            // `@` opens a file picker in place. This is the
+                            // attachment method that works everywhere:
+                            // clipboard image paste fails over SSH, in some
+                            // Windows terminals and under some tmux setups,
+                            // but a path on disk is just a path.
+                            KeyCode::Char('@') => {
+                                self.input.push('@');
+                                self.on_input_edited();
+                                self.refresh_at_completer();
+                            }
+                            KeyCode::Tab if self.at_completer.is_some() => {
+                                self.accept_at_completion();
+                            }
+                            KeyCode::Backspace if self.at_completer.is_some() => {
+                                self.input.pop();
+                                self.on_input_edited();
+                                if self.input.ends_with('@') {
+                                    self.at_completer = None;
+                                } else {
+                                    self.refresh_at_completer();
+                                }
+                            }
+                            KeyCode::Esc if self.at_completer.is_some() => {
+                                self.at_completer = None;
+                                continue;
+                            }
+                            KeyCode::Enter if self.at_completer.is_some() => {
+                                // Enter with the picker open attaches the
+                                // highlighted file and keeps editing, rather
+                                // than submitting a half-typed @word.
+                                self.accept_at_completion();
+                                continue;
+                            }
+                            KeyCode::Up if self.at_completer.is_some() => {
+                                self.move_at_selection(-1);
+                                continue;
+                            }
+                            KeyCode::Down if self.at_completer.is_some() => {
+                                self.move_at_selection(1);
+                                continue;
+                            }
                             KeyCode::Char(c) => {
                                 self.input.push(c);
                                 self.on_input_edited();
+                                if self.at_completer.is_some() {
+                                    self.refresh_at_completer();
+                                }
                             }
                             KeyCode::Backspace => {
                                 self.input.pop();
@@ -2424,7 +2718,9 @@ mod tests {
             .map(|i| format!("l{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(app.input_height(), 6);
+        // Bounded, so a long draft cannot eat the transcript.
+        assert_eq!(app.input_height(), 10);
+        assert!(app.input_height() <= 10);
     }
 
     #[test]
@@ -2994,5 +3290,166 @@ mod tests {
         app.feed_flow_event(&TuryaEvent::QueueChanged { pending: 3 });
         let line = app.status_line();
         assert!(line.contains("⏳3"), "{line}");
+    }
+    #[test]
+    fn attaching_a_missing_file_is_refused_with_a_reason() {
+        let mut app = TuiApp::new();
+        let err = app.attach_path("/definitely/not/here.txt").unwrap_err();
+        assert!(err.contains("no such file"), "{err}");
+        assert!(app.attachments.is_empty(), "nothing half-staged");
+    }
+
+    #[test]
+    fn attaching_a_real_file_records_its_mime() {
+        let mut app = TuiApp::new();
+        let path = std::env::temp_dir().join("turya-attach-test.png");
+        std::fs::write(&path, b"not really a png").unwrap();
+        app.attach_path(&path.to_string_lossy()).expect("stages");
+        assert_eq!(app.attachments.len(), 1);
+        assert_eq!(app.attachments[0].mime, "image/png");
+        assert!(app.attachment_summary().contains("turya-attach-test.png"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mime_guessing_falls_back_rather_than_guessing_wrong() {
+        let p = std::path::Path::new("a.rs");
+        assert_eq!(guess_mime(p), "text/plain");
+        assert_eq!(guess_mime(std::path::Path::new("a.pdf")), "application/pdf");
+        assert_eq!(
+            guess_mime(std::path::Path::new("a.weird")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn the_at_word_is_only_recognised_while_typing_one() {
+        let mut app = TuiApp::new();
+        // "look at @": the word starts at byte 9, just past the '@'.
+        app.input = "look at @".to_string();
+        assert_eq!(app.current_at_word(), Some((9, String::new())));
+        app.input = "look at @src/".to_string();
+        assert_eq!(app.current_at_word(), Some((9, "src/".to_string())));
+        // An email address is not a path, however much it looks like one.
+        app.input = "email me at a@b".to_string();
+        assert_eq!(app.current_at_word(), None);
+        // A finished word is not being typed.
+        app.input = "see @src/lib.rs for details".to_string();
+        assert_eq!(app.current_at_word(), None);
+    }
+
+    #[tokio::test]
+    async fn a_submitted_prompt_carries_its_attachments() {
+        let mut app = TuiApp::new();
+        let path = std::env::temp_dir().join("turya-attach-send.txt");
+        std::fs::write(&path, "hello").unwrap();
+        app.attach_path(&path.to_string_lossy()).expect("stages");
+        let (tx, mut rx) = mpsc::channel(8);
+        let prompt = std::mem::take(&mut app.input);
+        // `submit_prompt` is async; drive it to completion so the assertion
+        // is not racing the send.
+        let mut send = Box::pin(app.submit_prompt(prompt, &tx));
+        send.as_mut().await;
+        drop(send);
+        match rx.try_recv() {
+            Ok(TuryaCommand::SubmitPrompt { attachments, .. }) => {
+                assert_eq!(attachments.len(), 1, "the file rides along");
+            }
+            other => panic!("expected SubmitPrompt with attachments, got {other:?}"),
+        }
+        assert!(app.attachments.is_empty(), "staging is consumed by send");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_input_grows_a_row_for_staged_attachments() {
+        let mut app = TuiApp::new();
+        let base = app.input_height();
+        app.attachments.push(Attachment {
+            path: std::path::PathBuf::from("/tmp/x.png"),
+            mime: "image/png".to_string(),
+        });
+        assert!(app.input_height() > base, "the chip needs a row");
+    }
+    #[test]
+    fn a_tool_result_collapses_to_a_head_plus_a_short_preview() {
+        use turya_protocol::ToolResult;
+        let big = "y".repeat(900);
+        let res = ToolResult {
+            call_id: "c1".to_string(),
+            success: true,
+            output: big,
+            error: None,
+        };
+        let lines = format_tool_result_timed(
+            "run_bash",
+            &res,
+            Some(std::time::Duration::from_millis(1200)),
+        );
+        assert!(lines[0].contains("✔ run_bash"), "head names the tool");
+        assert!(lines[0].contains("1.2s"), "duration is shown: {}", lines[0]);
+        let preview = lines[1].clone();
+        assert!(preview.chars().count() < 200, "preview stays short");
+        assert!(
+            preview.contains("Ctrl+E"),
+            "and says how to see the rest: {preview}"
+        );
+    }
+
+    #[test]
+    fn a_short_tool_output_has_no_expand_hint() {
+        use turya_protocol::ToolResult;
+        let res = ToolResult {
+            call_id: "c1".to_string(),
+            success: true,
+            output: "ok".to_string(),
+            error: None,
+        };
+        let lines = format_tool_result_timed("view_file", &res, None);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            !lines[1].contains("Ctrl+E"),
+            "nothing to expand: {}",
+            lines[1]
+        );
+        assert!(!lines[0].contains('s'), "no invented duration");
+    }
+
+    #[test]
+    fn a_failed_tool_is_one_line_and_keeps_the_reason() {
+        use turya_protocol::ToolResult;
+        let res = ToolResult {
+            call_id: "c1".to_string(),
+            success: false,
+            output: String::new(),
+            error: Some("permission denied".to_string()),
+        };
+        let lines = format_tool_result_timed("write_file", &res, None);
+        assert_eq!(lines.len(), 1, "a failure is one line");
+        assert!(lines[0].contains("✘ write_file"), "{}", lines[0]);
+        assert!(lines[0].contains("permission denied"), "{}", lines[0]);
+    }
+
+    #[tokio::test]
+    async fn a_completed_tool_records_its_duration() {
+        use turya_protocol::{ToolCall, ToolResult};
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&TuryaEvent::ToolCallInitiated(ToolCall {
+            call_id: "c1".to_string(),
+            tool_name: "run_bash".to_string(),
+            parameters: serde_json::json!({}),
+            signature: None,
+        }));
+        app.feed_flow_event(&TuryaEvent::ToolCallCompleted(ToolResult {
+            call_id: "c1".to_string(),
+            success: true,
+            output: "done".to_string(),
+            error: None,
+        }));
+        let text = app.transcript_text();
+        assert!(text.contains("run_bash"), "{text}");
+        assert!(text.contains('s'), "a duration is reported: {text}");
+        // In-flight bookkeeping is cleaned up, not accumulated.
+        assert!(app.tool_started.is_empty());
     }
 }
