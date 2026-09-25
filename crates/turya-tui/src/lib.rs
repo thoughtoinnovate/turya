@@ -910,6 +910,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typing_in_model_pane_filters_models_in_place() {
+        // Exact reported sequence: open /models, Tab into models, type "flash".
+        let mut app = TuiApp::new();
+        app.flow = Flow::Browser(BrowserFlow::new(BrowserMode::Models));
+        app.feed_flow_event(&listed());
+        let (tx, _rx) = mpsc::channel(32);
+        app.handle_flow_key(KeyCode::Tab, &tx).await;
+        for c in ['f', 'l', 'a', 's', 'h'] {
+            app.handle_flow_key(KeyCode::Char(c), &tx).await;
+        }
+        match &app.flow {
+            Flow::Browser(b) => {
+                assert_eq!(b.query, "flash");
+                assert!(b.right, "focus must stay in the model pane");
+                assert_eq!(b.visible_providers(), vec![0]);
+                assert_eq!(
+                    b.selected_model(),
+                    Some(("gemini".to_string(), "gemini-2.5-flash".to_string()))
+                );
+            }
+            _ => panic!("expected browser flow"),
+        }
+    }
+
+    #[tokio::test]
     async fn unlocked_model_enter_switches_and_closes() {
         let mut app = TuiApp::new();
         app.flow = Flow::Browser(BrowserFlow::new(BrowserMode::Models));
