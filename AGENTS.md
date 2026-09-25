@@ -122,3 +122,28 @@ Before executing any `git commit`, agents must perform this internal checklist:
 ---
 
 *This document is enforced across all autonomous and interactive agent workflows for the Turya project.*
+
+---
+
+## 5. ♻️ Forward-Only Change Policy (NO Backward Compatibility)
+
+### Rule 5.1: Breaking changes are the default
+Turya is pre-1.0. Every release may break every internal contract freely. Never write code to preserve an old shape, an old client, or an old file.
+
+### Rule 5.2: Forbidden — compatibility shims
+**NEVER** add: `Option`/default fields *solely* for old callers · dual-shape enums · `#[deprecated]` legacy paths · `if old_version { … }` branches · serialization fallbacks · catch-all `Unknown` variants for old data · commented-out or flag-gated dead old code · migration/upgrade functions for any prior format.
+
+### Rule 5.3: Correct response to incompatible state
+A newer binary **may not understand** older state. On mismatch it must **fail fast with an actionable message**, or **back up and recreate**. Detect → tell the user exactly what happened and what to run next. Silently ignoring, silently merging, and silently discarding are all violations. Never `unwrap()`/`or_default()` over a schema you did not recognize.
+
+### Rule 5.4: Durable formats carry a version tag
+`config.toml`, the session database, and any exported bundle carry a version. Bump it freely. A non-current version is **rejected, never migrated**. Version tags exist to produce a good error message — not to enable a migration path.
+
+### Rule 5.5: Make the clean break
+When a shape changes, **delete the old path completely** in the same change. Leaving two ways to do one thing is a defect, not a safety net. Temporary feature flags are allowed *only* within a single phase and must be removed before that phase's gate.
+
+### Rule 5.6: Review rejection criteria
+A change is rejected if it contains compatibility shims, migration code, legacy branches, or dead old code. "It's safer for existing users" is not a justification — there are no external consumers (no socket transport, no third-party clients) until a `turya-server` socket ships; that is the moment this rule gets revisited.
+
+### Rule 5.7: Not affected
+Rule 3.3's runtime `register`/`unregister` + hot-reload must stay live **within** a session — an agent's own plugins cannot break mid-session. This is not a compatibility concern.
