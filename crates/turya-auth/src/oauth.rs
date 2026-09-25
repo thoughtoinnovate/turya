@@ -45,7 +45,12 @@ impl OAuthConfig {
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
             token_url: "https://oauth2.googleapis.com/token".to_string(),
             client_id: client_id.to_string(),
-            scopes: vec!["https://www.googleapis.com/auth/cloud-platform".to_string()],
+            scopes: vec![
+                "https://www.googleapis.com/auth/cloud-platform".to_string(),
+                // Generative Language API calls made with OAuth tokens
+                // (Authorization: Bearer) need this scope explicitly.
+                "https://www.googleapis.com/auth/generative-language".to_string(),
+            ],
             redirect_port: 0,
         }
     }

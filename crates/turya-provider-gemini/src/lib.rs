@@ -15,18 +15,45 @@ use turya_core::{
 use turya_protocol::ToolCall;
 
 /// Streaming Gemini provider (Generative Language SSE).
+///
+/// Credential transport depends on provenance: API keys travel as `?key=`,
+/// OAuth access tokens travel as `Authorization: Bearer` (Google rejects
+/// OAuth tokens in the `key` param). The flag derives from `creds.via`,
+/// so callers never branch on auth method themselves.
 pub struct GeminiProvider {
-    api_key: String,
+    credential: String,
+    bearer: bool,
     pub model: String,
 }
 
 impl GeminiProvider {
     pub fn new(api_key: String, model: String) -> Self {
-        Self { api_key, model }
+        Self {
+            credential: api_key,
+            bearer: false,
+            model,
+        }
     }
 
     pub fn connect_with(creds: &ResolvedCreds, model: &str) -> Self {
-        Self::new(creds.token.clone(), model.to_string())
+        Self {
+            credential: creds.token.clone(),
+            bearer: creds.via == "oauth",
+            model: model.to_string(),
+        }
+    }
+
+    /// Pure request target: `(url, bearer_token)`. Unit-tested, no network.
+    fn request_target(&self) -> (String, Option<String>) {
+        let base = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse",
+            self.model
+        );
+        if self.bearer {
+            (base, Some(format!("Bearer {}", self.credential)))
+        } else {
+            (format!("{base}&key={}", self.credential), None)
+        }
     }
 
     /// Request body for `streamGenerateContent` (pure: unit-tested).
@@ -119,13 +146,22 @@ impl GeminiProvider {
 
     /// Live model listing (`GET /v1beta/models`), filtered to generation-capable
     /// models. Empty on ANY failure — callers fall through, never error.
+    /// `bearer` selects the OAuth transport (see [`GeminiProvider`]).
     pub async fn fetch_live_models(api_key: &str) -> Vec<String> {
+        Self::fetch_live_models_authed(api_key, false).await
+    }
+
+    pub async fn fetch_live_models_authed(token: &str, bearer: bool) -> Vec<String> {
         let mut out = Vec::new();
         let mut page_token: Option<String> = None;
         for _ in 0..5 {
-            let mut url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models?key={api_key}&pageSize=100"
-            );
+            let mut url = if bearer {
+                "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100".to_string()
+            } else {
+                format!(
+                    "https://generativelanguage.googleapis.com/v1beta/models?key={token}&pageSize=100"
+                )
+            };
             if let Some(t) = &page_token {
                 url.push_str(&format!("&pageToken={t}"));
             }
@@ -134,13 +170,19 @@ impl GeminiProvider {
                 .user_agent("turya-provider")
                 .build()
             {
-                Ok(c) => match c.get(&url).send().await {
-                    Ok(r) if r.status().is_success() => match r.json().await {
-                        Ok(b) => b,
-                        Err(_) => break,
-                    },
-                    _ => break,
-                },
+                Ok(c) => {
+                    let mut req = c.get(&url);
+                    if bearer {
+                        req = req.bearer_auth(token);
+                    }
+                    match req.send().await {
+                        Ok(r) if r.status().is_success() => match r.json().await {
+                            Ok(b) => b,
+                            Err(_) => break,
+                        },
+                        _ => break,
+                    }
+                }
                 Err(_) => break,
             };
             let empty = vec![];
@@ -184,15 +226,14 @@ impl LlmProvider for GeminiProvider {
         history: &[String],
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.model, self.api_key
-        );
+        let (url, bearer) = self.request_target();
         let body = Self::request_body(prompt, history);
         let client = reqwest::Client::new();
-        let resp = client
-            .post(&url)
-            .header("content-type", "application/json")
+        let mut req = client.post(&url).header("content-type", "application/json");
+        if let Some(token) = bearer {
+            req = req.header("authorization", token);
+        }
+        let resp = req
             .json(&body)
             .send()
             .await
@@ -270,14 +311,12 @@ impl ProviderPlugin for GeminiPlugin {
     }
 
     fn connect(&self, creds: ResolvedCreds, model: &str) -> Result<Arc<dyn LlmProvider>, String> {
-        Ok(Arc::new(GeminiProvider::new(
-            creds.token,
-            model.to_string(),
-        )))
+        Ok(Arc::new(GeminiProvider::connect_with(&creds, model)))
     }
 
     async fn list_models(&self, creds: &ResolvedCreds) -> Vec<String> {
-        GeminiProvider::fetch_live_models(&creds.token).await
+        let bearer = creds.via == "oauth";
+        GeminiProvider::fetch_live_models_authed(&creds.token, bearer).await
     }
 }
 
@@ -343,5 +382,29 @@ mod tests {
         // Empty/unknown payloads yield nothing, never panic.
         assert!(GeminiProvider::steps_from_payload(&json!({}), &mut seq).is_empty());
         assert!(GeminiProvider::steps_from_payload(&json!({"candidates":[]}), &mut seq).is_empty());
+    }
+
+    #[test]
+    fn credential_transport_by_provenance() {
+        // API key (env/stored/login): credential travels as ?key=, no header.
+        let keyed = GeminiProvider::new("sk-test".to_string(), "gemini-2.5-flash".to_string());
+        let (url, bearer) = keyed.request_target();
+        assert!(url.contains("?alt=sse&key=sk-test"));
+        assert!(bearer.is_none());
+
+        // OAuth token: no key param anywhere, Bearer header instead.
+        // (Google rejects OAuth tokens in `key=`.)
+        let oauth = GeminiProvider::connect_with(
+            &ResolvedCreds {
+                token: "ya29.test".to_string(),
+                expires_at: None,
+                via: "oauth",
+            },
+            "gemini-2.5-flash",
+        );
+        let (url, bearer) = oauth.request_target();
+        assert!(!url.contains("key="));
+        assert!(!url.contains("ya29"));
+        assert_eq!(bearer.as_deref(), Some("Bearer ya29.test"));
     }
 }
