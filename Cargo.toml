@@ -27,8 +27,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 futures = "0.3"
 # Performance: Use memory-mapping for reading huge files without blowing up RAM on old machines
 memmap2 = "0.9"
-# HTTP/SSE for real LLM providers (rustls to avoid system openssl dependency)
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-manual-roots"] }
+# HTTP/SSE for real LLM providers (rustls to avoid system openssl dependency).
+# webpki-roots bundles Mozilla trust anchors: required for static musl
+# binaries (manual-roots ships an empty store and every https call fails).
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots"] }
 # Embedded SQLite for episodic/long-term memory (bundled, no system lib needed)
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Wasm sandbox for community/self-generated plugins
