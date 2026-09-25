@@ -155,8 +155,15 @@ impl TuiApp {
     /// Route one key into the open flow. Returns after handling; the input
     /// buffer is untouched while a flow owns the keyboard.
     async fn handle_flow_key(&mut self, code: KeyCode, cmd_tx: &mpsc::Sender<TuryaCommand>) {
-        // Esc closes any flow (cancelling a live server flow first).
+        // Esc closes any flow (cancelling a live server flow first) —
+        // unless the browser has filter text, which Esc clears first.
         if code == KeyCode::Esc {
+            if let Flow::Browser(b) = &mut self.flow {
+                if !b.query.is_empty() {
+                    b.set_query(String::new());
+                    return;
+                }
+            }
             let flow_id = match &self.flow {
                 Flow::Auth(a) => a.flow_id.clone(),
                 _ => None,
@@ -195,6 +202,18 @@ impl TuiApp {
                 KeyCode::Tab => {
                     b.right = !b.right;
                 }
+                // Type-to-filter (Esc clears it); Backspace edits it.
+                // An empty query after Backspace keeps the flow open.
+                KeyCode::Char(c) if !c.is_control() => {
+                    let mut q = b.query.clone();
+                    q.push(c);
+                    b.set_query(q);
+                }
+                KeyCode::Backspace => {
+                    let mut q = b.query.clone();
+                    q.pop();
+                    b.set_query(q);
+                }
                 KeyCode::Enter => match b.mode {
                     BrowserMode::Models => {
                         let current = b.current().cloned();
@@ -211,8 +230,8 @@ impl TuiApp {
                             }
                             _ => {
                                 if let Some((pid, mid)) = b.selected_model() {
-                                    // Toast optimistically; failures arrive as Error events.
-                                    self.tool_logs.push(format!("✔ switching to {pid}/{mid}"));
+                                    // Pending toast: failures arrive as Error events.
+                                    self.tool_logs.push(format!("→ switching to {pid}/{mid}…"));
                                     self.flow = Flow::None;
                                     let _ = cmd_tx
                                         .send(TuryaCommand::UpdateConfig {
@@ -428,14 +447,16 @@ impl TuiApp {
                     .split(f.area());
 
                 // 1. Header
-                let header =
-                    Paragraph::new(" Turya v0.1.0 | Mode: Build | Security: Review-for-me")
-                        .style(
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .block(Block::default().borders(Borders::ALL).title("Status"));
+                let header = Paragraph::new(format!(
+                    " Turya v{} | Mode: Build | Security: Review-for-me",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .block(Block::default().borders(Borders::ALL).title("Status"));
                 f.render_widget(header, chunks[0]);
 
                 // 2. Chat Stream
@@ -512,8 +533,8 @@ impl TuiApp {
                             .split(area);
                         f.render_widget(ratatui::widgets::Clear, area);
                         let left_title = match b.mode {
-                            BrowserMode::Models => "Providers — Models",
-                            BrowserMode::AuthPick => "Providers — Auth (pick one)",
+                            BrowserMode::Models => "Providers — type to filter",
+                            BrowserMode::AuthPick => "Providers — type to filter, Enter to log in",
                         };
                         let left_widget =
                             Paragraph::new(left.into_iter().map(Line::from).collect::<Vec<_>>())
@@ -856,6 +877,36 @@ mod tests {
             cmd,
             TuryaCommand::GetAuthStatus { provider } if provider == "openai"
         ));
+    }
+
+    #[tokio::test]
+    async fn browser_typing_filters_esc_clears_then_closes() {
+        let mut app = TuiApp::new();
+        app.flow = Flow::Browser(BrowserFlow::new(BrowserMode::Models));
+        app.feed_flow_event(&listed());
+        let (tx, _rx) = mpsc::channel(32);
+        // Type a filter.
+        app.handle_flow_key(KeyCode::Char('g'), &tx).await;
+        app.handle_flow_key(KeyCode::Char('e'), &tx).await;
+        match &app.flow {
+            Flow::Browser(b) => assert_eq!(b.query, "ge"),
+            _ => panic!("expected browser flow"),
+        }
+        // Backspace edits the query; flow stays open.
+        app.handle_flow_key(KeyCode::Backspace, &tx).await;
+        match &app.flow {
+            Flow::Browser(b) => assert_eq!(b.query, "g"),
+            _ => panic!("expected browser flow"),
+        }
+        // First Esc clears the query, flow stays open.
+        app.handle_flow_key(KeyCode::Esc, &tx).await;
+        match &app.flow {
+            Flow::Browser(b) => assert!(b.query.is_empty()),
+            _ => panic!("expected browser flow"),
+        }
+        // Second Esc closes.
+        app.handle_flow_key(KeyCode::Esc, &tx).await;
+        assert!(matches!(app.flow, Flow::None));
     }
 
     #[tokio::test]

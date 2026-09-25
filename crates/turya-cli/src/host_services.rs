@@ -347,7 +347,14 @@ impl HostServices {
                 .map(|m| m.id.clone())
                 .unwrap_or_default()
         });
-        if !plugin.models().iter().any(|m| m.id == model) {
+        // Validate against the same sources the /models browser shows:
+        // static list (offline, instant) → disk cache (offline) → live
+        // discovery (network). Rejecting live-known models here was a bug:
+        // the picker offered them but the switch refused.
+        if !plugin.models().iter().any(|m| m.id == model)
+            && !self.catalog.cached_ids(&id).iter().any(|m| m == &model)
+            && !self.live_ids(&id).await.iter().any(|m| m == &model)
+        {
             events
                 .send(TuryaEvent::Error {
                     message: format!("unknown model '{model}' for provider '{id}'"),
@@ -802,8 +809,27 @@ mod tests {
         mpsc::Sender<TuryaEvent>,
         mpsc::Receiver<TuryaEvent>,
     ) {
+        harness_with(&["anthropic"])
+    }
+
+    /// Harness with explicit providers, isolated catalog dir + config file.
+    fn harness_with(
+        providers: &[&str],
+    ) -> (
+        HostServices,
+        mpsc::Sender<TuryaEvent>,
+        mpsc::Receiver<TuryaEvent>,
+    ) {
         let registry = Arc::new(ProviderRegistry::new());
-        registry.register(Arc::new(turya_provider_anthropic::AnthropicPlugin));
+        for id in providers {
+            match *id {
+                "anthropic" => {
+                    registry.register(Arc::new(turya_provider_anthropic::AnthropicPlugin))
+                }
+                "gemini" => registry.register(Arc::new(turya_provider_gemini::GeminiPlugin)),
+                _ => {}
+            }
+        }
         let store: Arc<dyn CredentialStore> = Arc::new(MemStore::new());
         let dir = std::env::temp_dir().join("turya-host-router-test");
         let catalog = turya_catalog::Catalog::new(dir);
@@ -895,6 +921,71 @@ mod tests {
             e,
             TuryaEvent::Error { message } if message.contains("unknown provider")
         )));
+    }
+
+    #[tokio::test]
+    async fn switch_accepts_cached_live_only_model() {
+        // Regression: the /models browser offered gemini-flash-latest (live)
+        // but the switch rejected it (static-only validation).
+        let saved_env = std::env::var("GEMINI_API_KEY").ok();
+        std::env::remove_var("GEMINI_API_KEY");
+        let dir = std::env::temp_dir().join("turya-host-switch-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let config_path = dir.join("config.toml");
+        let registry = Arc::new(ProviderRegistry::new());
+        registry.register(Arc::new(turya_provider_gemini::GeminiPlugin));
+        let mem = Arc::new(MemStore::new());
+        mem.set("gemini-api-key", "fake-key-for-offline-test")
+            .unwrap();
+        let store: Arc<dyn CredentialStore> = mem;
+        let catalog = turya_catalog::Catalog::new(dir.join("catalog"));
+        // Seed the disk cache with a live-only model (no network below).
+        let _ = catalog.ensure_loaded(
+            "gemini",
+            true,
+            || vec!["gemini-flash-latest".to_string()],
+            |_| Ok("{}".to_string()),
+        );
+        let tools = Arc::new(turya_tools::ToolRegistry::standard());
+        let mock: Arc<dyn turya_core::LlmProvider> =
+            Arc::new(turya_core::MockProvider { responses: vec![] });
+        let engine = Arc::new(TuryaEngine::new(
+            mock,
+            tools,
+            turya_protocol::PermissionMode::Open,
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let host = HostServices::new(
+            registry,
+            store,
+            catalog,
+            engine,
+            config_path.to_string_lossy().to_string(),
+        );
+        let sink = HostEventSink::new(tx);
+        let consumed = host
+            .handle(
+                &TuryaCommand::UpdateConfig {
+                    permission_mode: None,
+                    provider: Some("gemini".to_string()),
+                    model: Some("gemini-flash-latest".to_string()),
+                },
+                &sink,
+            )
+            .await;
+        assert!(consumed);
+        let evts = drain(&mut rx);
+        assert!(
+            !evts.iter().any(|e| matches!(e, TuryaEvent::Error { .. })),
+            "unexpected error: {evts:?}"
+        );
+        // Selection persisted for next launch.
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        assert!(saved.contains("gemini-flash-latest"));
+        if let Some(v) = saved_env {
+            std::env::set_var("GEMINI_API_KEY", v);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

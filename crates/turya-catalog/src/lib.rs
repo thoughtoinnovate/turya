@@ -224,6 +224,14 @@ impl Catalog {
         self.cache_dir.join(format!("{provider}.json"))
     }
 
+    /// Offline model ids from disk cache (any age — stale beats rejection).
+    /// Pure disk read, never network. Used to validate switches offline.
+    pub fn cached_ids(&self, provider: &str) -> Vec<String> {
+        self.read_cache(provider)
+            .map(|(models, _)| models.into_iter().map(|m| m.id).collect())
+            .unwrap_or_default()
+    }
+
     fn read_cache(&self, provider: &str) -> Option<(Vec<ResolvedModel>, bool)> {
         let raw = std::fs::read_to_string(self.cache_path(provider)).ok()?;
         let file: CacheFile = serde_json::from_str(&raw).ok()?;
@@ -413,5 +421,24 @@ mod tests {
         let json = cat.query_models_json("anthropic", false);
         let models: Vec<ResolvedModel> = serde_json::from_str(&json).unwrap();
         assert!(!models.is_empty());
+    }
+
+    #[test]
+    fn cached_ids_reads_disk_without_network() {
+        let dir = std::env::temp_dir().join("turya-catalog-cached-ids-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cat = Catalog::new(dir);
+        // Nothing cached yet.
+        assert!(cat.cached_ids("gemini").is_empty());
+        // Seed via injected fetchers (no network), then read back offline.
+        let _ = cat.ensure_loaded(
+            "gemini",
+            true,
+            || vec!["gemini-flash-latest".to_string()],
+            |_| Ok(MINI_META.to_string()),
+        );
+        assert!(cat
+            .cached_ids("gemini")
+            .contains(&"gemini-flash-latest".to_string()));
     }
 }

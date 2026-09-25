@@ -48,6 +48,9 @@ pub enum BrowserMode {
     AuthPick,
 }
 
+/// Visible rows per pane before the list scrolls.
+pub const BROWSER_VISIBLE_ROWS: usize = 8;
+
 /// Provider-first browser (mock M2).
 #[derive(Debug, Clone)]
 pub struct BrowserFlow {
@@ -57,6 +60,14 @@ pub struct BrowserFlow {
     pub right: bool,
     pub mode: BrowserMode,
     pub loading: bool,
+    /// Live filter text (typed directly into the browser).
+    pub query: String,
+    prov_offset: usize,
+    model_offset: usize,
+}
+
+fn matches(haystack: &str, query: &str) -> bool {
+    query.is_empty() || haystack.to_lowercase().contains(&query.to_lowercase())
 }
 
 impl BrowserFlow {
@@ -68,36 +79,99 @@ impl BrowserFlow {
             right: false,
             mode,
             loading: true,
+            query: String::new(),
+            prov_offset: 0,
+            model_offset: 0,
         }
     }
 
     pub fn set_providers(&mut self, providers: Vec<ProviderView>) {
         self.providers = providers;
         self.loading = false;
+        self.reset_selection();
+    }
+
+    /// Replace the filter text (resets selection + scroll).
+    pub fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.reset_selection();
+    }
+
+    fn reset_selection(&mut self) {
         self.sel_prov = 0;
         self.sel_model = 0;
         self.right = false;
+        self.prov_offset = 0;
+        self.model_offset = 0;
+    }
+
+    /// Provider indices passing the filter (empty query = all). A provider
+    /// is also visible when one of its models matches (discovery by model).
+    pub fn visible_providers(&self) -> Vec<usize> {
+        self.providers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                matches(&p.id, &self.query)
+                    || matches(&p.display_name, &self.query)
+                    || p.models.iter().any(|m| {
+                        matches(&m.id, &self.query) || matches(&m.display_name, &self.query)
+                    })
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Model indices of the current visible provider passing the filter.
+    pub fn visible_models(&self) -> Vec<usize> {
+        self.current()
+            .map(|p| {
+                p.models
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| {
+                        matches(&m.id, &self.query) || matches(&m.display_name, &self.query)
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn current(&self) -> Option<&ProviderView> {
-        self.providers.get(self.sel_prov)
+        let idx = *self.visible_providers().get(self.sel_prov)?;
+        self.providers.get(idx)
     }
 
     pub fn move_prov(&mut self, delta: isize) {
-        if self.providers.is_empty() {
+        let len = self.visible_providers().len();
+        if len == 0 {
             return;
         }
-        let len = self.providers.len() as isize;
-        self.sel_prov = (self.sel_prov as isize + delta).rem_euclid(len) as usize;
+        self.sel_prov = (self.sel_prov as isize + delta).rem_euclid(len as isize) as usize;
         self.sel_model = 0;
+        self.model_offset = 0;
+        Self::follow(&mut self.prov_offset, self.sel_prov, len);
     }
 
     pub fn move_model(&mut self, delta: isize) {
-        let len = self.current().map(|p| p.models.len()).unwrap_or(0);
+        let len = self.visible_models().len();
         if len == 0 {
             return;
         }
         self.sel_model = (self.sel_model as isize + delta).rem_euclid(len as isize) as usize;
+        Self::follow(&mut self.model_offset, self.sel_model, len);
+    }
+
+    /// Keep `selected` inside the `[offset, offset+WINDOW)` viewport.
+    fn follow(offset: &mut usize, selected: usize, len: usize) {
+        if selected < *offset {
+            *offset = selected;
+        } else if selected >= *offset + BROWSER_VISIBLE_ROWS {
+            *offset = selected + 1 - BROWSER_VISIBLE_ROWS;
+        }
+        let max_offset = len.saturating_sub(BROWSER_VISIBLE_ROWS);
+        *offset = (*offset).min(max_offset);
     }
 
     /// Currently highlighted model, if the provider is unlocked.
@@ -106,7 +180,8 @@ impl BrowserFlow {
         if p.is_locked() {
             return None;
         }
-        let m = p.models.get(self.sel_model)?;
+        let models = self.visible_models();
+        let m = p.models.get(*models.get(self.sel_model)?)?;
         Some((p.id.clone(), m.id.clone()))
     }
 }
@@ -161,23 +236,36 @@ pub enum Flow {
 }
 
 /// Render lines for the browser overlay. Pure (draw maps to `Line`s).
+/// Both panes show a scrolling window of [`BROWSER_VISIBLE_ROWS`] rows with
+/// `↑n`/`↓n` overflow markers; a non-empty filter adds a status header.
 pub fn render_browser(flow: &BrowserFlow) -> (Vec<String>, Vec<String>) {
     if flow.loading {
         return (vec!["  ⠋ loading providers…".to_string()], vec![]);
     }
-    if flow.providers.is_empty() {
-        return (vec!["  (no providers registered)".to_string()], vec![]);
+    let vis_prov = flow.visible_providers();
+    if vis_prov.is_empty() {
+        let empty = if flow.query.is_empty() {
+            "  (no providers registered)".to_string()
+        } else {
+            format!("  (no match for “{}”)", flow.query)
+        };
+        return (vec![empty], vec![]);
     }
-    let left: Vec<String> = flow
-        .providers
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let marker = if i == flow.sel_prov { "❯" } else { " " };
-            let lock = if p.is_locked() { " (locked)" } else { "" };
-            format!("{marker} {} {}{}", p.badge(), p.display_name, lock)
-        })
-        .collect();
+    let header = if flow.query.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "  /{} ({} match{})",
+            flow.query,
+            vis_prov.len(),
+            if vis_prov.len() == 1 { "" } else { "es" }
+        ))
+    };
+    let left: Vec<String> = windowed(vis_prov.len(), flow.prov_offset, flow.sel_prov, |i| {
+        let p = &flow.providers[vis_prov[i]];
+        let lock = if p.is_locked() { " (locked)" } else { "" };
+        format!("{} {}{}", p.badge(), p.display_name, lock)
+    });
     let right: Vec<String> = flow
         .current()
         .map(|p| {
@@ -186,21 +274,48 @@ pub fn render_browser(flow: &BrowserFlow) -> (Vec<String>, Vec<String>) {
                     "  🔒 log in to see models".to_string(),
                     "  Enter → /auth".to_string(),
                 ]
-            } else if p.models.is_empty() {
-                vec!["  (no models)".to_string()]
             } else {
-                p.models
-                    .iter()
-                    .enumerate()
-                    .map(|(i, m)| {
-                        let marker = if i == flow.sel_model { "❯" } else { " " };
-                        format!("{marker} {} [{}]", m.display_name, m.source)
+                let vis_models = flow.visible_models();
+                if vis_models.is_empty() && !flow.query.is_empty() {
+                    vec![format!("  (no match for “{}”)", flow.query)]
+                } else if vis_models.is_empty() {
+                    vec!["  (no models)".to_string()]
+                } else {
+                    windowed(vis_models.len(), flow.model_offset, flow.sel_model, |i| {
+                        let m = &p.models[vis_models[i]];
+                        format!("{} [{}]", m.display_name, m.source)
                     })
-                    .collect()
+                }
             }
         })
         .unwrap_or_default();
+    let mut left = left;
+    if let Some(h) = header {
+        left.insert(0, h);
+    }
     (left, right)
+}
+
+/// Slice `[offset, offset+WINDOW)` with selection markers + overflow counts.
+fn windowed(
+    len: usize,
+    offset: usize,
+    selected: usize,
+    mut render: impl FnMut(usize) -> String,
+) -> Vec<String> {
+    let end = (offset + BROWSER_VISIBLE_ROWS).min(len);
+    let mut rows = Vec::new();
+    if offset > 0 {
+        rows.push(format!("  ↑{offset} more"));
+    }
+    for i in offset..end {
+        let marker = if i == selected { "❯" } else { " " };
+        rows.push(format!("{marker} {}", render(i)));
+    }
+    if end < len {
+        rows.push(format!("  ↓{} more", len - end));
+    }
+    rows
 }
 
 /// Render lines for the auth overlay. Pure.
@@ -323,6 +438,62 @@ mod tests {
         f.sel_prov = 1;
         let (_, right) = render_browser(&f);
         assert!(right.iter().any(|l| l.contains("log in")));
+    }
+
+    #[test]
+    fn query_filters_providers_and_models() {
+        let mut f = sample();
+        f.set_query("gem".to_string());
+        assert_eq!(f.visible_providers(), vec![0]);
+        assert_eq!(f.sel_prov, 0);
+        let (left, _) = render_browser(&f);
+        assert!(left[0].contains("/gem"));
+        assert!(left.iter().any(|l| l.contains("1 match")));
+
+        // Model-level filter surfaces the owning provider.
+        f.set_query("flash".to_string());
+        assert_eq!(f.visible_providers(), vec![0]);
+        assert_eq!(
+            f.selected_model(),
+            // sel_model 0 over visible [flash] → first flash model
+            Some(("gemini".to_string(), "gemini-2.5-flash".to_string()))
+        );
+
+        // No match anywhere.
+        f.set_query("zzz-nope".to_string());
+        assert!(f.visible_providers().is_empty());
+        assert!(f.selected_model().is_none());
+        let (left, _) = render_browser(&f);
+        assert!(left.iter().any(|l| l.contains("no match")));
+    }
+
+    #[test]
+    fn scroll_viewport_follows_selection() {
+        let mut f = sample();
+        // Grow gemini to 12 models so the 8-row window must scroll.
+        if let Some(p) = f.providers.get_mut(0) {
+            for i in 0..10 {
+                p.models.push(ModelView {
+                    id: format!("extra-{i}"),
+                    display_name: format!("Extra {i}"),
+                    source: "static".into(),
+                });
+            }
+        }
+        f.right = true;
+        for _ in 0..8 {
+            f.move_model(1);
+        }
+        assert_eq!(f.sel_model, 8);
+        let (_, right) = render_browser(&f);
+        assert!(right.iter().any(|l| l.starts_with("  ↑")));
+        assert!(right.iter().any(|l| l.starts_with("❯")));
+        // Scroll back to top clears the marker.
+        for _ in 0..8 {
+            f.move_model(-1);
+        }
+        let (_, right) = render_browser(&f);
+        assert!(!right.iter().any(|l| l.starts_with("  ↑")));
     }
 
     #[test]
