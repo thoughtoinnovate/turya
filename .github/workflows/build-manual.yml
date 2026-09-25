@@ -1,0 +1,220 @@
+name: Manual Build
+
+# Manual workflow to build binaries and publish to 'nightly' release
+# Click "Run workflow" → builds selected platforms → uploads to nightly release
+#
+# Users can then download from:
+#   https://github.com/thoughtoinnovate/turya/releases/download/nightly/turya-linux-x86_64-musl
+#
+# The `turya update` self-updater and install.sh resolve /releases/latest,
+# which excludes prereleases, so nightly builds never hijack stable users.
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platforms to build'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - linux
+          - macos
+          - windows
+          - all
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: turya
+
+jobs:
+  build-linux:
+    if: ${{ github.event.inputs.platforms == 'linux' || github.event.inputs.platforms == 'all' }}
+    name: Build Linux
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # musl = static binary, works on ANY Linux (Alpine, Arch, Ubuntu, etc.)
+          - target: x86_64-unknown-linux-musl
+            artifact_name: turya-linux-x86_64-musl
+            use_cross: true
+          # ARM64 for Raspberry Pi 4/5, AWS Graviton, etc.
+          - target: aarch64-unknown-linux-musl
+            artifact_name: turya-linux-arm64-musl
+            use_cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }} -p turya-cli
+
+      - name: Build with cargo
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }} -p turya-cli
+
+      - name: Prepare binary
+        run: |
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} ${{ matrix.artifact_name }}
+          strip ${{ matrix.artifact_name }} 2>/dev/null || true
+          chmod +x ${{ matrix.artifact_name }}
+          ls -lh ${{ matrix.artifact_name }}
+          sha256sum ${{ matrix.artifact_name }} > ${{ matrix.artifact_name }}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}
+            ${{ matrix.artifact_name }}.sha256
+
+  build-macos:
+    if: ${{ github.event.inputs.platforms == 'macos' || github.event.inputs.platforms == 'all' }}
+    name: Build macOS
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            artifact_name: turya-darwin-x86_64
+          - target: aarch64-apple-darwin
+            artifact_name: turya-darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p turya-cli
+
+      - name: Prepare binary
+        run: |
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} ${{ matrix.artifact_name }}
+          strip ${{ matrix.artifact_name }} 2>/dev/null || true
+          chmod +x ${{ matrix.artifact_name }}
+          ls -lh ${{ matrix.artifact_name }}
+          shasum -a 256 ${{ matrix.artifact_name }} > ${{ matrix.artifact_name }}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}
+            ${{ matrix.artifact_name }}.sha256
+
+  build-windows:
+    if: ${{ github.event.inputs.platforms == 'windows' || github.event.inputs.platforms == 'all' }}
+    name: Build Windows
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            artifact_name: turya-windows-x86_64.exe
+          - target: aarch64-pc-windows-msvc
+            artifact_name: turya-windows-arm64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p turya-cli
+
+      - name: Prepare binary
+        shell: pwsh
+        run: |
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" "${{ matrix.artifact_name }}"
+          $hash = (Get-FileHash "${{ matrix.artifact_name }}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.artifact_name }}" | Out-File -Encoding ASCII "${{ matrix.artifact_name }}.sha256"
+          Get-Item "${{ matrix.artifact_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}
+            ${{ matrix.artifact_name }}.sha256
+
+  # Publish all built binaries to 'nightly' release
+  publish-nightly:
+    name: Publish Nightly Release
+    needs: [build-linux, build-macos, build-windows]
+    if: always() && (needs.build-linux.result == 'success' || needs.build-macos.result == 'success' || needs.build-windows.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          # Copy all binaries and checksums
+          for dir in artifacts/*/; do
+            if [ -d "$dir" ]; then
+              cp "$dir"* release/ 2>/dev/null || true
+            fi
+          done
+          ls -la release/
+
+      - name: Create or update nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Delete existing nightly release if it exists
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+
+          # Create new nightly release with all binaries
+          gh release create nightly \
+            --title "Nightly Build" \
+            --prerelease \
+            --notes "## Nightly Build
+
+          This is an automated nightly build from the latest code.
+
+          - Built from: ${{ github.sha }}
+          - Built at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          For stable releases, see [Releases](https://github.com/${{ github.repository }}/releases).
+
+          > Nightly builds are prereleases: \`turya update\` and install.sh
+          > resolve /releases/latest and will never install them." \
+            release/*
+
+      - name: Summary
+        run: |
+          echo "## Nightly Release Published!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download URL:" >> $GITHUB_STEP_SUMMARY
+          echo "\`https://github.com/${{ github.repository }}/releases/download/nightly/<binary>\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Binaries uploaded:" >> $GITHUB_STEP_SUMMARY
+          ls release/ >> $GITHUB_STEP_SUMMARY

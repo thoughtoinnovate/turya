@@ -1,0 +1,175 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: turya
+
+jobs:
+  version-check:
+    name: Tag matches crate version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag equals turya-cli version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="v$(grep -m1 '^version' crates/turya-cli/Cargo.toml | cut -d'"' -f2)"
+          echo "tag=$TAG crate=$VERSION"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::Tag $TAG does not match turya-cli version $VERSION. Bump Cargo.toml first."
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version-check
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux (musl) - static binaries that work on ANY Linux
+          # (Ubuntu, Debian, Fedora, Alpine, Arch, NixOS, etc.)
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: turya-linux-x86_64-musl
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: turya-linux-arm64-musl
+            use_cross: true
+
+          # macOS
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact_name: turya-darwin-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact_name: turya-darwin-arm64
+
+          # Windows
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: turya-windows-x86_64.exe
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: turya-windows-arm64.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }} -p turya-cli
+
+      - name: Build with cargo
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }} -p turya-cli
+
+      - name: Strip and rename binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} ${{ matrix.artifact_name }}
+          # Strip debug symbols for smaller binary (~50% size reduction)
+          strip ${{ matrix.artifact_name }} 2>/dev/null || true
+          chmod +x ${{ matrix.artifact_name }}
+          # Show binary size
+          ls -lh ${{ matrix.artifact_name }}
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe ${{ matrix.artifact_name }}
+          # Show binary size
+          dir ${{ matrix.artifact_name }}
+
+      - name: Generate checksum
+        if: runner.os != 'Windows'
+        run: sha256sum ${{ matrix.artifact_name }} > ${{ matrix.artifact_name }}.sha256
+
+      - name: Generate checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Path "${{ matrix.artifact_name }}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.artifact_name }}" | Out-File -FilePath "${{ matrix.artifact_name }}.sha256" -Encoding ascii
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ matrix.artifact_name }}
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+          files: |
+            ${{ matrix.artifact_name }}
+            ${{ matrix.artifact_name }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: turya ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # NOTE: install.sh resolves the latest release tag at runtime and needs
+  # no per-release version bump, so there is intentionally no automation
+  # committing to main from this workflow.

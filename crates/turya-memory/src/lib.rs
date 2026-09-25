@@ -184,7 +184,10 @@ impl MemoryStore {
             let value: serde_json::Value =
                 serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
             let tool = value.get("tool").and_then(|t| t.as_str()).unwrap_or("tool");
-            let error = value.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
+            let error = value
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown error");
             let snippet: String = error.chars().take(200).collect();
             let rule = format!(
                 "Lesson from session '{}': tool '{}' failed with '{}'. Double-check inputs for '{}' before retrying.",
@@ -208,8 +211,12 @@ mod tests {
     #[test]
     fn records_and_replays_session_events() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.record_event("s1", "TurnCompleted", &json!({"ok": true})).unwrap();
-        store.record_event("s1", "TokenDelta", &json!({"chunk": "hi"})).unwrap();
+        store
+            .record_event("s1", "TurnCompleted", &json!({"ok": true}))
+            .unwrap();
+        store
+            .record_event("s1", "TokenDelta", &json!({"chunk": "hi"}))
+            .unwrap();
         let history = store.session_history("s1", 10).unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].0, "TurnCompleted");
@@ -219,9 +226,14 @@ mod tests {
     fn retrieves_relevant_rules() {
         let store = MemoryStore::open_in_memory().unwrap();
         store
-            .save_rule("project", "Axum handlers require Send + Sync on custom errors")
+            .save_rule(
+                "project",
+                "Axum handlers require Send + Sync on custom errors",
+            )
             .unwrap();
-        store.save_rule("global", "Always use double quotes in bash").unwrap();
+        store
+            .save_rule("global", "Always use double quotes in bash")
+            .unwrap();
         let rules = store.rules_for("add a new axum route handler", 5).unwrap();
         assert!(rules.iter().any(|r| r.rule.contains("Axum")));
         assert!(rules.iter().any(|r| r.scope == "global"));

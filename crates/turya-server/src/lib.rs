@@ -1,7 +1,7 @@
-use turya_core::TuryaEngine;
-use turya_protocol::{TuryaCommand, TuryaEvent, PermissionDecision};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use turya_core::TuryaEngine;
+use turya_protocol::{PermissionDecision, TuryaCommand, TuryaEvent};
 
 pub struct TuryaSession {
     engine: Arc<TuryaEngine>,
@@ -46,7 +46,10 @@ impl TuryaSession {
                             .await;
                     });
                 }
-                TuryaCommand::ResolvePermission { request_id, decision } => {
+                TuryaCommand::ResolvePermission {
+                    request_id,
+                    decision,
+                } => {
                     // Forward permission decision directly to the active turn
                     if let Some(ref tx) = self.active_perm_tx {
                         let _ = tx.send((request_id, decision)).await;

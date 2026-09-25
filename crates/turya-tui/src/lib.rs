@@ -4,7 +4,6 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::StreamExt;
-use turya_protocol::{AgentMode, TuryaCommand, TuryaEvent, PermissionDecision};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -15,12 +14,19 @@ use ratatui::{
 };
 use std::io::stdout;
 use tokio::sync::mpsc;
+use turya_protocol::{AgentMode, PermissionDecision, TuryaCommand, TuryaEvent};
 
 pub struct TuiApp {
     input: String,
     streamed_text: String,
     tool_logs: Vec<String>,
     pending_permission: Option<(String, String)>, // (request_id, action)
+}
+
+impl Default for TuiApp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TuiApp {
@@ -32,7 +38,6 @@ impl TuiApp {
             pending_permission: None,
         }
     }
-
     pub async fn run(
         mut self,
         cmd_tx: mpsc::Sender<TuryaCommand>,
@@ -59,9 +64,14 @@ impl TuiApp {
                     .split(f.area());
 
                 // 1. Header
-                let header = Paragraph::new(" Turya v0.1.0 | Mode: Build | Security: Review-for-me")
-                    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-                    .block(Block::default().borders(Borders::ALL).title("Status"));
+                let header =
+                    Paragraph::new(" Turya v0.1.0 | Mode: Build | Security: Review-for-me")
+                        .style(
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .block(Block::default().borders(Borders::ALL).title("Status"));
                 f.render_widget(header, chunks[0]);
 
                 // 2. Chat Stream
@@ -71,9 +81,16 @@ impl TuiApp {
                 f.render_widget(chat, chunks[1]);
 
                 // 3. Tool Activity
-                let logs: Vec<Line> = self.tool_logs.iter().map(|l| Line::from(Span::raw(l))).collect();
-                let tools_widget = Paragraph::new(logs)
-                    .block(Block::default().borders(Borders::ALL).title("Tool Activity"));
+                let logs: Vec<Line> = self
+                    .tool_logs
+                    .iter()
+                    .map(|l| Line::from(Span::raw(l)))
+                    .collect();
+                let tools_widget = Paragraph::new(logs).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Tool Activity"),
+                );
                 f.render_widget(tools_widget, chunks[2]);
 
                 // 4. Input or Permission Prompt
@@ -82,8 +99,16 @@ impl TuiApp {
                         "Allow '{}'? Press [y] to allow, [n] to deny",
                         action
                     ))
-                    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                    .block(Block::default().borders(Borders::ALL).title("Permission Required"));
+                    .style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Permission Required"),
+                    );
                     f.render_widget(prompt, chunks[3]);
                 } else {
                     let input_widget = Paragraph::new(self.input.as_str()).block(
@@ -123,14 +148,12 @@ impl TuiApp {
                         match key.code {
                             KeyCode::Char(c) => self.input.push(c),
                             KeyCode::Backspace => { self.input.pop(); },
-                            KeyCode::Enter => {
-                                if !self.input.trim().is_empty() {
-                                    let prompt = std::mem::take(&mut self.input);
-                                    let _ = cmd_tx.send(TuryaCommand::SubmitPrompt {
-                                        prompt,
-                                        mode: AgentMode::Build,
-                                    }).await;
-                                }
+                            KeyCode::Enter if !self.input.trim().is_empty() => {
+                                let prompt = std::mem::take(&mut self.input);
+                                let _ = cmd_tx.send(TuryaCommand::SubmitPrompt {
+                                    prompt,
+                                    mode: AgentMode::Build,
+                                }).await;
                             }
                             _ => {}
                         }

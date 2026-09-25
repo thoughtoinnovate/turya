@@ -1,19 +1,58 @@
-use clap::Parser;
-use turya_core::{AnthropicProvider, LlmProvider, MockProvider, ProviderStep, TuryaEngine};
-use turya_protocol::{PermissionMode, ToolCall};
-use turya_tools::ToolRegistry;
-use turya_server::TuryaSession;
-use turya_tui::TuiApp;
+use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use turya_core::{AnthropicProvider, LlmProvider, MockProvider, ProviderStep, TuryaEngine};
+use turya_protocol::{PermissionMode, ToolCall};
+use turya_server::TuryaSession;
+use turya_tools::ToolRegistry;
+use turya_tui::TuiApp;
+
+mod update;
 
 #[derive(Parser, Debug)]
-#[command(name = "turya", about = "Fast, modular agentic coding harness")]
+#[command(
+    name = "turya",
+    version,
+    about = "Fast, modular agentic coding harness"
+)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[arg(short, long, default_value = "review-for-me")]
     permission_mode: String,
     #[arg(long)]
     model: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Update to the latest patch/minor release (never crosses majors).
+    Update {
+        /// Install a specific version (e.g. --version v0.1.2).
+        #[arg(long)]
+        version: Option<String>,
+        /// Reinstall even when already up to date.
+        #[arg(long)]
+        force: bool,
+        /// Report latest vs installed versions, change nothing.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Upgrade across major versions (confirms breaking-change risk).
+    Upgrade {
+        /// Install a specific version (e.g. --version v1.0.0).
+        #[arg(long)]
+        version: Option<String>,
+        /// Reinstall even when already up to date.
+        #[arg(long)]
+        force: bool,
+        /// Report latest vs installed versions, change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Skip the major-version confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn parse_permission_mode(raw: &str) -> PermissionMode {
@@ -27,6 +66,31 @@ fn parse_permission_mode(raw: &str) -> PermissionMode {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // Self-management subcommands never touch the agent engine.
+    match args.command {
+        Some(Command::Update {
+            version,
+            force,
+            check,
+        }) => {
+            return update::run_self_update(version.as_deref(), force, check)
+                .await
+                .map_err(|e| e.into());
+        }
+        Some(Command::Upgrade {
+            version,
+            force,
+            check,
+            yes,
+        }) => {
+            return update::run_upgrade(version.as_deref(), force, check, yes)
+                .await
+                .map_err(|e| e.into());
+        }
+        None => {}
+    }
+
     if let Some(model) = args.model {
         // Export for AnthropicProvider::from_env; CLI flag wins over env.
         std::env::set_var("TURYA_MODEL", model);
@@ -34,29 +98,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let permission_mode = parse_permission_mode(&args.permission_mode);
 
     // Deterministic mock when TURYA_SIM_MODE=1 or no API key is configured.
-    let provider: std::sync::Arc<dyn LlmProvider> =
-        match AnthropicProvider::from_env() {
-            Some(real) => {
-                eprintln!("Turya: using Anthropic model '{}'", real.model);
-                std::sync::Arc::new(real)
-            }
-            None => std::sync::Arc::new(MockProvider {
-                responses: vec![
-                    ProviderStep::Token(
-                        "Welcome to Turya. Analyzing your repository... ".to_string(),
-                    ),
-                    ProviderStep::CallTool(ToolCall {
-                        call_id: "init_call".to_string(),
-                        tool_name: "view_file".to_string(),
-                        parameters: serde_json::json!({ "path": "Cargo.toml" }),
-                    }),
-                    ProviderStep::Token(
-                        "\nRepository read complete. Ready for tasks.".to_string(),
-                    ),
-                    ProviderStep::Finish,
-                ],
-            }),
-        };
+    let provider: std::sync::Arc<dyn LlmProvider> = match AnthropicProvider::from_env() {
+        Some(real) => {
+            eprintln!("Turya: using Anthropic model '{}'", real.model);
+            std::sync::Arc::new(real)
+        }
+        None => std::sync::Arc::new(MockProvider {
+            responses: vec![
+                ProviderStep::Token("Welcome to Turya. Analyzing your repository... ".to_string()),
+                ProviderStep::CallTool(ToolCall {
+                    call_id: "init_call".to_string(),
+                    tool_name: "view_file".to_string(),
+                    parameters: serde_json::json!({ "path": "Cargo.toml" }),
+                }),
+                ProviderStep::Token("\nRepository read complete. Ready for tasks.".to_string()),
+                ProviderStep::Finish,
+            ],
+        }),
+    };
 
     let tools = Arc::new(ToolRegistry::standard());
     let mut engine = TuryaEngine::new(provider, tools, permission_mode);

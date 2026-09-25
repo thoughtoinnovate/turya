@@ -77,9 +77,7 @@ impl LspBridge {
         }
         match self.query_server(path).await {
             Ok(diags) => Ok(diags),
-            Err(LspError::NoServer(_)) | Err(LspError::Timeout) => {
-                Ok(local_syntax_check(path))
-            }
+            Err(LspError::NoServer(_)) | Err(LspError::Timeout) => Ok(local_syntax_check(path)),
             Err(e) => Err(e),
         }
     }
@@ -195,8 +193,14 @@ async fn run_lsp_session(
     path: &Path,
     _server_cmd: &[String],
 ) -> Result<Vec<LspDiagnostic>, LspError> {
-    let stdin = child.stdin.take().ok_or_else(|| LspError::Protocol("no stdin".to_string()))?;
-    let stdout = child.stdout.take().ok_or_else(|| LspError::Protocol("no stdout".to_string()))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| LspError::Protocol("no stdin".to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| LspError::Protocol("no stdout".to_string()))?;
     let mut writer = stdin;
     let mut reader = BufReader::new(stdout);
 
@@ -212,8 +216,7 @@ async fn run_lsp_session(
     writer.write_all(&encode_message(&init)).await?;
     // Drain initialize response (id 1); ignore errors — servers vary.
     let _ = read_message(&mut reader).await;
-    let initialized =
-        serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}});
+    let initialized = serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}});
     writer.write_all(&encode_message(&initialized)).await?;
 
     let content = std::fs::read_to_string(path).unwrap_or_default();
@@ -251,8 +254,9 @@ async fn run_lsp_session(
                     if uri != want_uri {
                         continue;
                     }
-                    if let Some(items) =
-                        msg.pointer("/params/diagnostics").and_then(|d| d.as_array())
+                    if let Some(items) = msg
+                        .pointer("/params/diagnostics")
+                        .and_then(|d| d.as_array())
                     {
                         if items.is_empty() {
                             continue;

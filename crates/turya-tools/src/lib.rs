@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use turya_protocol::{RiskLevel, ToolResult};
 use std::path::Path;
 use tokio::fs;
 use tokio::process::Command;
+use turya_protocol::{RiskLevel, ToolResult};
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -179,6 +179,9 @@ impl ToolRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.iter().find(|t| t.name() == name).map(|b| b.as_ref())
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|b| b.as_ref())
     }
 }

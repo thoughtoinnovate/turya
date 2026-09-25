@@ -11,9 +11,9 @@ pub use provider::{LlmProvider, MockProvider, ProviderStep};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turya_protocol::{AgentMode, TuryaEvent, PermissionMode, ToolCall};
     use std::sync::Arc;
     use tokio::sync::mpsc;
+    use turya_protocol::{AgentMode, PermissionMode, ToolCall, TuryaEvent};
 
     #[tokio::test]
     async fn test_master_loop_with_mock_provider() {
@@ -68,10 +68,7 @@ mod tests {
             turya_memory::MemoryStore::open_in_memory().unwrap(),
         ));
         let mock_provider = Arc::new(MockProvider {
-            responses: vec![
-                ProviderStep::Token("Hi".to_string()),
-                ProviderStep::Finish,
-            ],
+            responses: vec![ProviderStep::Token("Hi".to_string()), ProviderStep::Finish],
         });
         let tools = Arc::new(turya_tools::ToolRegistry::standard());
         let engine = TuryaEngine::new(mock_provider, tools, PermissionMode::Open)
@@ -94,6 +91,9 @@ mod tests {
         assert!(history.iter().any(|(kind, _)| kind == "TurnCompleted"));
     }
 
+    // run_bash shells out to `bash`, which only exists on Unix.
+    // (Windows support needs a cmd.exe fallback in RunBashTool first.)
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_failed_tool_yields_reflected_rule() {
         let store = Arc::new(std::sync::Mutex::new(
@@ -151,8 +151,7 @@ mod tests {
         let tools = Arc::new(turya_tools::ToolRegistry::standard());
         // Empty server cmd -> local fallback: existing file yields no diagnostics.
         let bridge = Arc::new(turya_lsp::LspBridge::new(vec![]));
-        let engine =
-            TuryaEngine::new(mock_provider, tools, PermissionMode::Open).with_lsp(bridge);
+        let engine = TuryaEngine::new(mock_provider, tools, PermissionMode::Open).with_lsp(bridge);
         let (event_tx, mut event_rx) = mpsc::channel(32);
         let (_perm_tx, perm_rx) = mpsc::channel(1);
 
@@ -170,10 +169,8 @@ mod tests {
                     completed = true;
                     break;
                 }
-                TuryaEvent::TokenDelta { chunk } => {
-                    if chunk.contains("compiler error") {
-                        error_feedback = true;
-                    }
+                TuryaEvent::TokenDelta { chunk } if chunk.contains("compiler error") => {
+                    error_feedback = true;
                 }
                 _ => {}
             }

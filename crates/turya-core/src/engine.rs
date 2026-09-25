@@ -1,10 +1,10 @@
 use crate::permissions::PermissionBroker;
 use crate::provider::{LlmProvider, ProviderStep};
-use turya_protocol::{AgentMode, TuryaEvent, PermissionDecision, PermissionMode};
-use turya_tools::ToolRegistry;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use turya_protocol::{AgentMode, PermissionDecision, PermissionMode, TuryaEvent};
+use turya_tools::ToolRegistry;
 
 pub struct TuryaEngine {
     provider: Arc<dyn LlmProvider>,
@@ -141,7 +141,9 @@ impl TuryaEngine {
 
                     if authorized {
                         let result = tool.execute(&call.call_id, call.parameters.clone()).await;
-                        let _ = event_tx.send(TuryaEvent::ToolCallCompleted(result.clone())).await;
+                        let _ = event_tx
+                            .send(TuryaEvent::ToolCallCompleted(result.clone()))
+                            .await;
                         // Record genuine tool failures for the reflection loop
                         // (permission denials are user decisions, not lessons).
                         if !result.success {
@@ -237,10 +239,14 @@ impl TuryaEngine {
         let protocol_diags: Vec<turya_protocol::DiagnosticItem> =
             diagnostics.iter().map(|d| d.to_protocol()).collect();
         let _ = event_tx
-            .send(TuryaEvent::DiagnosticsReceived { diagnostics: protocol_diags })
+            .send(TuryaEvent::DiagnosticsReceived {
+                diagnostics: protocol_diags,
+            })
             .await;
         if let Some(feedback) = turya_lsp::LspBridge::format_feedback(path, &diagnostics) {
-            let _ = event_tx.send(TuryaEvent::TokenDelta { chunk: feedback }).await;
+            let _ = event_tx
+                .send(TuryaEvent::TokenDelta { chunk: feedback })
+                .await;
         }
     }
 }

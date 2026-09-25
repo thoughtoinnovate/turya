@@ -73,7 +73,8 @@ impl PluginHost {
     ) -> Result<serde_json::Value, PluginError> {
         use extism::{Manifest, Plugin, Wasm};
         let manifest = Manifest::new([Wasm::data(wasm_bytes.to_vec())]);
-        let mut plugin = Plugin::new(&manifest, [], false).map_err(|e| PluginError::Extism(e.to_string()))?;
+        let mut plugin =
+            Plugin::new(&manifest, [], false).map_err(|e| PluginError::Extism(e.to_string()))?;
         let input_str =
             serde_json::to_string(input).map_err(|e| PluginError::Output(e.to_string()))?;
         let out = plugin
@@ -164,13 +165,13 @@ mod tests {
         use extism::{Manifest, Plugin, Wasm};
         // Minimal module exporting `greet() -> i32 42`.
         const MINIMAL_WASM: &[u8] = &[
-            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00,
-            0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x09, 0x01, 0x05, 0x67, 0x72, 0x65,
-            0x65, 0x74, 0x00, 0x00, 0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b,
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01,
+            0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x09, 0x01, 0x05, 0x67, 0x72, 0x65, 0x65, 0x74,
+            0x00, 0x00, 0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b,
         ];
         let manifest = Manifest::new([Wasm::data(MINIMAL_WASM.to_vec())]);
-        let result =
-            Plugin::new(&manifest, [], false).and_then(|mut p| p.call("greet", "").map(|b| b.to_vec()));
+        let result = Plugin::new(&manifest, [], false)
+            .and_then(|mut p| p.call("greet", "").map(|b| b.to_vec()));
         assert!(result.is_ok(), "extism should run minimal module");
     }
 }

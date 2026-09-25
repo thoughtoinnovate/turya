@@ -1,6 +1,6 @@
-use turya_protocol::{PermissionDecision, PermissionMode, RiskLevel};
 use std::collections::HashSet;
 use std::sync::RwLock;
+use turya_protocol::{PermissionDecision, PermissionMode, RiskLevel};
 
 pub struct PermissionBroker {
     mode: RwLock<PermissionMode>,
@@ -27,7 +27,12 @@ impl PermissionBroker {
             return Some(PermissionDecision::AllowOnce);
         }
 
-        if self.allowed_session_tools.read().unwrap().contains(tool_name) {
+        if self
+            .allowed_session_tools
+            .read()
+            .unwrap()
+            .contains(tool_name)
+        {
             return Some(PermissionDecision::AllowOnce);
         }
 
@@ -41,7 +46,10 @@ impl PermissionBroker {
 
     pub fn record_decision(&self, tool_name: &str, decision: PermissionDecision) {
         if decision == PermissionDecision::AllowSession {
-            self.allowed_session_tools.write().unwrap().insert(tool_name.to_string());
+            self.allowed_session_tools
+                .write()
+                .unwrap()
+                .insert(tool_name.to_string());
         }
     }
 }

@@ -34,8 +34,8 @@ impl AnthropicProvider {
         if key.trim().is_empty() {
             return None;
         }
-        let model = std::env::var("TURYA_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4-5".to_string());
+        let model =
+            std::env::var("TURYA_MODEL").unwrap_or_else(|_| "claude-sonnet-4-5".to_string());
         Some(Self::new(key, model))
     }
 
@@ -147,13 +147,10 @@ impl LlmProvider for AnthropicProvider {
                         let d_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         if d_type == "text_delta" {
                             if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                let _ =
-                                    tx.send(ProviderStep::Token(text.to_string())).await;
+                                let _ = tx.send(ProviderStep::Token(text.to_string())).await;
                             }
                         } else if d_type == "input_json_delta" {
-                            if let Some(part) =
-                                delta.get("partial_json").and_then(|p| p.as_str())
-                            {
+                            if let Some(part) = delta.get("partial_json").and_then(|p| p.as_str()) {
                                 tool_json.entry(idx).or_default().push_str(part);
                             }
                         }
@@ -162,9 +159,7 @@ impl LlmProvider for AnthropicProvider {
                         let idx = evt.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                         let block = evt.get("content_block").cloned().unwrap_or(json!({}));
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                            if let Some(name) =
-                                block.get("name").and_then(|n| n.as_str())
-                            {
+                            if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
                                 tool_names.insert(idx, name.to_string());
                             }
                             if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
@@ -178,8 +173,9 @@ impl LlmProvider for AnthropicProvider {
                             let raw = tool_json.remove(&idx).unwrap_or_else(|| "{}".to_string());
                             let params: serde_json::Value =
                                 serde_json::from_str(&raw).unwrap_or(json!({}));
-                            let call_id =
-                                tool_ids.remove(&idx).unwrap_or_else(|| format!("call_{}", idx));
+                            let call_id = tool_ids
+                                .remove(&idx)
+                                .unwrap_or_else(|| format!("call_{}", idx));
                             let _ = tx
                                 .send(ProviderStep::CallTool(ToolCall {
                                     call_id,

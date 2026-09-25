@@ -43,9 +43,11 @@ Turya defines a standardized build and test contract in the root [Makefile](./Ma
 | :--- | :--- | :--- |
 | `make help` | Show all available dev commands | Displays command catalog |
 | `make build` | Build the entire workspace (debug) | `cargo build --workspace` |
+| `make build-release` | Build release binaries (ships as `turya`) | `cargo build --workspace --release` |
 | `make test` | Run all workspace unit & integration tests | `cargo test --workspace` |
 | `make e2e` | Run deterministic E2E simulation tests | `TURYA_SIM_MODE=1 cargo test --workspace -- --nocapture` |
-| `make install` | Build & install `turya` CLI to `~/.cargo/bin` | `cargo install --path crates/turya-cli --force` |
+| `make install` | Build & install `turya` CLI (debug) to `~/.cargo/bin` | `cargo install --path crates/turya-cli --force` |
+| `make install-release` | Build & install `turya` CLI (release) to `~/.cargo/bin` | `cargo install --path crates/turya-cli --release --force` |
 | `make clean` | Clean workspace build artifacts | `cargo clean` |
 | `make nuke` | Deep clean target, cargo cache, & reset scratch state | Cleans `target/`, cargo registry cache, and `~/.turya/scratch/*` |
 

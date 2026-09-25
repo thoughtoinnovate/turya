@@ -75,8 +75,13 @@ pub enum TuryaCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum TuryaEvent {
-    TurnStarted { turn_id: String, mode: AgentMode },
-    TokenDelta { chunk: String },
+    TurnStarted {
+        turn_id: String,
+        mode: AgentMode,
+    },
+    TokenDelta {
+        chunk: String,
+    },
     ToolCallInitiated(ToolCall),
     ToolCallCompleted(ToolResult),
     PermissionRequested {
@@ -88,8 +93,13 @@ pub enum TuryaEvent {
     DiagnosticsReceived {
         diagnostics: Vec<DiagnosticItem>,
     },
-    TurnCompleted { turn_id: String, success: bool },
-    Error { message: String },
+    TurnCompleted {
+        turn_id: String,
+        success: bool,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[cfg(test)]

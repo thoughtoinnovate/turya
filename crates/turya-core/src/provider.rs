@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use turya_protocol::ToolCall;
 use tokio::sync::mpsc;
+use turya_protocol::ToolCall;
 
 #[derive(Debug, Clone)]
 pub enum ProviderStep {

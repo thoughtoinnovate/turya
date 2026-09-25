@@ -18,7 +18,11 @@ async fn live_rust_analyzer_reports_broken_file() {
     let src_dir = dir.join("src");
     std::fs::create_dir_all(&src_dir).unwrap();
     let target = src_dir.join("main.rs");
-    std::fs::write(&target, "fn main() {\n    let x: i32 = \"not a number\";\n}\n").unwrap();
+    std::fs::write(
+        &target,
+        "fn main() {\n    let x: i32 = \"not a number\";\n}\n",
+    )
+    .unwrap();
 
     let bridge = LspBridge::rust_analyzer();
     let diags = bridge.diagnose_file(&target).await.unwrap();
