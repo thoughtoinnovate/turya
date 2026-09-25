@@ -434,7 +434,9 @@ impl TuiApp {
         }
     }
 
-    /// Feed a protocol event into the open flow (badges, pickers, stages).
+    /// Feed one protocol event into UI state. Single home for ALL event
+    /// handling (transcript, tools, permissions, flows, provider label),
+    /// so headless tests drive exactly what the live loop drives.
     fn feed_flow_event(&mut self, evt: &TuryaEvent) {
         match evt {
             TuryaEvent::ProvidersListed { providers } => {
@@ -529,6 +531,44 @@ impl TuiApp {
                     // the flow stays consistent without extra plumbing here.
                 }
             }
+            TuryaEvent::ProviderState {
+                provider,
+                model,
+                via,
+            } => {
+                // Host truth corrects the optimistic switch label. Handled
+                // here (not in the run loop) so headless tests drive it.
+                self.provider = Some((provider.clone(), model.clone(), via.clone()));
+            }
+            TuryaEvent::TokenDelta { chunk } => {
+                self.recv_chars += chunk.len();
+                self.streamed_text.push_str(chunk);
+            }
+            TuryaEvent::ToolCallInitiated(call) => {
+                self.log_line(format!("⚡ {}", call.tool_name));
+                self.pending_tools
+                    .insert(call.call_id.clone(), call.tool_name.clone());
+            }
+            TuryaEvent::ToolCallCompleted(res) => {
+                let name = self
+                    .pending_tools
+                    .remove(&res.call_id)
+                    .unwrap_or_else(|| "tool".to_string());
+                for line in format_tool_result(&name, res) {
+                    self.log_line(line);
+                }
+            }
+            TuryaEvent::PermissionRequested {
+                request_id, action, ..
+            } => {
+                self.pending_permission = Some((request_id.clone(), action.clone()));
+            }
+            TuryaEvent::TurnCompleted { .. } => {
+                self.streamed_text.push_str("\n[Turn Finished]\n");
+            }
+            TuryaEvent::Error { message } => {
+                self.log_line(format!("⚠ {message}"));
+            }
             _ => {}
         }
     }
@@ -581,21 +621,21 @@ impl TuiApp {
                     .borders(Borders::ALL)
                     .title("Permission Required"),
             );
-            f.render_widget(prompt, chunks[3]);
+            f.render_widget(prompt, chunks[2]);
         } else {
             let input_widget = Paragraph::new(self.input.as_str()).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title("Prompt (Enter send · / commands · Esc stop · Ctrl+C quit)"),
             );
-            f.render_widget(input_widget, chunks[3]);
+            f.render_widget(input_widget, chunks[2]);
         }
 
         // 5. Status bar: single borderless row — provider/model, token
         // estimates (≈), thinking flag. Every row earns its place.
         f.render_widget(
             Paragraph::new(self.status_line()).style(Style::default().fg(Color::DarkGray)),
-            chunks[4],
+            chunks[3],
         );
 
         // 6. Slash autocomplete popup (overlay above the input pane).
@@ -789,46 +829,9 @@ impl TuiApp {
                     }
                 }
                 Some(evt) = event_rx.recv() => {
-                    // Flows observe every event first (badges, pickers, stages).
+                    // Single home for ALL event handling (see feed_flow_event):
+                    // the live loop and headless tests drive the same code.
                     self.feed_flow_event(&evt);
-                    match evt {
-                        TuryaEvent::TokenDelta { chunk } => {
-                            self.recv_chars += chunk.len();
-                            self.streamed_text.push_str(&chunk);
-                        }
-                        TuryaEvent::ToolCallInitiated(call) => {
-                            self.log_line(format!("⚡ {}", call.tool_name));
-                            self.pending_tools
-                                .insert(call.call_id.clone(), call.tool_name.clone());
-                        }
-                        TuryaEvent::ToolCallCompleted(res) => {
-                            let name = self
-                                .pending_tools
-                                .remove(&res.call_id)
-                                .unwrap_or_else(|| "tool".to_string());
-                            for line in format_tool_result(&name, &res) {
-                                self.log_line(line);
-                            }
-                        }
-                        TuryaEvent::PermissionRequested { request_id, action, .. } => {
-                            self.pending_permission = Some((request_id, action));
-                        }
-                        TuryaEvent::TurnCompleted { .. } => {
-                            self.streamed_text.push_str("\n[Turn Finished]\n");
-                        }
-                        TuryaEvent::Error { message } => {
-                            self.log_line(format!("⚠ {message}"));
-                        }
-                        TuryaEvent::ProviderState {
-                            provider,
-                            model,
-                            via,
-                        } => {
-                            // Host truth corrects the optimistic switch label.
-                            self.provider = Some((provider, model, via));
-                        }
-                        _ => {}
-                    }
                 }
             }
         }
