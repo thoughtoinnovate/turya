@@ -13,7 +13,7 @@ pub use oauth::{OAuthConfig, OAuthError, TokenResponse};
 pub use resolver::{CredSource, MethodChoice, ResolveError};
 pub use status::{auth_status, methods_for, ProviderAuthMethods, ProviderAuthStatus, SlotState};
 pub use store::{
-    api_key_account, oauth_client_id_account, oauth_refresh_account, CredentialStore,
-    KeychainStore, MemStore, StoreError,
+    api_key_account, oauth_client_id_account, oauth_refresh_account, ChainStore, CredentialStore,
+    FileStore, KeychainStore, MemStore, StoreError,
 };
 pub use turya_core::ResolvedCreds;

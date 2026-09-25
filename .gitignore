@@ -4,6 +4,8 @@ target/
 *.db-wal
 .env
 .env.*
+# Local credential fallback (see turya-auth FileStore). Never commit secrets.
+credentials.json
 *.pem
 *.key
 *.log

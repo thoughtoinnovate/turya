@@ -6,7 +6,7 @@
 
 use turya_auth::{
     api_key_account, auth_status, methods_for, oauth_client_id_account, oauth_refresh_account,
-    CredentialStore, KeychainStore, SlotState,
+    CredentialStore, SlotState,
 };
 use turya_core::ProviderRegistry;
 
@@ -155,7 +155,7 @@ pub async fn login(
                 .set(&api_key_account(provider), &key)
                 .map_err(|e| e.to_string())?;
             confirm_persisted(store, &api_key_account(provider), &key)?;
-            println!("Stored {provider} API key.");
+            println!("Stored {provider} API key ({}).", stored_where(store));
             Ok(())
         }
         "oauth" => {
@@ -252,7 +252,7 @@ async fn login_oauth(
         .map_err(|e| e.to_string())?;
     confirm_persisted(store, &oauth_refresh_account(provider), &refresh)?;
     let _ = store.set(&oauth_client_id_account(provider), &client_id);
-    println!("Connected {provider} via OAuth.");
+    println!("Connected {provider} via OAuth ({}).", stored_where(store));
     Ok(())
 }
 
@@ -284,9 +284,24 @@ fn extract_code(line: &str) -> Result<String, String> {
     Ok(line.to_string())
 }
 
-/// Default keychain store for CLI use.
-pub fn default_store() -> KeychainStore {
-    KeychainStore::new()
+/// Default production store: OS keychain first, persistent file fallback
+/// (`~/.turya/credentials.json`, mode 0600) for environments where the
+/// keychain accepts writes it cannot persist.
+pub fn default_store() -> turya_auth::ChainStore {
+    let home = std::env::var("TURYA_HOME").unwrap_or_else(|_| {
+        let h = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{h}/.turya")
+    });
+    turya_auth::ChainStore::with_file_fallback(format!("{home}/credentials.json"))
+}
+
+/// Where the last write landed, for honest login messaging.
+fn stored_where(store: &dyn CredentialStore) -> String {
+    store
+        .as_any()
+        .downcast_ref::<turya_auth::ChainStore>()
+        .and_then(|c| c.last_write_backend())
+        .unwrap_or_else(|| "credential store".to_string())
 }
 
 #[cfg(test)]
@@ -308,6 +323,9 @@ mod tests {
         fn delete(&self, _account: &str) -> Result<(), turya_auth::StoreError> {
             Ok(())
         }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     struct BrokenStore;
@@ -321,6 +339,9 @@ mod tests {
         }
         fn delete(&self, _account: &str) -> Result<(), turya_auth::StoreError> {
             Err(turya_auth::StoreError::Backend("no backend".to_string()))
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 
