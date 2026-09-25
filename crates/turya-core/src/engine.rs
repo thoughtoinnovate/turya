@@ -1,19 +1,23 @@
+use crate::hooks::{DiagnosticsHook, MemoryHook};
 use crate::permissions::PermissionBroker;
 use crate::provider::{LlmProvider, ProviderStep};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use turya_protocol::{AgentMode, PermissionDecision, PermissionMode, TuryaEvent};
 use turya_tools::ToolRegistry;
 
 pub struct TuryaEngine {
-    provider: Arc<dyn LlmProvider>,
+    /// Hot-swappable provider slot (Rule 3.3): `/models` switches vendors
+    /// mid-session without rebuilding the engine.
+    provider: Arc<RwLock<Arc<dyn LlmProvider>>>,
     tools: Arc<ToolRegistry>,
     permissions: Arc<PermissionBroker>,
-    /// Step 8 hook: episodic persistence (`TurnCompleted`) + `pre_turn` rule injection.
-    memory: Option<Arc<Mutex<turya_memory::MemoryStore>>>,
-    /// Step 10 hook: post-write LSP diagnostics fed back into the turn.
-    lsp: Option<Arc<turya_lsp::LspBridge>>,
+    /// Injected memory seam (Rule 3.1: trait only, implementation lives
+    /// in the `turya-memory` internal plugin crate).
+    memory_hook: Option<Arc<dyn MemoryHook>>,
+    /// Injected diagnostics seam (implementation lives in `turya-lsp`).
+    diagnostics_hook: Option<Arc<dyn DiagnosticsHook>>,
     session_id: String,
 }
 
@@ -24,22 +28,27 @@ impl TuryaEngine {
         mode: PermissionMode,
     ) -> Self {
         Self {
-            provider,
+            provider: Arc::new(RwLock::new(provider)),
             tools,
             permissions: Arc::new(PermissionBroker::new(mode)),
-            memory: None,
-            lsp: None,
+            memory_hook: None,
+            diagnostics_hook: None,
             session_id: "default".to_string(),
         }
     }
 
-    pub fn with_memory(mut self, store: Arc<Mutex<turya_memory::MemoryStore>>) -> Self {
-        self.memory = Some(store);
+    /// Hot-swap the active provider (used by `/models` switching).
+    pub fn set_provider(&self, provider: Arc<dyn LlmProvider>) {
+        *self.provider.write().unwrap() = provider;
+    }
+
+    pub fn with_memory_hook(mut self, hook: Arc<dyn MemoryHook>) -> Self {
+        self.memory_hook = Some(hook);
         self
     }
 
-    pub fn with_lsp(mut self, bridge: Arc<turya_lsp::LspBridge>) -> Self {
-        self.lsp = Some(bridge);
+    pub fn with_diagnostics_hook(mut self, hook: Arc<dyn DiagnosticsHook>) -> Self {
+        self.diagnostics_hook = Some(hook);
         self
     }
 
@@ -57,16 +66,12 @@ impl TuryaEngine {
         mut perm_rx: mpsc::Receiver<(String, PermissionDecision)>,
     ) {
         // `pre_turn` memory hook: surface learned rules before generation.
-        if let Some(ref memory) = self.memory {
-            let rules = memory
-                .lock()
-                .ok()
-                .and_then(|store| store.rules_for(prompt, 3).ok())
-                .unwrap_or_default();
+        if let Some(ref hook) = self.memory_hook {
+            let rules = hook.recall_rules(&self.session_id, prompt, 3).await;
             if !rules.is_empty() {
                 let mut chunk = String::from("[memory] recalled rules:\n");
                 for rule in &rules {
-                    chunk.push_str(&format!("- {}\n", rule.rule));
+                    chunk.push_str(&format!("- {}\n", rule));
                 }
                 let _ = event_tx.send(TuryaEvent::TokenDelta { chunk }).await;
             }
@@ -80,7 +85,7 @@ impl TuryaEngine {
             .await;
 
         let (step_tx, mut step_rx) = mpsc::channel(32);
-        let provider = self.provider.clone();
+        let provider = self.provider.read().unwrap().clone();
         let prompt_clone = prompt.to_string();
 
         tokio::spawn(async move {
@@ -147,7 +152,7 @@ impl TuryaEngine {
                         // Record genuine tool failures for the reflection loop
                         // (permission denials are user decisions, not lessons).
                         if !result.success {
-                            self.record_tool_error(&call.tool_name, &result);
+                            self.record_tool_error(&call.tool_name, &result).await;
                         }
                         // Step 10 hook: freshly written files get a live diagnostic check.
                         if call.tool_name == "write_file" {
@@ -176,42 +181,28 @@ impl TuryaEngine {
             .await;
 
         // `on_event(TurnCompleted)` memory hook: append audit row, best-effort.
-        if let Some(ref memory) = self.memory {
-            if let Ok(store) = memory.lock() {
-                let _ = store.record_event(
-                    &self.session_id,
-                    "TurnCompleted",
-                    &serde_json::json!({"turn_id": turn_id, "prompt": prompt, "success": true}),
-                );
-                // Reflection loop: distill this session's tool failures into rules.
-                let _ = store.reflect_session(&self.session_id);
-            }
+        // Reflection (distilling failures into rules) runs inside the hook
+        // implementation, never in the kernel.
+        if let Some(ref hook) = self.memory_hook {
+            hook.record_turn_completed(&self.session_id, turn_id, prompt, true)
+                .await;
         }
     }
 
-    fn record_tool_error(&self, tool_name: &str, result: &turya_protocol::ToolResult) {
-        let memory = match self.memory.as_ref() {
-            Some(m) => m,
+    async fn record_tool_error(&self, tool_name: &str, result: &turya_protocol::ToolResult) {
+        let hook = match self.memory_hook.as_ref() {
+            Some(h) => h,
             None => return,
         };
-        if result
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("Permission denied"))
-        {
-            return;
-        }
-        if let Ok(store) = memory.lock() {
-            let _ = store.record_event(
-                &self.session_id,
-                "ToolError",
-                &serde_json::json!({
-                    "tool": tool_name,
-                    "call_id": result.call_id,
-                    "error": result.error.clone().unwrap_or_else(|| "tool reported failure".to_string()),
-                }),
-            );
-        }
+        let error = match result.error.as_deref() {
+            // Permission denials are user decisions, not lessons.
+            Some(e) if e.contains("Permission denied") => return,
+            Some(e) => e.to_string(),
+            None if !result.success => "tool reported failure".to_string(),
+            None => return,
+        };
+        hook.record_tool_error(&self.session_id, tool_name, &result.call_id, &error)
+            .await;
     }
 
     /// Diagnose a just-written file and stream any compiler errors back.
@@ -220,8 +211,8 @@ impl TuryaEngine {
         call: &turya_protocol::ToolCall,
         event_tx: &mpsc::Sender<TuryaEvent>,
     ) {
-        let bridge = match self.lsp.as_ref() {
-            Some(b) => b,
+        let hook = match self.diagnostics_hook.as_ref() {
+            Some(h) => h,
             None => return,
         };
         let path_str = match call.parameters.get("path").and_then(|p| p.as_str()) {
@@ -229,21 +220,25 @@ impl TuryaEngine {
             None => return,
         };
         let path = Path::new(path_str);
-        let diagnostics = match bridge.diagnose_file(path).await {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let diagnostics = hook.diagnose_written_file(path).await;
         if diagnostics.is_empty() {
             return;
         }
-        let protocol_diags: Vec<turya_protocol::DiagnosticItem> =
-            diagnostics.iter().map(|d| d.to_protocol()).collect();
+        let protocol_diags: Vec<turya_protocol::DiagnosticItem> = diagnostics
+            .iter()
+            .map(|d| turya_protocol::DiagnosticItem {
+                file: path.to_path_buf(),
+                line: d.line,
+                message: d.message.clone(),
+                severity: d.severity.clone(),
+            })
+            .collect();
         let _ = event_tx
             .send(TuryaEvent::DiagnosticsReceived {
                 diagnostics: protocol_diags,
             })
             .await;
-        if let Some(feedback) = turya_lsp::LspBridge::format_feedback(path, &diagnostics) {
+        if let Some(feedback) = hook.format_feedback(path, &diagnostics) {
             let _ = event_tx
                 .send(TuryaEvent::TokenDelta { chunk: feedback })
                 .await;

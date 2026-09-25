@@ -6,12 +6,7 @@ edition = "2021"
 [dependencies]
 turya-protocol = { path = "../turya-protocol" }
 turya-tools = { path = "../turya-tools" }
-turya-memory = { path = "../turya-memory" }
-turya-lsp = { path = "../turya-lsp" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }
-reqwest = { workspace = true }
-futures = { workspace = true }

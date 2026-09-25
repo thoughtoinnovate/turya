@@ -203,6 +203,10 @@ impl MemoryStore {
     }
 }
 
+pub mod adapter;
+
+pub use adapter::SqliteMemoryHook;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2,6 +2,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
+pub mod manifest;
+
+pub use manifest::{
+    Contributions, ManifestCapabilities, ManifestError, OAuthConfig, OAuthFlowType, PluginKind,
+    PluginManifest, ProviderContribution,
+};
+
 #[derive(Debug, Error)]
 pub enum PluginError {
     #[error("io: {0}")]
@@ -21,6 +28,8 @@ pub struct PluginCapability {
     pub allowed_hosts: Vec<String>,
     /// Filesystem paths the plugin may access (documentation-level; WASI off by default).
     pub allowed_paths: Vec<String>,
+    /// May persist tokens/credentials (keychain or plugin storage).
+    pub storage: bool,
 }
 
 /// Sandboxed Wasm plugin host.
@@ -130,6 +139,7 @@ mod tests {
             PluginCapability {
                 allowed_hosts: vec![],
                 allowed_paths: vec!["/tmp/turya_plugins/".to_string()],
+                storage: false,
             },
         );
         let err = host

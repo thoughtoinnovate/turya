@@ -58,7 +58,59 @@ Turya defines a standardized build and test contract in the root [Makefile](./Ma
 
 ---
 
-## 3. 🔍 Pre-Commit Sanitization Checklist
+## 3. 🧬 Microkernel Architecture Constraint (STRICT, NEVER DEVIATE)
+
+> Turya is a microkernel + plugin ecosystem. The core stays very light.
+> This constraint binds ALL planning and implementation of new changes.
+
+### Rule 3.1: Core owns traits, registries, and the event loop — nothing else
+- **FORBIDDEN in `turya-core`:** provider implementations, vendor strings/URLs,
+  auth/credential/keychain/HTTP-OAuth code, UI code, secrets of any kind.
+- **ALLOWED in `turya-core`:** `LlmProvider`/`ProviderPlugin`/`UiPlugin` traits,
+  `ProviderRegistry`, hook traits (`MemoryHook`, `DiagnosticsHook`),
+  `CredentialResolver`/`ResolvedCreds` *shapes* (never resolvers),
+  permission broker, event loop, protocol types.
+- **ENFORCED** by CI dependency gates (see Rule 3.4).
+
+### Rule 3.2: Internal vs external plugins
+- **Internal (native, mandatory, shipped):** protocol, engine loop, primitive tools,
+  TUI client, CLI host, auth service, built-in providers, catalog, memory, updater.
+  Internal ≠ hardcoded: every internal capability registers through the same
+  trait + registry + capability-manifest path an external plugin would use, so
+  any of them can be replaced or hot-reloaded without touching core.
+- **External (community, Wasm-sandboxed):** community providers, themes, custom
+  tools, RAG, UI widgets. Secrets cross into sandboxes as short-lived tokens only.
+- Every plugin declares `kind = "internal" | "external"` in its manifest.
+
+### Rule 3.3: Self-improvement loop stays intact
+- The registry MUST support runtime `register`/`unregister`; the plugin host MUST
+  support hot-reload. Any change that makes capabilities load-time-only is rejected.
+- The agent writing its own `.wasm` plugin mid-session is a first-class flow:
+  `register_plugin` → capability-gated → callable in the same turn.
+
+### Rule 3.4: CI gates (all must pass)
+- `turya-core` dependency allowlist (tokio, serde, serde_json, async-trait + registry
+  plumbing only — no auth/vendor/UI crates).
+- `turya-tui` imports `turya-protocol` + UI libs only.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`.
+
+### Rule 3.5: Pre-change architecture gate (MANDATORY before ANY code change)
+Before writing a single line of implementation, the agent MUST:
+1. ASK the user to confirm the change follows this microkernel constraint
+   (one explicit question, every time — no silent proceeding).
+2. In the plan, declare for the change, in this EXACT block format:
+   - **Goes in microkernel:** <crate/items> — why it is essential kernel
+     responsibility AND why it does not void the architecture.
+   - **Goes in plugin system:** <internal|external, crate/items> — why it
+     belongs outside core.
+   - **New dependencies (if any):** <crate → dep> — each justified, or "none".
+3. Proceed ONLY on user confirmation. If the user rejects, revise the split
+   until the declaration is truthful — never relabel core code as "plugin"
+   to dodge the gate.
+
+---
+
+## 4. 🔍 Pre-Commit Sanitization Checklist
 
 Before executing any `git commit`, agents must perform this internal checklist:
 

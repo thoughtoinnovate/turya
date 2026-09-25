@@ -1,13 +1,18 @@
 [package]
-name = "turya-lsp"
+name = "turya-auth"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 turya-core = { path = "../turya-core" }
-turya-protocol = { path = "../turya-protocol" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-async-trait = { workspace = true }
+reqwest = { workspace = true }
+keyring = "3"
+open = "5"
+url = "2"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.2"

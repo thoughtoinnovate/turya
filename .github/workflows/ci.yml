@@ -48,6 +48,27 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Rule 3.4 (AGENTS.md): microkernel dependency gates. Core must not
+      # depend on plugin/auth/vendor crates, import them, or name vendor
+      # endpoints; the TUI may only speak the protocol plus UI libraries.
+      - name: Microkernel dependency gates
+        run: |
+          echo "--- turya-core: forbidden implementation deps ---"
+          if grep -E 'turya-(memory|lsp|auth|plugins|catalog)|keyring|reqwest' crates/turya-core/Cargo.toml; then
+            echo "::error::turya-core Cargo.toml violates Rule 3.1 (see AGENTS.md)"
+            exit 1
+          fi
+          if grep -rnE 'use turya_(memory|lsp|auth|plugins|catalog)|use keyring|generativelanguage|api\.anthropic\.com|oauth2\.googleapis|accounts\.google\.com' crates/turya-core/src/; then
+            echo "::error::turya-core sources violate Rule 3.1 (see AGENTS.md)"
+            exit 1
+          fi
+          echo "--- turya-tui: protocol + UI libs only ---"
+          if grep -rhn '^use turya' crates/turya-tui/src/ | grep -v 'turya_protocol'; then
+            echo "::error::turya-tui violates Rule 3.2 (see AGENTS.md)"
+            exit 1
+          fi
+          echo "Gates passed."
+
   # run_bash shells out to `bash`, so OS coverage beyond Linux waits on a
   # cmd.exe fallback in turya-tools. Release binaries for all targets are
   # still built in release.yml.

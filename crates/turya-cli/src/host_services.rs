@@ -1,0 +1,987 @@
+//! Host-side command router (CLI process).
+//!
+//! Rule 3.2: the host links plugin crates and answers provider/auth/catalog
+//! protocol commands. `turya-server` stays a thin proxy (it ignores these
+//! variants); `turya-core` never names a vendor. Any future host (headless
+//! daemon, IDE bridge) replicates this small router against the same traits.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+use turya_auth::{CredentialStore, SlotState};
+use turya_core::{ProviderRegistry, TuryaEngine};
+use turya_protocol::{AuthAction, ModelSummary, ProviderSummary, TuryaCommand, TuryaEvent};
+
+/// Pending interactive auth flow (OAuth browser wait or key prompt).
+struct PendingFlow {
+    provider: String,
+    method: String,
+    verifier: String,
+    redirect_uri: String,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Minimal `~/.turya/config.toml` (`provider = "…"`, `model = "…"`, line-based).
+#[derive(Debug, Default, Clone)]
+pub struct HostConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+impl HostConfig {
+    pub fn load(path: &str) -> Self {
+        let mut cfg = Self::default();
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for line in text.lines() {
+                let (k, v) = match line.split_once('=') {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let v = v.trim().trim_matches('"').to_string();
+                match k.trim() {
+                    "provider" => cfg.provider = Some(v),
+                    "model" => cfg.model = Some(v),
+                    _ => {}
+                }
+            }
+        }
+        cfg
+    }
+
+    pub fn save(&self, path: &str) {
+        let mut text = String::new();
+        if let Some(p) = &self.provider {
+            text.push_str(&format!("provider = \"{p}\"\n"));
+        }
+        if let Some(m) = &self.model {
+            text.push_str(&format!("model = \"{m}\"\n"));
+        }
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, text);
+    }
+}
+
+pub struct HostServices {
+    registry: Arc<ProviderRegistry>,
+    store: Arc<dyn CredentialStore>,
+    catalog: turya_catalog::Catalog,
+    engine: Arc<TuryaEngine>,
+    config_path: String,
+    flows: Mutex<HashMap<String, PendingFlow>>,
+    flow_seq: Mutex<u64>,
+}
+
+impl HostServices {
+    pub fn new(
+        registry: Arc<ProviderRegistry>,
+        store: Arc<dyn CredentialStore>,
+        catalog: turya_catalog::Catalog,
+        engine: Arc<TuryaEngine>,
+        config_path: String,
+    ) -> Self {
+        Self {
+            registry,
+            store,
+            catalog,
+            engine,
+            config_path,
+            flows: Mutex::new(HashMap::new()),
+            flow_seq: Mutex::new(0),
+        }
+    }
+
+    fn next_flow_id(&self) -> String {
+        let mut seq = self.flow_seq.lock().unwrap();
+        *seq += 1;
+        format!("flow_{}", *seq)
+    }
+
+    fn slot_word(state: &SlotState) -> &'static str {
+        match state {
+            SlotState::Env => "env",
+            SlotState::Stored => "stored",
+            SlotState::Connected { .. } => "connected",
+            SlotState::Missing => "missing",
+            SlotState::Unsupported => "unsupported",
+        }
+    }
+
+    fn auth_status_words(&self, provider: &str) -> (String, String) {
+        let plugin = self.registry.get(provider);
+        let (has_env, has_oauth) = match plugin.as_ref() {
+            Some(p) => {
+                let methods = p.auth_methods();
+                (
+                    methods
+                        .iter()
+                        .any(|m| matches!(m, turya_core::AuthMethodKind::ApiKey { .. })),
+                    methods
+                        .iter()
+                        .any(|m| matches!(m, turya_core::AuthMethodKind::OAuth)),
+                )
+            }
+            None => (false, false),
+        };
+        let api_key = if !has_env {
+            SlotState::Unsupported
+        } else {
+            let env = plugin
+                .and_then(|p| {
+                    p.auth_methods().into_iter().find_map(|m| match m {
+                        turya_core::AuthMethodKind::ApiKey { env_var } => Some(env_var),
+                        _ => None,
+                    })
+                })
+                .unwrap_or("");
+            if std::env::var(env)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+            {
+                SlotState::Env
+            } else if self
+                .store
+                .get(&turya_auth::api_key_account(provider))
+                .is_some()
+            {
+                SlotState::Stored
+            } else {
+                SlotState::Missing
+            }
+        };
+        let oauth = if !has_oauth {
+            SlotState::Unsupported
+        } else if self
+            .store
+            .get(&turya_auth::oauth_refresh_account(provider))
+            .is_some()
+        {
+            SlotState::Connected {
+                account: String::new(),
+            }
+        } else {
+            SlotState::Missing
+        };
+        (
+            Self::slot_word(&api_key).to_string(),
+            Self::slot_word(&oauth).to_string(),
+        )
+    }
+
+    fn is_authenticated(&self, provider: &str) -> bool {
+        let (a, o) = self.auth_status_words(provider);
+        a == "env" || a == "stored" || a == "connected" || o == "connected"
+    }
+
+    /// Resolve credentials for a provider (env → stored → OAuth refresh).
+    async fn resolve_for(&self, provider: &str) -> Result<turya_core::ResolvedCreds, String> {
+        let client_id = std::env::var("TURYA_OAUTH_CLIENT_ID").ok().or_else(|| {
+            self.store
+                .get(&turya_auth::oauth_client_id_account(provider))
+        });
+        let cfg = client_id.map(|id| turya_auth::OAuthConfig::google(&id));
+        turya_auth::resolver::resolve(provider, None, cfg.as_ref(), self.store.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn live_ids(&self, provider: &str) -> Vec<String> {
+        let plugin = match self.registry.get(provider) {
+            Some(p) => p,
+            None => return vec![],
+        };
+        let creds = match self.resolve_for(provider).await {
+            Ok(c) => c,
+            Err(_) => return vec![],
+        };
+        plugin.list_models(&creds).await
+    }
+
+    async fn fetch_meta_doc(url: &str) -> Result<String, String> {
+        let text = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .user_agent("turya-catalog")
+            .build()
+            .map_err(|e| e.to_string())?
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .text()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(text)
+    }
+
+    /// Handle one client command. Takes `&TuryaCommand` so the router can
+    /// forward unconsumed commands to the session proxy afterwards.
+    pub async fn handle(&self, cmd: &TuryaCommand, events: &HostEventSink) -> bool {
+        match cmd {
+            TuryaCommand::ListProviders => {
+                // Auth gate: metadata refresh only when at least one provider
+                // is authenticated — locked setups never phone home.
+                let any_authed = self
+                    .registry
+                    .ids()
+                    .iter()
+                    .any(|id| self.is_authenticated(id));
+                let meta_doc = if any_authed {
+                    let meta_url = turya_catalog::metadata_url();
+                    Self::fetch_meta_doc(&meta_url).await.ok()
+                } else {
+                    None
+                };
+                let mut providers = Vec::new();
+                for id in self.registry.ids() {
+                    let plugin = match self.registry.get(&id) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let authed = self.is_authenticated(&id);
+                    let live = if authed {
+                        self.live_ids(&id).await
+                    } else {
+                        vec![]
+                    };
+                    let models = self.catalog.ensure_loaded(
+                        &id,
+                        authed,
+                        || live,
+                        |_| meta_doc.clone().ok_or_else(|| "no metadata".to_string()),
+                    );
+                    let (api_key, oauth) = self.auth_status_words(&id);
+                    providers.push(ProviderSummary {
+                        id: id.clone(),
+                        display_name: plugin.display_name().to_string(),
+                        models: models
+                            .into_iter()
+                            .map(|m| ModelSummary {
+                                id: m.id,
+                                display_name: m.display_name,
+                                source: match m.source {
+                                    turya_catalog::ModelSource::Live => "live".to_string(),
+                                    turya_catalog::ModelSource::Cached => "cached".to_string(),
+                                    turya_catalog::ModelSource::Snapshot => "snapshot".to_string(),
+                                    turya_catalog::ModelSource::Static => "static".to_string(),
+                                },
+                            })
+                            .collect(),
+                        api_key,
+                        oauth,
+                    });
+                }
+                events.send(TuryaEvent::ProvidersListed { providers }).await;
+                true
+            }
+            TuryaCommand::GetAuthStatus { provider } => {
+                let (api_key, oauth) = self.auth_status_words(provider);
+                events
+                    .send(TuryaEvent::AuthStatusChanged {
+                        provider: provider.clone(),
+                        api_key,
+                        oauth,
+                    })
+                    .await;
+                true
+            }
+            TuryaCommand::BeginAuthFlow { provider, method } => {
+                self.begin_flow(provider.clone(), method.clone(), events)
+                    .await;
+                true
+            }
+            TuryaCommand::SubmitAuthInput { flow_id, payload } => {
+                self.submit_input(flow_id.clone(), payload.clone(), events)
+                    .await;
+                true
+            }
+            TuryaCommand::CancelAuthFlow { flow_id } => {
+                self.cancel_flow(flow_id, events, "cancelled").await;
+                true
+            }
+            TuryaCommand::UpdateConfig {
+                permission_mode: _,
+                provider,
+                model,
+            } => {
+                // Engine-bound switching; permission_mode passes through to session.
+                if provider.is_none() && model.is_none() {
+                    return false;
+                }
+                self.switch_model(provider.clone(), model.clone(), events)
+                    .await;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    async fn switch_model(
+        &self,
+        provider: Option<String>,
+        model: Option<String>,
+        events: &HostEventSink,
+    ) {
+        // Resolve current selection from config when partially specified.
+        let cfg = HostConfig::load(&self.config_path);
+        let id = provider
+            .or(cfg.provider)
+            .unwrap_or_else(|| "anthropic".to_string());
+        let plugin = match self.registry.get(&id) {
+            Some(p) => p,
+            None => {
+                events
+                    .send(TuryaEvent::Error {
+                        message: format!("unknown provider '{id}'"),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let model = model.or(cfg.model).unwrap_or_else(|| {
+            plugin
+                .models()
+                .first()
+                .map(|m| m.id.clone())
+                .unwrap_or_default()
+        });
+        if !plugin.models().iter().any(|m| m.id == model) {
+            events
+                .send(TuryaEvent::Error {
+                    message: format!("unknown model '{model}' for provider '{id}'"),
+                })
+                .await;
+            return;
+        }
+        let creds = match self.resolve_for(&id).await {
+            Ok(c) => c,
+            Err(e) => {
+                events
+                    .send(TuryaEvent::Error {
+                        message: format!("cannot use {id}: {e} (run /auth)"),
+                    })
+                    .await;
+                return;
+            }
+        };
+        match plugin.connect(creds, &model) {
+            Ok(p) => {
+                self.engine.set_provider(p);
+                HostConfig {
+                    provider: Some(id),
+                    model: Some(model),
+                }
+                .save(&self.config_path);
+                // Optimistic toast is rendered client-side on dispatch;
+                // failures arrive as Error events above.
+            }
+            Err(e) => {
+                events
+                    .send(TuryaEvent::Error {
+                        message: format!("cannot connect {id}: {e}"),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    async fn begin_flow(&self, provider: String, method: String, events: &HostEventSink) {
+        if self.registry.get(&provider).is_none() {
+            events
+                .send(TuryaEvent::AuthFlowFailed {
+                    flow_id: String::new(),
+                    reason: format!("unknown provider '{provider}'"),
+                })
+                .await;
+            return;
+        }
+        if method == "api-key" {
+            let flow_id = self.next_flow_id();
+            self.flows.lock().unwrap().insert(
+                flow_id.clone(),
+                PendingFlow {
+                    provider,
+                    method,
+                    verifier: String::new(),
+                    redirect_uri: String::new(),
+                    task: None,
+                },
+            );
+            events
+                .send(TuryaEvent::AuthFlowStarted {
+                    flow_id,
+                    action: AuthAction::PromptMasked {
+                        prompt: "API key".to_string(),
+                    },
+                })
+                .await;
+            return;
+        }
+        if method == "oauth" {
+            let client_id = std::env::var("TURYA_OAUTH_CLIENT_ID").ok().or_else(|| {
+                self.store
+                    .get(&turya_auth::oauth_client_id_account(&provider))
+            });
+            let client_id = match client_id {
+                Some(id) => id,
+                None => {
+                    events
+                        .send(TuryaEvent::AuthFlowFailed {
+                            flow_id: String::new(),
+                            reason: "OAuth needs your Google Cloud client ID (consumer accounts unsupported)".to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            let cfg = turya_auth::OAuthConfig::google(&client_id);
+            let (verifier, challenge) = match turya_auth::oauth::pkce_pair() {
+                Ok(p) => p,
+                Err(e) => {
+                    events
+                        .send(TuryaEvent::AuthFlowFailed {
+                            flow_id: String::new(),
+                            reason: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            // Bind now so the redirect URI is known before emitting the URL.
+            let probe = match tokio::net::TcpListener::bind(("127.0.0.1", cfg.redirect_port)).await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    events
+                        .send(TuryaEvent::AuthFlowFailed {
+                            flow_id: String::new(),
+                            reason: format!("cannot bind localhost callback: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            let port = match probe.local_addr() {
+                Ok(a) => a.port(),
+                Err(e) => {
+                    events
+                        .send(TuryaEvent::AuthFlowFailed {
+                            flow_id: String::new(),
+                            reason: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            drop(probe);
+            let redirect = turya_auth::oauth::redirect_uri(port);
+            let state = format!("turya-{}", std::process::id());
+            let url = match turya_auth::oauth::build_auth_url(&cfg, &redirect, &challenge, &state) {
+                Ok(u) => u,
+                Err(e) => {
+                    events
+                        .send(TuryaEvent::AuthFlowFailed {
+                            flow_id: String::new(),
+                            reason: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            let flow_id = self.next_flow_id();
+            // Background wait: browser callback completes the flow; pasted
+            // codes arrive via SubmitAuthInput which aborts this task.
+            let store_clone = self.store.clone();
+            let provider_clone = provider.clone();
+            let client_id_clone = client_id.clone();
+            let redirect_clone = redirect.clone();
+            let verifier_clone = verifier.clone();
+            let events_clone = events.clone();
+            let flow_id_clone = flow_id.clone();
+            let task = tokio::spawn(async move {
+                match turya_auth::oauth::wait_for_callback(
+                    port,
+                    &state,
+                    std::time::Duration::from_secs(300),
+                )
+                .await
+                {
+                    Ok((code, _)) => {
+                        let cfg = turya_auth::OAuthConfig::google(&client_id_clone);
+                        match turya_auth::oauth::exchange_code(
+                            &cfg,
+                            &redirect_clone,
+                            code.trim(),
+                            &verifier_clone,
+                        )
+                        .await
+                        {
+                            Ok(tokens) => {
+                                if let Some(refresh) = tokens.refresh_token {
+                                    let _ = store_clone.set(
+                                        &turya_auth::oauth_refresh_account(&provider_clone),
+                                        &refresh,
+                                    );
+                                    let _ = store_clone.set(
+                                        &turya_auth::oauth_client_id_account(&provider_clone),
+                                        &client_id_clone,
+                                    );
+                                    events_clone
+                                        .send(TuryaEvent::AuthFlowCompleted {
+                                            flow_id: flow_id_clone,
+                                            provider: provider_clone,
+                                            method: "oauth".to_string(),
+                                        })
+                                        .await;
+                                } else {
+                                    events_clone
+                                        .send(TuryaEvent::AuthFlowFailed {
+                                            flow_id: flow_id_clone,
+                                            reason: "no refresh token returned".to_string(),
+                                        })
+                                        .await;
+                                }
+                            }
+                            Err(e) => {
+                                events_clone
+                                    .send(TuryaEvent::AuthFlowFailed {
+                                        flow_id: flow_id_clone,
+                                        reason: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Timeout or bind race: stay silent unless the flow
+                        // is still pending (cancel already reported).
+                    }
+                }
+            });
+            self.flows.lock().unwrap().insert(
+                flow_id.clone(),
+                PendingFlow {
+                    provider,
+                    method,
+                    verifier,
+                    redirect_uri: redirect,
+                    task: Some(task),
+                },
+            );
+            events
+                .send(TuryaEvent::AuthFlowStarted {
+                    flow_id,
+                    action: AuthAction::OpenBrowser { url },
+                })
+                .await;
+            return;
+        }
+        events
+            .send(TuryaEvent::AuthFlowFailed {
+                flow_id: String::new(),
+                reason: format!("unknown method '{method}': expected api-key|oauth"),
+            })
+            .await;
+    }
+
+    async fn submit_input(&self, flow_id: String, payload: String, events: &HostEventSink) {
+        // Bind the Option first: match-scrutinee temporaries (the guard)
+        // live until the match ends, which would cross awaits below.
+        let flow: Option<PendingFlow> = self.flows.lock().unwrap().remove(&flow_id);
+        let flow = match flow {
+            Some(f) => f,
+            None => {
+                events
+                    .send(TuryaEvent::AuthFlowFailed {
+                        flow_id,
+                        reason: "unknown or expired flow".to_string(),
+                    })
+                    .await;
+                return;
+            }
+        };
+        if let Some(task) = flow.task {
+            task.abort();
+        }
+        if flow.method == "api-key" {
+            let key = payload.trim().to_string();
+            if key.is_empty() {
+                events
+                    .send(TuryaEvent::AuthFlowFailed {
+                        flow_id,
+                        reason: "empty key — nothing stored".to_string(),
+                    })
+                    .await;
+                return;
+            }
+            let plugin = match self.registry.get(&flow.provider) {
+                Some(p) => p,
+                None => {
+                    events
+                        .send(TuryaEvent::AuthFlowFailed {
+                            flow_id,
+                            reason: "unknown provider".to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            let creds = turya_core::ResolvedCreds {
+                token: key.clone(),
+                expires_at: None,
+                via: "login",
+            };
+            if plugin.list_models(&creds).await.is_empty() {
+                events
+                    .send(TuryaEvent::AuthFlowFailed {
+                        flow_id,
+                        reason: "key rejected (no models listed) — not stored".to_string(),
+                    })
+                    .await;
+                return;
+            }
+            match self
+                .store
+                .set(&turya_auth::api_key_account(&flow.provider), &key)
+            {
+                Ok(()) => {
+                    let (api_key, oauth) = self.auth_status_words(&flow.provider);
+                    events
+                        .send(TuryaEvent::AuthFlowCompleted {
+                            flow_id,
+                            provider: flow.provider.clone(),
+                            method: "api-key".to_string(),
+                        })
+                        .await;
+                    events
+                        .send(TuryaEvent::AuthStatusChanged {
+                            provider: flow.provider,
+                            api_key,
+                            oauth,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    events
+                        .send(TuryaEvent::AuthFlowFailed {
+                            flow_id,
+                            reason: e.to_string(),
+                        })
+                        .await;
+                }
+            }
+            return;
+        }
+        // OAuth pasted-code path (browser wait was aborted above).
+        let code = extract_pasted_code(&payload);
+        if code.is_empty() {
+            events
+                .send(TuryaEvent::AuthFlowFailed {
+                    flow_id,
+                    reason: "empty input — login cancelled".to_string(),
+                })
+                .await;
+            return;
+        }
+        let client_id = match std::env::var("TURYA_OAUTH_CLIENT_ID").ok().or_else(|| {
+            self.store
+                .get(&turya_auth::oauth_client_id_account(&flow.provider))
+        }) {
+            Some(id) => id,
+            None => {
+                events
+                    .send(TuryaEvent::AuthFlowFailed {
+                        flow_id,
+                        reason: "missing OAuth client id".to_string(),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let cfg = turya_auth::OAuthConfig::google(&client_id);
+        match turya_auth::oauth::exchange_code(&cfg, &flow.redirect_uri, &code, &flow.verifier)
+            .await
+        {
+            Ok(tokens) => match tokens.refresh_token {
+                Some(refresh) => {
+                    let _ = self
+                        .store
+                        .set(&turya_auth::oauth_refresh_account(&flow.provider), &refresh);
+                    let _ = self.store.set(
+                        &turya_auth::oauth_client_id_account(&flow.provider),
+                        &client_id,
+                    );
+                    events
+                        .send(TuryaEvent::AuthFlowCompleted {
+                            flow_id,
+                            provider: flow.provider,
+                            method: "oauth".to_string(),
+                        })
+                        .await;
+                }
+                None => {
+                    events
+                        .send(TuryaEvent::AuthFlowFailed {
+                            flow_id,
+                            reason: "no refresh token returned".to_string(),
+                        })
+                        .await;
+                }
+            },
+            Err(e) => {
+                events
+                    .send(TuryaEvent::AuthFlowFailed {
+                        flow_id,
+                        reason: e.to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    async fn cancel_flow(&self, flow_id: &str, events: &HostEventSink, reason: &str) {
+        let flow = {
+            // Scope the lock: guards must never cross an await (Send).
+            self.flows.lock().unwrap().remove(flow_id)
+        };
+        if let Some(flow) = flow {
+            if let Some(task) = flow.task {
+                task.abort();
+            }
+            events
+                .send(TuryaEvent::AuthFlowFailed {
+                    flow_id: flow_id.to_string(),
+                    reason: reason.to_string(),
+                })
+                .await;
+        }
+    }
+}
+
+/// Accept a full callback URL or a bare code (shared with CLI login).
+pub fn extract_pasted_code(line: &str) -> String {
+    let line = line.trim();
+    if let Some((_, q)) = line.split_once('?') {
+        for pair in q.split('&') {
+            if let Some(code) = pair.strip_prefix("code=") {
+                let code = code.split('&').next().unwrap_or("");
+                if !code.is_empty() {
+                    return code.to_string();
+                }
+            }
+        }
+    }
+    line.to_string()
+}
+
+/// Cloneable event sink for background flow tasks.
+#[derive(Clone)]
+pub struct HostEventSink {
+    tx: mpsc::Sender<TuryaEvent>,
+}
+
+impl HostEventSink {
+    pub fn new(tx: mpsc::Sender<TuryaEvent>) -> Self {
+        Self { tx }
+    }
+
+    pub async fn send(&self, event: TuryaEvent) {
+        let _ = self.tx.send(event).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turya_auth::MemStore;
+
+    fn harness() -> (
+        HostServices,
+        mpsc::Sender<TuryaEvent>,
+        mpsc::Receiver<TuryaEvent>,
+    ) {
+        let registry = Arc::new(ProviderRegistry::new());
+        registry.register(Arc::new(turya_provider_anthropic::AnthropicPlugin));
+        let store: Arc<dyn CredentialStore> = Arc::new(MemStore::new());
+        let dir = std::env::temp_dir().join("turya-host-router-test");
+        let catalog = turya_catalog::Catalog::new(dir);
+        let tools = Arc::new(turya_tools::ToolRegistry::standard());
+        let mock: Arc<dyn turya_core::LlmProvider> =
+            Arc::new(turya_core::MockProvider { responses: vec![] });
+        let engine = Arc::new(TuryaEngine::new(
+            mock,
+            tools,
+            turya_protocol::PermissionMode::Open,
+        ));
+        let (tx, rx) = mpsc::channel(32);
+        let host = HostServices::new(
+            registry,
+            store,
+            catalog,
+            engine,
+            "/tmp/turya-host-router-test-config.toml".to_string(),
+        );
+        (host, tx, rx)
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<TuryaEvent>) -> Vec<TuryaEvent> {
+        let mut out = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            out.push(evt);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn list_providers_without_creds_uses_static() {
+        let (host, tx, mut rx) = harness();
+        let sink = HostEventSink::new(tx);
+        // No creds configured: router must still answer from static lists
+        // (no network: plugin live calls would fail fast to empty).
+        let consumed = host.handle(&TuryaCommand::ListProviders, &sink).await;
+        assert!(consumed);
+        let evts = drain(&mut rx);
+        let listed = evts.iter().find_map(|e| match e {
+            TuryaEvent::ProvidersListed { providers } => Some(providers),
+            _ => None,
+        });
+        let providers = listed.expect("ProvidersListed event");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, "anthropic");
+        assert_eq!(providers[0].api_key, "missing");
+        assert!(!providers[0].models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_auth_status_reports_slots() {
+        let (host, tx, mut rx) = harness();
+        let sink = HostEventSink::new(tx);
+        let consumed = host
+            .handle(
+                &TuryaCommand::GetAuthStatus {
+                    provider: "anthropic".to_string(),
+                },
+                &sink,
+            )
+            .await;
+        assert!(consumed);
+        let evts = drain(&mut rx);
+        assert!(evts.iter().any(|e| matches!(
+            e,
+            TuryaEvent::AuthStatusChanged { provider, api_key, .. }
+                if provider == "anthropic" && api_key == "missing"
+        )));
+    }
+
+    #[tokio::test]
+    async fn unknown_provider_switch_errors() {
+        let (host, tx, mut rx) = harness();
+        let sink = HostEventSink::new(tx);
+        let consumed = host
+            .handle(
+                &TuryaCommand::UpdateConfig {
+                    permission_mode: None,
+                    provider: Some("nope".to_string()),
+                    model: None,
+                },
+                &sink,
+            )
+            .await;
+        assert!(consumed);
+        let evts = drain(&mut rx);
+        assert!(evts.iter().any(|e| matches!(
+            e,
+            TuryaEvent::Error { message } if message.contains("unknown provider")
+        )));
+    }
+
+    #[tokio::test]
+    async fn begin_api_key_flow_prompts() {
+        let (host, tx, mut rx) = harness();
+        let sink = HostEventSink::new(tx);
+        let consumed = host
+            .handle(
+                &TuryaCommand::BeginAuthFlow {
+                    provider: "anthropic".to_string(),
+                    method: "api-key".to_string(),
+                },
+                &sink,
+            )
+            .await;
+        assert!(consumed);
+        let evts = drain(&mut rx);
+        assert!(evts.iter().any(|e| matches!(
+            e,
+            TuryaEvent::AuthFlowStarted {
+                action: AuthAction::PromptMasked { .. },
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn unknown_method_fails_fast() {
+        let (host, tx, mut rx) = harness();
+        let sink = HostEventSink::new(tx);
+        let consumed = host
+            .handle(
+                &TuryaCommand::BeginAuthFlow {
+                    provider: "anthropic".to_string(),
+                    method: "oauth".to_string(),
+                },
+                &sink,
+            )
+            .await;
+        assert!(consumed);
+        // Anthropic offers no OAuth: fails without touching the network.
+        let evts = drain(&mut rx);
+        assert!(evts
+            .iter()
+            .any(|e| matches!(e, TuryaEvent::AuthFlowFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn passthrough_commands_are_not_consumed() {
+        let (host, tx, _rx) = harness();
+        let sink = HostEventSink::new(tx);
+        assert!(
+            !host
+                .handle(
+                    &TuryaCommand::SubmitPrompt {
+                        prompt: "hi".to_string(),
+                        mode: turya_protocol::AgentMode::Build,
+                    },
+                    &sink,
+                )
+                .await
+        );
+        assert!(!host.handle(&TuryaCommand::AbortTurn, &sink).await);
+    }
+
+    #[test]
+    fn host_config_roundtrip() {
+        let path = "/tmp/turya-host-router-test-config.toml";
+        let _ = std::fs::remove_file(path);
+        HostConfig {
+            provider: Some("gemini".to_string()),
+            model: Some("gemini-2.5-flash".to_string()),
+        }
+        .save(path);
+        let back = HostConfig::load(path);
+        assert_eq!(back.provider.as_deref(), Some("gemini"));
+        assert_eq!(back.model.as_deref(), Some("gemini-2.5-flash"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn extract_pasted_code_cases() {
+        assert_eq!(
+            extract_pasted_code("http://x/callback?code=ABC&state=s"),
+            "ABC"
+        );
+        assert_eq!(extract_pasted_code("  XYZ  "), "XYZ");
+        assert_eq!(extract_pasted_code(""), "");
+    }
+}

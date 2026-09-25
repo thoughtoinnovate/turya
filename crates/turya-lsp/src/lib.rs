@@ -304,6 +304,10 @@ fn language_id(path: &Path) -> &'static str {
     }
 }
 
+pub mod adapter;
+
+pub use adapter::LspDiagnosticsHook;
+
 #[cfg(test)]
 mod tests {
     use super::*;

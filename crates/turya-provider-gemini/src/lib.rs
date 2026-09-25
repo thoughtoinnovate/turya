@@ -1,0 +1,347 @@
+//! Gemini provider plugin (internal, native).
+//!
+//! Rule 3.2: this crate owns the Gemini wire dialect (Generative Language
+//! `streamGenerateContent` SSE, `functionDeclarations` mapping, `/v1beta/models`
+//! listing). The microkernel only sees `LlmProvider` steps.
+
+use async_trait::async_trait;
+use futures::StreamExt;
+use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use turya_core::{
+    AuthMethodKind, LlmProvider, ModelInfo, ProviderPlugin, ProviderStep, ResolvedCreds,
+};
+use turya_protocol::ToolCall;
+
+/// Streaming Gemini provider (Generative Language SSE).
+pub struct GeminiProvider {
+    api_key: String,
+    pub model: String,
+}
+
+impl GeminiProvider {
+    pub fn new(api_key: String, model: String) -> Self {
+        Self { api_key, model }
+    }
+
+    pub fn connect_with(creds: &ResolvedCreds, model: &str) -> Self {
+        Self::new(creds.token.clone(), model.to_string())
+    }
+
+    /// Request body for `streamGenerateContent` (pure: unit-tested).
+    fn request_body(model_prompt: &str, history: &[String]) -> serde_json::Value {
+        let mut contents: Vec<serde_json::Value> = history
+            .iter()
+            .map(|h| json!({"role": "user", "parts": [{"text": h}]}))
+            .collect();
+        contents.push(json!({"role": "user", "parts": [{"text": model_prompt}]}));
+        json!({
+            "contents": contents,
+            "tools": [{"functionDeclarations": Self::function_declarations()}],
+        })
+    }
+
+    fn function_declarations() -> serde_json::Value {
+        json!([
+            {
+                "name": "view_file",
+                "description": "Read file content from the filesystem",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "write_file",
+                "description": "Write or overwrite file content",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["path", "content"]
+                }
+            },
+            {
+                "name": "run_bash",
+                "description": "Execute a bash shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"]
+                }
+            }
+        ])
+    }
+
+    /// Translate one decoded SSE JSON payload into steps (pure: unit-tested).
+    /// `call_seq` numbers synthetic call ids (`gcall_<n>`).
+    fn steps_from_payload(payload: &serde_json::Value, call_seq: &mut usize) -> Vec<ProviderStep> {
+        let mut steps = Vec::new();
+        let empty = vec![];
+        let candidates = payload
+            .get("candidates")
+            .and_then(|c| c.as_array())
+            .unwrap_or(&empty);
+        for cand in candidates {
+            let parts = cand
+                .get("content")
+                .and_then(|c| c.get("parts"))
+                .and_then(|p| p.as_array());
+            let parts = match parts {
+                Some(p) => p,
+                None => continue,
+            };
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    steps.push(ProviderStep::Token(text.to_string()));
+                }
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let args = fc.get("args").cloned().unwrap_or(json!({}));
+                    *call_seq += 1;
+                    steps.push(ProviderStep::CallTool(ToolCall {
+                        call_id: format!("gcall_{}", *call_seq),
+                        tool_name: name.to_string(),
+                        parameters: args,
+                    }));
+                }
+            }
+        }
+        steps
+    }
+
+    /// Live model listing (`GET /v1beta/models`), filtered to generation-capable
+    /// models. Empty on ANY failure — callers fall through, never error.
+    pub async fn fetch_live_models(api_key: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        for _ in 0..5 {
+            let mut url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models?key={api_key}&pageSize=100"
+            );
+            if let Some(t) = &page_token {
+                url.push_str(&format!("&pageToken={t}"));
+            }
+            let body: serde_json::Value = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .user_agent("turya-provider")
+                .build()
+            {
+                Ok(c) => match c.get(&url).send().await {
+                    Ok(r) if r.status().is_success() => match r.json().await {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    },
+                    _ => break,
+                },
+                Err(_) => break,
+            };
+            let empty = vec![];
+            let models = body
+                .get("models")
+                .and_then(|m| m.as_array())
+                .unwrap_or(&empty);
+            if models.is_empty() {
+                break;
+            }
+            for m in models {
+                let name = m.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let short = name.strip_prefix("models/").unwrap_or(name);
+                let methods = m
+                    .get("supportedGenerationMethods")
+                    .and_then(|v| v.as_array());
+                let generatable = methods
+                    .map(|arr| arr.iter().any(|v| v.as_str() == Some("generateContent")))
+                    .unwrap_or(false);
+                if generatable && !short.is_empty() {
+                    out.push(short.to_string());
+                }
+            }
+            page_token = body
+                .get("nextPageToken")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string());
+            if page_token.is_none() {
+                break;
+            }
+        }
+        out
+    }
+}
+
+#[async_trait]
+impl LlmProvider for GeminiProvider {
+    async fn generate_turn(
+        &self,
+        prompt: &str,
+        history: &[String],
+        tx: mpsc::Sender<ProviderStep>,
+    ) -> Result<(), String> {
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
+            self.model, self.api_key
+        );
+        let body = Self::request_body(prompt, history);
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("gemini request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let short: String = text.chars().take(300).collect();
+            return Err(format!("gemini {}: {}", status, short));
+        }
+
+        let mut buf = String::new();
+        let mut call_seq = 0usize;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("sse read failed: {}", e))?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buf.find('\n') {
+                let line: String = buf.drain(..=pos).collect();
+                let line = line.trim();
+                if line.is_empty() || !line.starts_with("data:") {
+                    continue;
+                }
+                let payload = line.trim_start_matches("data:").trim();
+                if payload == "[DONE]" {
+                    continue;
+                }
+                let value: serde_json::Value = match serde_json::from_str(payload) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                for step in Self::steps_from_payload(&value, &mut call_seq) {
+                    let _ = tx.send(step).await;
+                }
+            }
+        }
+
+        let _ = tx.send(ProviderStep::Finish).await;
+        Ok(())
+    }
+}
+
+/// Registry plugin: Gemini as a first-party native provider.
+pub struct GeminiPlugin;
+
+#[async_trait]
+impl ProviderPlugin for GeminiPlugin {
+    fn id(&self) -> &str {
+        "gemini"
+    }
+
+    fn display_name(&self) -> &str {
+        "Gemini"
+    }
+
+    fn models(&self) -> Vec<ModelInfo> {
+        // Curated static fallback (live discovery unions over this in STEP 4).
+        ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"]
+            .into_iter()
+            .map(|id| ModelInfo {
+                id: id.to_string(),
+                display_name: id.to_string(),
+            })
+            .collect()
+    }
+
+    fn auth_methods(&self) -> Vec<AuthMethodKind> {
+        vec![
+            AuthMethodKind::ApiKey {
+                env_var: "GEMINI_API_KEY",
+            },
+            AuthMethodKind::OAuth,
+        ]
+    }
+
+    fn connect(&self, creds: ResolvedCreds, model: &str) -> Result<Arc<dyn LlmProvider>, String> {
+        Ok(Arc::new(GeminiProvider::new(
+            creds.token,
+            model.to_string(),
+        )))
+    }
+
+    async fn list_models(&self, creds: &ResolvedCreds) -> Vec<String> {
+        GeminiProvider::fetch_live_models(&creds.token).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_declaration_is_stable() {
+        let p = GeminiPlugin;
+        assert_eq!(p.id(), "gemini");
+        assert_eq!(p.models().len(), 3);
+        assert_eq!(
+            p.auth_methods(),
+            vec![
+                AuthMethodKind::ApiKey {
+                    env_var: "GEMINI_API_KEY"
+                },
+                AuthMethodKind::OAuth,
+            ]
+        );
+    }
+
+    #[test]
+    fn request_body_maps_tools_to_function_declarations() {
+        let body = GeminiProvider::request_body("hi", &["earlier".to_string()]);
+        let decls = body
+            .pointer("/tools/0/functionDeclarations")
+            .and_then(|d| d.as_array())
+            .unwrap();
+        assert_eq!(decls.len(), 3);
+        assert!(decls.iter().any(|d| d["name"] == "run_bash"));
+        let contents = body.get("contents").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(contents.len(), 2);
+    }
+
+    #[test]
+    fn steps_from_text_and_function_call() {
+        let payload = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "I'll read it. "},
+                    {"functionCall": {"name": "view_file", "args": {"path": "a.rs"}}},
+                    {"functionCall": {"name": "", "args": {}}},
+                ]}
+            }]
+        });
+        let mut seq = 0;
+        let steps = GeminiProvider::steps_from_payload(&payload, &mut seq);
+        assert_eq!(steps.len(), 2);
+        match &steps[0] {
+            ProviderStep::Token(t) => assert_eq!(t, "I'll read it. "),
+            other => panic!("expected token, got {:?}", std::mem::discriminant(other)),
+        }
+        match &steps[1] {
+            ProviderStep::CallTool(c) => {
+                assert_eq!(c.call_id, "gcall_1");
+                assert_eq!(c.tool_name, "view_file");
+                assert_eq!(c.parameters["path"], "a.rs");
+            }
+            _ => panic!("expected tool call"),
+        }
+        // Empty/unknown payloads yield nothing, never panic.
+        assert!(GeminiProvider::steps_from_payload(&json!({}), &mut seq).is_empty());
+        assert!(GeminiProvider::steps_from_payload(&json!({"candidates":[]}), &mut seq).is_empty());
+    }
+}

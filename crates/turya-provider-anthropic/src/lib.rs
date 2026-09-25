@@ -1,15 +1,20 @@
+//! Anthropic provider plugin (internal, native).
+//!
+//! Rule 3.2: this crate owns the Anthropic wire dialect (Messages SSE,
+//! tool-use assembly, `/v1/models` listing). The microkernel only sees
+//! `LlmProvider` steps through the `ProviderPlugin` trait.
+
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::json;
+use std::sync::Arc;
 use tokio::sync::mpsc;
-
-use super::provider::{LlmProvider, ProviderStep};
+use turya_core::{
+    AuthMethodKind, LlmProvider, ModelInfo, ProviderPlugin, ProviderStep, ResolvedCreds,
+};
 use turya_protocol::ToolCall;
 
 /// Streaming Anthropic Messages provider (SSE).
-///
-/// Reads credentials strictly from the environment (`ANTHROPIC_API_KEY`);
-/// never accepts keys as CLI args so they cannot leak into shell history.
 pub struct AnthropicProvider {
     api_key: String,
     pub model: String,
@@ -25,7 +30,15 @@ impl AnthropicProvider {
         }
     }
 
+    /// Connect from host-resolved credentials (STEP 5 wiring calls this;
+    /// `from_env` below preserves the current CLI bootstrap until then).
+    pub fn connect_with(creds: &ResolvedCreds, model: &str) -> Self {
+        Self::new(creds.token.clone(), model.to_string())
+    }
+
     /// Returns `None` when sim mode is forced or no key is configured.
+    /// Reads credentials strictly from the environment (`ANTHROPIC_API_KEY`);
+    /// never accepts keys as CLI args so they cannot leak into shell history.
     pub fn from_env() -> Option<Self> {
         if std::env::var("TURYA_SIM_MODE").ok().as_deref() == Some("1") {
             return None;
@@ -37,6 +50,64 @@ impl AnthropicProvider {
         let model =
             std::env::var("TURYA_MODEL").unwrap_or_else(|_| "claude-sonnet-4-5".to_string());
         Some(Self::new(key, model))
+    }
+
+    /// Live model listing (`GET /v1/models`, newest first). Empty on ANY
+    /// failure — callers fall through to cached/static lists, never an error.
+    pub async fn fetch_live_models(api_key: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..5 {
+            let mut url = "https://api.anthropic.com/v1/models?limit=100".to_string();
+            if let Some(cursor) = &after {
+                url.push_str(&format!("&after_id={cursor}"));
+            }
+            let resp = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .user_agent("turya-provider")
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => break,
+            }
+            .get(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await;
+            let body: serde_json::Value = match resp {
+                Ok(r) if r.status().is_success() => match r.json().await {
+                    Ok(b) => b,
+                    Err(_) => break,
+                },
+                _ => break,
+            };
+            let empty = vec![];
+            let data = body
+                .get("data")
+                .and_then(|d| d.as_array())
+                .unwrap_or(&empty);
+            if data.is_empty() {
+                break;
+            }
+            for m in data {
+                if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
+                    out.push(id.to_string());
+                }
+            }
+            after = body
+                .get("last_id")
+                .and_then(|l| l.as_str())
+                .map(|s| s.to_string());
+            if !body
+                .get("has_more")
+                .and_then(|h| h.as_bool())
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        out
     }
 
     fn tool_schemas() -> serde_json::Value {
@@ -193,4 +264,80 @@ impl LlmProvider for AnthropicProvider {
         let _ = tx.send(ProviderStep::Finish).await;
         Ok(())
     }
+}
+
+/// Registry plugin: Anthropic as a first-party native provider.
+pub struct AnthropicPlugin;
+
+#[async_trait]
+impl ProviderPlugin for AnthropicPlugin {
+    fn id(&self) -> &str {
+        "anthropic"
+    }
+
+    fn display_name(&self) -> &str {
+        "Anthropic"
+    }
+
+    fn models(&self) -> Vec<ModelInfo> {
+        // Curated static fallback (live discovery unions over this in STEP 4).
+        ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5"]
+            .into_iter()
+            .map(|id| ModelInfo {
+                id: id.to_string(),
+                display_name: id.to_string(),
+            })
+            .collect()
+    }
+
+    fn auth_methods(&self) -> Vec<AuthMethodKind> {
+        vec![AuthMethodKind::ApiKey {
+            env_var: "ANTHROPIC_API_KEY",
+        }]
+    }
+
+    fn connect(&self, creds: ResolvedCreds, model: &str) -> Result<Arc<dyn LlmProvider>, String> {
+        Ok(Arc::new(AnthropicProvider::new(
+            creds.token,
+            model.to_string(),
+        )))
+    }
+
+    async fn list_models(&self, creds: &ResolvedCreds) -> Vec<String> {
+        AnthropicProvider::fetch_live_models(&creds.token).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_declaration_is_stable() {
+        let p = AnthropicPlugin;
+        assert_eq!(p.id(), "anthropic");
+        assert!(!p.models().is_empty());
+        assert_eq!(
+            p.auth_methods(),
+            vec![AuthMethodKind::ApiKey {
+                env_var: "ANTHROPIC_API_KEY"
+            }]
+        );
+    }
+
+    #[test]
+    fn connect_uses_resolved_token_not_env() {
+        let p = AnthropicPlugin;
+        let creds = ResolvedCreds {
+            token: "tok".to_string(),
+            expires_at: None,
+            via: "stored-key",
+        };
+        let prov = p.connect(creds, "m").unwrap();
+        // Type-level: connect succeeds from creds alone (no env read).
+        let _ = prov;
+    }
+
+    // NOTE: live `list_models` is covered by the ignored live test pattern
+    // (STEP 8); unit tests never touch the network (deterministic suite).
 }
