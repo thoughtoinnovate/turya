@@ -5,9 +5,16 @@ edition = "2021"
 
 [dependencies]
 turya-core = { path = "../turya-core" }
+turya-protocol = { path = "../turya-protocol" }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+# The session integration test drives the real engine, so it needs tools and
+# the async runtime. A dev-dependency on turya-core is already a normal
+# dependency here; no cycle.
+turya-tools = { path = "../turya-tools" }

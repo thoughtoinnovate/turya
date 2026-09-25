@@ -60,6 +60,25 @@ enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// List stored sessions (newest first).
+    Sessions {
+        /// Show sessions from every directory, not just this one.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Continue a stored session (its conversation is replayed into the TUI).
+    Resume {
+        /// Session id (see `turya sessions`).
+        id: String,
+    },
+    /// Export one session as newline-delimited JSON.
+    Export {
+        /// Session id (see `turya sessions`).
+        id: String,
+        /// Write here instead of stdout.
+        #[arg(long)]
+        out: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -95,6 +114,57 @@ fn parse_permission_mode(raw: &str) -> PermissionMode {
     }
 }
 
+/// Fresh session id: UTC timestamp + pid. Sortable, unique enough for one
+/// machine, and readable in `turya sessions`.
+fn new_session_id() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("s-{now}-{}", std::process::id())
+}
+
+fn open_store(turya_home: &str) -> Option<Arc<turya_memory::MemoryStore>> {
+    let db_path = format!("{turya_home}/turya.db");
+    if let Err(e) = std::fs::create_dir_all(turya_home) {
+        eprintln!("Turya: cannot create {turya_home}: {e}");
+        return None;
+    }
+    match turya_memory::MemoryStore::open(&db_path) {
+        // Rule 5.3: a foreign format is reported loudly, never migrated.
+        Ok((store, note)) => {
+            if let Some(note) = note {
+                eprintln!("Turya: {note}");
+            }
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            eprintln!("Turya: memory disabled ({db_path}: {e})");
+            None
+        }
+    }
+}
+
+fn print_sessions(store: &turya_memory::MemoryStore, cwd: Option<&str>) {
+    match store.list_sessions(cwd, 50) {
+        Ok(sessions) if sessions.is_empty() => {
+            println!("No sessions yet.");
+        }
+        Ok(sessions) => {
+            println!("{:<22} {:<7} {:<19} TITLE", "SESSION", "TURNS", "UPDATED");
+            for s in sessions {
+                let mark = if s.repaired { " *" } else { "" };
+                println!(
+                    "{:<22} {:<7} {:<19} {}{}",
+                    s.id, s.seq, s.updated_at, s.title, mark
+                );
+            }
+            println!("\n* closed by crash repair; resume to continue it.");
+        }
+        Err(e) => eprintln!("Turya: cannot list sessions: {e}"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -124,6 +194,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .map_err(|e| e.into());
         }
+        Some(Command::Sessions { all }) => {
+            let home = turya_home_dir();
+            let store = open_store(&home).ok_or("cannot open the session store")?;
+            let cwd = if all {
+                None
+            } else {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+            };
+            print_sessions(&store, cwd.as_deref());
+            return Ok(());
+        }
+        Some(Command::Export { id, out }) => {
+            let home = turya_home_dir();
+            let store = open_store(&home).ok_or("cannot open the session store")?;
+            let jsonl = store
+                .export_jsonl(&id)
+                .map_err(|e| format!("cannot export session {id}: {e}"))?;
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, jsonl)
+                        .map_err(|e| format!("cannot write {path}: {e}"))?;
+                    println!("Wrote {path}");
+                }
+                None => print!("{jsonl}"),
+            }
+            return Ok(());
+        }
         Some(Command::Auth { action }) => {
             return match action {
                 AuthAction::Login {
@@ -148,7 +247,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
         }
-        None => {}
+        // `Resume` deliberately falls through: it needs the full engine, but
+        // with the stored session's id and its transcript replayed below.
+        _ => {}
     }
 
     if let Some(model) = args.model.clone() {
@@ -168,22 +269,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 8: episodic memory at $TURYA_HOME or ~/.turya/turya.db (best-effort).
     // Rule 3.1: the host injects the plugin adapter through the kernel seam;
     // the engine never touches SQLite directly.
-    let turya_home = std::env::var("TURYA_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/.turya", home)
-    });
-    let db_path = format!("{}/turya.db", turya_home);
-    if let Err(e) = std::fs::create_dir_all(&turya_home) {
-        eprintln!("Turya: cannot create {}: {}", turya_home, e);
-    } else {
-        match turya_memory::SqliteMemoryHook::open(&db_path) {
-            Ok(hook) => {
-                engine = engine
-                    .with_memory_hook(Arc::new(hook))
-                    .with_session_id("local");
-            }
-            Err(e) => eprintln!("Turya: memory disabled ({}: {})", db_path, e),
+    let turya_home = turya_home_dir();
+    let session_store = open_store(&turya_home);
+    let session_id = match &args.command {
+        Some(Command::Resume { id }) => id.clone(),
+        _ => new_session_id(),
+    };
+    if let Some(store) = &session_store {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if let Err(e) = <turya_memory::MemoryStore as turya_core::MemoryHook>::begin_session(
+            store,
+            &session_id,
+            &cwd,
+            "",
+        )
+        .await
+        {
+            eprintln!("Turya: cannot open session: {e}");
         }
+    }
+    if let Some(store) = session_store {
+        engine = engine.with_memory_hook(store).with_session_id(&session_id);
     }
 
     // Step 10: live diagnostics when a language server is on PATH.
@@ -226,7 +334,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let app = TuiApp::new();
+    let mut app = TuiApp::new();
+    // `turya resume <id>`: replay the stored conversation so the session looks
+    // exactly as it did before the process exited. The engine also loads it
+    // for the model; this is the user-visible half.
+    if let Some(Command::Resume { id }) = &args.command {
+        match <turya_memory::MemoryStore as turya_core::MemoryHook>::load_transcript(
+            open_store(&turya_home_dir())
+                .ok_or("cannot open the session store")?
+                .as_ref(),
+            id,
+        )
+        .await
+        {
+            Ok(turns) => {
+                let count = turns.len();
+                app.load_transcript(&turya_protocol::Transcript {
+                    session_id: id.clone(),
+                    turns,
+                });
+                println!("Resumed {id} ({count} turns).");
+            }
+            Err(e) => return Err(format!("cannot resume {id}: {e}").into()),
+        }
+    }
     app.run(ui_cmd_tx, event_rx).await?;
 
     Ok(())

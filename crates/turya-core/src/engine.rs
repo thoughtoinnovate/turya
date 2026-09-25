@@ -136,7 +136,22 @@ impl TuryaEngine {
         // everything so far. Tool results re-enter as history, so the model
         // always gets the last word (a summary, an explanation, a follow-up).
         let budgets = *self.budgets.read().unwrap();
-        let mut transcript = Transcript::new(&self.session_id);
+        // Continue the stored conversation when a memory seam is present, so
+        // the model actually remembers earlier turns. Without it the turn
+        // starts from nothing, which is correct for a first turn and wrong
+        // for every one after it.
+        let mut transcript = match self.memory_hook {
+            Some(ref hook) => {
+                let prior = hook
+                    .load_transcript(&self.session_id)
+                    .await
+                    .unwrap_or_default();
+                let mut t = Transcript::new(&self.session_id);
+                t.turns = prior;
+                t
+            }
+            None => Transcript::new(&self.session_id),
+        };
         transcript.start_turn(turn_id);
         // The user's turn is recorded here, once. Providers serialize the
         // transcript as-is; there is no separate prompt to append.
@@ -242,6 +257,12 @@ impl TuryaEngine {
         // Reflection (distilling failures into rules) runs inside the hook
         // implementation, never in the kernel.
         if let Some(ref hook) = self.memory_hook {
+            // Persist the turn as one atomic log record. Written after the
+            // turn so a crash loses at most the in-flight turn, and the
+            // store's repair pass closes any tool call left open.
+            if let Some(turn) = transcript.turns.last() {
+                let _ = hook.append_turn(&self.session_id, turn).await;
+            }
             hook.record_turn_completed(&self.session_id, turn_id, prompt, success)
                 .await;
         }

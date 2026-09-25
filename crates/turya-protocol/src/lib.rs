@@ -169,13 +169,18 @@ impl Transcript {
         self.turns.iter().map(|t| t.parts.len()).sum()
     }
 
-    /// All assistant-visible text, in order (render + estimate input).
+    /// Every text payload in the conversation, in order. Used for context
+    /// estimation and rendering, so it counts the *user's* turns and harness
+    /// instructions too — leaving them out under-reports the window.
     pub fn texts(&self) -> Vec<&str> {
         self.turns
             .iter()
             .flat_map(|t| t.parts.iter())
             .filter_map(|p| match p {
-                Part::Text { text } | Part::Reasoning { text } => Some(text.as_str()),
+                Part::Text { text }
+                | Part::Reasoning { text }
+                | Part::UserText { text }
+                | Part::Instruction { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect()
@@ -346,6 +351,24 @@ impl Transcript {
     }
 }
 
+/// Session header. Out-of-log metadata (Rule: metadata is storage, not
+/// conversation state), so it lives in its own row and never enters the
+/// transcript. `format_version` exists to produce a good error message on a
+/// foreign database — never to migrate one (AGENTS.md Rule 5.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub id: String,
+    pub cwd: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub title: String,
+    pub parent_id: Option<String>,
+    /// Highest committed turn sequence; the next append must continue it.
+    pub seq: u32,
+    /// Set when the session was closed by a crash-repair pass.
+    pub repaired: bool,
+}
+
 /// Commands sent from any UI/Client to the Turya Core Engine
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -370,6 +393,16 @@ pub enum TuryaCommand {
         /// old clients simply never send these.
         max_steps: Option<usize>,
         max_tool_calls: Option<u32>,
+    },
+    /// List stored sessions, newest first (`turya sessions`, `/sessions`).
+    ListSessions {
+        /// Restrict to one working directory; `None` lists every session.
+        cwd: Option<String>,
+        limit: Option<usize>,
+    },
+    /// Replay a stored session into the engine (drive by `turya resume`).
+    ResumeSession {
+        id: String,
     },
     /// List registered providers and their models (drives `/models`).
     ListProviders,
@@ -400,6 +433,15 @@ pub enum TuryaCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum TuryaEvent {
+    /// Answer to `ListSessions`.
+    SessionsListed {
+        sessions: Vec<SessionMeta>,
+    },
+    /// Answer to `ResumeSession`: the replayed transcript plus its header.
+    SessionResumed {
+        session: Box<SessionMeta>,
+        transcript: Transcript,
+    },
     TurnStarted {
         turn_id: String,
         mode: AgentMode,

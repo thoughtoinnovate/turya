@@ -42,6 +42,58 @@ mod tests {
 
     #[async_trait]
     impl MemoryHook for FakeMemory {
+        async fn begin_session(
+            &self,
+            session_id: &str,
+            _cwd: &str,
+            _title: &str,
+        ) -> Result<turya_protocol::SessionMeta, String> {
+            Ok(turya_protocol::SessionMeta {
+                id: session_id.to_string(),
+                cwd: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                title: String::new(),
+                parent_id: None,
+                seq: 0,
+                repaired: false,
+            })
+        }
+        async fn append_turn(
+            &self,
+            _session_id: &str,
+            _turn: &turya_protocol::Turn,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn load_transcript(
+            &self,
+            _session_id: &str,
+        ) -> Result<Vec<turya_protocol::Turn>, String> {
+            Ok(Vec::new())
+        }
+        async fn list_sessions(
+            &self,
+            _cwd: Option<&str>,
+            _limit: usize,
+        ) -> Result<Vec<turya_protocol::SessionMeta>, String> {
+            Ok(Vec::new())
+        }
+        async fn search(
+            &self,
+            _session_id: &str,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
+        async fn session_meta(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<turya_protocol::SessionMeta>, String> {
+            Ok(None)
+        }
+
         async fn recall_rules(&self, _s: &str, _p: &str, limit: usize) -> Vec<String> {
             self.rules.iter().take(limit).cloned().collect()
         }
