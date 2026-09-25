@@ -4,6 +4,7 @@
 //! directly instead of only through a spawned process.
 
 pub mod auth_cmd;
+pub mod config;
 pub mod host_services;
 pub mod live;
 pub mod update;

@@ -23,6 +23,9 @@ tokio = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Durable settings file. Hand-rolled use of a tiny, stable parser; no
+# backward-compat layer is written for other versions (Rule 5.4).
+toml = "0.8"
 reqwest = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"

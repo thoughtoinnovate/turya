@@ -63,6 +63,54 @@ enum EscAction {
     AbortTurn,
 }
 
+/// How many submitted prompts are kept for recall. Bounded so a long-lived
+/// session cannot grow the history file without limit.
+const MAX_PROMPT_HISTORY: usize = 500;
+
+/// Prompt history file: one line per entry, oldest first. Plain text so it
+/// stays greppable, and session logs never live here (those may hold secrets).
+fn history_path() -> std::path::PathBuf {
+    let home = std::env::var("TURYA_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{home}/.turya")
+    });
+    std::path::PathBuf::from(home).join("history")
+}
+
+/// Load recall history, newest last. A missing or unreadable file is not an
+/// error: recall simply starts empty.
+fn load_history() -> Vec<String> {
+    let path = history_path();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    if out.len() > MAX_PROMPT_HISTORY {
+        let excess = out.len() - MAX_PROMPT_HISTORY;
+        out.drain(0..excess);
+    }
+    out
+}
+
+/// Append one prompt to the history file, best-effort and bounded. Rewriting
+/// the tail keeps the file capped without unbounded growth.
+fn persist_history(history: &[String]) {
+    if history.is_empty() {
+        return;
+    }
+    let path = history_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let start = history.len().saturating_sub(MAX_PROMPT_HISTORY);
+    let body: String = history[start..].iter().map(|l| format!("{l}\n")).collect();
+    let _ = std::fs::write(path, body);
+}
+
 /// One retained tool output for on-demand expansion (`Ctrl+E`).
 #[derive(Debug, Clone)]
 struct StoredOutput {
@@ -146,6 +194,14 @@ pub struct TuiApp {
     recv_chars: usize,
     /// Reasoning visibility toggle (`/thinking`). Display-only for now.
     show_thinking: bool,
+    /// Write recall history to disk. Off in tests so they stay hermetic.
+    persist_history: bool,
+    /// Submitted prompts, newest last, for Up/Down recall.
+    prompt_history: Vec<String>,
+    /// Where recall is walking: `None` means "on the live draft".
+    history_cursor: Option<usize>,
+    /// The draft saved when recall first walked away from it.
+    stashed_draft: String,
     registry: SlashRegistry,
     completer: Option<Completer>,
     flow: Flow,
@@ -170,6 +226,8 @@ impl Default for TuiApp {
 }
 
 impl TuiApp {
+    /// In-memory app with no disk state. Tests and embedders use this; it
+    /// never reads or writes the user's history file.
     pub fn new() -> Self {
         Self {
             input: String::new(),
@@ -181,6 +239,10 @@ impl TuiApp {
             sent_chars: 0,
             recv_chars: 0,
             show_thinking: true,
+            prompt_history: Vec::new(),
+            history_cursor: None,
+            stashed_draft: String::new(),
+            persist_history: false,
             registry: SlashRegistry::with_builtins(),
             completer: None,
             flow: Flow::None,
@@ -260,6 +322,82 @@ impl TuiApp {
     /// Clear all transcript rows (`/clear`).
     fn clear_transcript(&mut self) {
         self.transcript.clear();
+    }
+
+    // ---- prompt history (readline semantics) ----
+
+    /// Record a submitted prompt. Consecutive duplicates are collapsed so
+    /// hammering Enter does not fill the ring with the same line.
+    fn push_history(&mut self, prompt: &str) {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return;
+        }
+        if self.prompt_history.last().map(String::as_str) != Some(prompt) {
+            self.prompt_history.push(prompt.to_string());
+        }
+        if self.prompt_history.len() > MAX_PROMPT_HISTORY {
+            let excess = self.prompt_history.len() - MAX_PROMPT_HISTORY;
+            self.prompt_history.drain(0..excess);
+        }
+        self.history_cursor = None;
+        self.stashed_draft.clear();
+        if self.persist_history {
+            persist_history(&self.prompt_history);
+        }
+    }
+
+    /// The real application constructor: restores the recall history file
+    /// and keeps writing to it. `new()` stays hermetic for tests.
+    pub fn new_restoring() -> Self {
+        let mut app = Self::new();
+        app.prompt_history = load_history();
+        app.persist_history = true;
+        app
+    }
+
+    /// Do the input box's arrow keys, or does an open flow/completer own them?
+    fn input_owns_arrows(&self) -> bool {
+        self.completer.is_none() && matches!(self.flow, Flow::None)
+    }
+
+    /// Any manual edit abandons the recall cursor, so the next Up starts from
+    /// the newest entry instead of resuming a stale walk.
+    fn on_input_edited(&mut self) {
+        self.history_cursor = None;
+    }
+
+    /// One step older. The first press stashes the in-progress draft so
+    /// walking back to the newest entry restores it.
+    fn recall_older(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let idx = match self.history_cursor {
+            None => {
+                self.stashed_draft = std::mem::take(&mut self.input);
+                self.prompt_history.len() - 1
+            }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_cursor = Some(idx);
+        self.input = self.prompt_history[idx].clone();
+    }
+
+    /// One step newer; past the newest entry the stashed draft comes back.
+    fn recall_newer(&mut self) {
+        let Some(idx) = self.history_cursor else {
+            return;
+        };
+        if idx + 1 < self.prompt_history.len() {
+            let next = idx + 1;
+            self.history_cursor = Some(next);
+            self.input = self.prompt_history[next].clone();
+        } else {
+            self.history_cursor = None;
+            self.input = std::mem::take(&mut self.stashed_draft);
+        }
     }
 
     /// Replay a stored transcript into the view (`turya resume`).
@@ -459,6 +597,8 @@ impl TuiApp {
     async fn submit_prompt(&mut self, prompt: String, cmd_tx: &mpsc::Sender<TuryaCommand>) {
         self.sent_chars += prompt.len();
         self.scroll_to_bottom();
+        // Recall before the prompt is moved out, so the draft is kept.
+        self.push_history(&prompt);
         self.push_block(&format_user_message(&prompt), false);
         let _ = cmd_tx
             .send(TuryaCommand::SubmitPrompt {
@@ -1186,11 +1326,26 @@ impl TuiApp {
                             {
                                 self.expand_last_output();
                             }
-                            KeyCode::Char(c) => self.input.push(c),
-                            KeyCode::Backspace => { self.input.pop(); }
+                            KeyCode::Char(c) => {
+                                self.input.push(c);
+                                self.on_input_edited();
+                            }
+                            KeyCode::Backspace => {
+                                self.input.pop();
+                                self.on_input_edited();
+                            }
                             KeyCode::PageUp => self.scroll_up(),
                             KeyCode::PageDown => self.scroll_down(),
                             KeyCode::End => self.scroll_to_bottom(),
+                            // Readline-style prompt recall, only when the
+                            // input owns the arrow keys (no flow, no
+                            // completer), so the browsers keep theirs.
+                            KeyCode::Up if self.input_owns_arrows() => {
+                                self.recall_older();
+                            }
+                            KeyCode::Down if self.input_owns_arrows() => {
+                                self.recall_newer();
+                            }
                             // Alt+Enter inserts a newline (multiline draft);
                             // most terminals deliver it as Enter+ALT.
                             KeyCode::Enter
@@ -1931,5 +2086,107 @@ mod tests {
         app.log_dim("───".to_string());
         app.push_text("next");
         assert_eq!(app.transcript_text(), "hello\n───\nnext");
+    }
+    #[test]
+    fn recall_walks_back_to_the_newest_prompt() {
+        let mut app = TuiApp::new();
+        app.push_history("first");
+        app.push_history("second");
+        app.input = "draft".to_string();
+
+        app.recall_older();
+        assert_eq!(app.input, "second", "newest first");
+        app.recall_older();
+        assert_eq!(app.input, "first");
+        // Past the oldest entry it stops, it does not wrap or clear.
+        app.recall_older();
+        assert_eq!(app.input, "first");
+    }
+
+    #[test]
+    fn recall_forward_restores_the_stashed_draft() {
+        let mut app = TuiApp::new();
+        app.push_history("first");
+        app.push_history("second");
+        app.input = "half-written thought".to_string();
+
+        app.recall_older();
+        app.recall_older();
+        assert_eq!(app.input, "first");
+        app.recall_newer();
+        assert_eq!(app.input, "second");
+        app.recall_newer();
+        assert_eq!(
+            app.input, "half-written thought",
+            "walking back to the end restores the draft"
+        );
+        // A further Down is a no-op rather than a panic or a clear.
+        app.recall_newer();
+        assert_eq!(app.input, "half-written thought");
+    }
+
+    #[test]
+    fn editing_abandons_the_recall_cursor() {
+        let mut app = TuiApp::new();
+        app.push_history("first");
+        app.recall_older();
+        assert!(app.history_cursor.is_some());
+        app.on_input_edited();
+        assert!(
+            app.history_cursor.is_none(),
+            "the next Up starts from the newest entry"
+        );
+    }
+
+    #[test]
+    fn arrows_belong_to_the_input_only_when_nothing_else_is_open() {
+        let mut app = TuiApp::new();
+        assert!(app.input_owns_arrows(), "idle: the prompt owns Up/Down");
+        app.completer = Some(Completer::new());
+        assert!(!app.input_owns_arrows(), "completer: it owns Up/Down");
+        app.completer = None;
+        app.flow = Flow::Browser(flows::BrowserFlow::new(flows::BrowserMode::Models));
+        assert!(!app.input_owns_arrows(), "browser: it owns Up/Down");
+    }
+
+    #[test]
+    fn history_skips_blanks_and_collapses_repeats() {
+        let mut app = TuiApp::new();
+        app.push_history("same");
+        app.push_history("same");
+        app.push_history("   ");
+        app.push_history("other");
+        assert_eq!(app.prompt_history, vec!["same", "other"]);
+    }
+
+    #[test]
+    fn history_is_bounded() {
+        let mut app = TuiApp::new();
+        for i in 0..(MAX_PROMPT_HISTORY + 25) {
+            app.push_history(&format!("p{i}"));
+        }
+        assert_eq!(app.prompt_history.len(), MAX_PROMPT_HISTORY);
+        assert_eq!(
+            app.prompt_history.last().map(String::as_str),
+            Some(format!("p{}", MAX_PROMPT_HISTORY + 24).as_str()),
+            "newest kept, oldest dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_submitted_prompt_lands_in_recall_history() {
+        let mut app = TuiApp::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.input = "remember me".to_string();
+        let prompt = std::mem::take(&mut app.input);
+        app.submit_prompt(prompt, &tx).await;
+        assert_eq!(app.prompt_history, vec!["remember me"]);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TuryaCommand::SubmitPrompt { .. })
+        ));
+        // And the next recall returns it.
+        app.recall_older();
+        assert_eq!(app.input, "remember me");
     }
 }

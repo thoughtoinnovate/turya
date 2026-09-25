@@ -3113,6 +3113,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "turya-auth",
  "turya-catalog",
  "turya-core",

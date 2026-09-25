@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use turya_cli::{auth_cmd, host_services, update};
+use turya_cli::{auth_cmd, config, host_services, update};
 use turya_core::{LlmProvider, MockProvider, ProviderStep, TuryaEngine};
 use turya_protocol::{PermissionMode, ToolCall};
 use turya_server::TuryaSession;
@@ -17,8 +17,9 @@ use turya_tui::TuiApp;
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
-    #[arg(short, long, default_value = "review-for-me")]
-    permission_mode: String,
+    /// open | review-for-me | manual. Unset means "use the saved setting".
+    #[arg(short, long)]
+    permission_mode: Option<String>,
     #[arg(long)]
     model: Option<String>,
     /// Provider id (registry-driven; default: anthropic).
@@ -169,6 +170,20 @@ fn print_sessions(store: &turya_memory::MemoryStore, cwd: Option<&str>) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    // Durable settings: file first, then flags/env override it. An
+    // incompatible file is replaced and reported, never migrated.
+    let (settings, load_outcome) = config::TuryaConfig::load(config_path());
+    match load_outcome {
+        Some(config::LoadOutcome::Replaced { found, backup }) => eprintln!(
+            "Turya: config.toml was schema v{found}: kept as {backup} and reset to defaults \
+             (forward-only, no migration)."
+        ),
+        Some(config::LoadOutcome::ReplacedUnparsable { reason, backup }) => eprintln!(
+            "Turya: config.toml was unreadable ({reason}); kept as {backup} and reset to defaults."
+        ),
+        _ => {}
+    }
+
     // Self-management subcommands never touch the agent engine.
     // Auth shares the turya-auth functions the TUI /auth flow will call.
     let store: std::sync::Arc<dyn turya_auth::CredentialStore> =
@@ -252,11 +267,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
 
+    // Settings supply defaults; an explicit flag still wins.
+    if let Some(p) = &settings.provider {
+        if args.provider.is_none() && std::env::var_os("TURYA_PROVIDER").is_none() {
+            std::env::set_var("TURYA_PROVIDER", p);
+        }
+    }
+    if let Some(m) = &settings.model {
+        if args.model.is_none() && std::env::var_os("TURYA_MODEL").is_none() {
+            std::env::set_var("TURYA_MODEL", m);
+        }
+    }
     if let Some(model) = args.model.clone() {
         // Export for provider defaults; CLI flag wins over env.
         std::env::set_var("TURYA_MODEL", model);
     }
-    let permission_mode = parse_permission_mode(&args.permission_mode);
+    let permission_mode = parse_permission_mode(
+        args.permission_mode
+            .as_deref()
+            .or(settings.permission_mode.as_deref())
+            .unwrap_or("review-for-me"),
+    );
 
     // Registry-driven bootstrap (Rule 3.2: host links plugins, core names
     // no vendor). Mock fallback keeps sim/offline working.
@@ -334,7 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut app = TuiApp::new();
+    let mut app = TuiApp::new_restoring();
     // `turya resume <id>`: replay the stored conversation so the session looks
     // exactly as it did before the process exited. The engine also loads it
     // for the model; this is the user-visible half.

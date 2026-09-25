@@ -57,6 +57,25 @@ pub fn asset_name() -> Option<String> {
     Some(base.to_string())
 }
 
+/// Pre-1.0 releases carry no compatibility guarantee, so a routine update
+/// prompt says so once. Separate from the major prompt: crossing a major is
+/// a *different* promise, and a user may accept one and not the other.
+fn confirm_breaking(current: &str, target: &str) -> Result<bool, String> {
+    println!(
+        "turya {current} -> {target}\n\
+         This is a 0.x release: breaking changes are expected and older state \
+         (config, sessions) may be reset, not migrated."
+    );
+    println!("Proceed? [y/N]");
+    print!("> ");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
 /// Outcome of the version decision, kept pure for unit testing.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdateDecision {
@@ -293,6 +312,14 @@ async fn run(
     if target_v.0 > current_v.0 && !auto_yes && !force && !confirm_major_upgrade(&current, &target)?
     {
         println!("Upgrade cancelled.");
+        return Ok(());
+    }
+
+    // Rule 5.1: pre-1.0 Turya makes no compatibility promise, so even a patch
+    // bump may carry breaking changes. Say so before overwriting a binary the
+    // user is running right now.
+    if !auto_yes && !force && current_v.0 == 0 && !confirm_breaking(&current, &target)? {
+        println!("Update cancelled.");
         return Ok(());
     }
 
