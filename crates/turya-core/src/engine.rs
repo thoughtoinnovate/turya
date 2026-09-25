@@ -7,6 +7,20 @@ use tokio::sync::mpsc;
 use turya_protocol::{AgentMode, PermissionDecision, PermissionMode, TuryaEvent};
 use turya_tools::ToolRegistry;
 
+/// Max model calls per turn. After each pass that invokes tools, the engine
+/// re-invokes the provider with the accumulated transcript so the assistant
+/// answers *after* seeing tool results (agentic loop). Pure-text passes end
+/// the turn immediately; only runaway tool-calling hits this cap.
+const MAX_MODEL_CALLS: usize = 8;
+/// Max tool *executions* per turn. One model response can emit many
+/// `CallTool` steps, so the model-call cap alone does not bound side
+/// effects (`run_bash`, `write_file`). Generous for legit chains
+/// (explore → read → test), tight enough to stop a flood.
+const MAX_TOOL_CALLS_PER_TURN: u32 = 32;
+/// Tool outputs are truncated in history: one `cat` of a huge file must not
+/// blow the context window on every follow-up call.
+const MAX_TOOL_HISTORY_CHARS: usize = 2000;
+
 pub struct TuryaEngine {
     /// Hot-swappable provider slot (Rule 3.3): `/models` switches vendors
     /// mid-session without rebuilding the engine.
@@ -84,99 +98,126 @@ impl TuryaEngine {
             })
             .await;
 
-        let (step_tx, mut step_rx) = mpsc::channel(32);
-        let provider = self.provider.read().unwrap().clone();
-        let prompt_clone = prompt.to_string();
+        // Agentic loop: each pass asks the provider for the next step given
+        // everything so far. Tool results re-enter as history, so the model
+        // always gets the last word (a summary, an explanation, a follow-up).
+        let mut history: Vec<String> = Vec::new();
+        let mut turn_error: Option<String> = None;
+        let mut passes = 0u32;
+        let mut tools_last_pass = 0u32;
+        let mut tool_executions = 0u32;
+        let mut tool_cap_hit = false;
 
-        tokio::spawn(async move {
-            let _ = provider.generate_turn(&prompt_clone, &[], step_tx).await;
-        });
+        for _pass in 0..MAX_MODEL_CALLS {
+            passes += 1;
+            let (step_tx, mut step_rx) = mpsc::channel(32);
+            let provider = self.provider.read().unwrap().clone();
+            let prompt_clone = prompt.to_string();
+            let history_clone = history.clone();
 
-        while let Some(step) = step_rx.recv().await {
-            match step {
-                ProviderStep::Token(chunk) => {
-                    let _ = event_tx.send(TuryaEvent::TokenDelta { chunk }).await;
-                }
-                ProviderStep::CallTool(call) => {
-                    let _ = event_tx
-                        .send(TuryaEvent::ToolCallInitiated(call.clone()))
-                        .await;
-                    let tool = match self.tools.get(&call.tool_name) {
-                        Some(t) => t,
-                        None => {
-                            let _ = event_tx
-                                .send(TuryaEvent::ToolCallCompleted(turya_protocol::ToolResult {
-                                    call_id: call.call_id,
-                                    success: false,
-                                    output: String::new(),
-                                    error: Some(format!("Unknown tool: {}", call.tool_name)),
-                                }))
-                                .await;
-                            continue;
-                        }
-                    };
+            let join = tokio::spawn(async move {
+                provider
+                    .generate_turn(&prompt_clone, &history_clone, step_tx)
+                    .await
+            });
 
-                    let risk = tool.risk_level(&call.parameters);
-                    let authorized = match self.permissions.check(&call.tool_name, risk) {
-                        Some(decision) => decision != PermissionDecision::Deny,
-                        None => {
-                            // Issue challenge
-                            let req_id = format!("req_{}", call.call_id);
-                            let _ = event_tx
-                                .send(TuryaEvent::PermissionRequested {
-                                    request_id: req_id.clone(),
-                                    action: call.tool_name.clone(),
-                                    risk_level: risk,
-                                    details: call.parameters.to_string(),
-                                })
-                                .await;
+            let mut assistant_text = String::new();
+            let mut tool_calls_this_pass = 0u32;
 
-                            // Wait for UI to resolve
-                            let mut approved = false;
-                            while let Some((id, dec)) = perm_rx.recv().await {
-                                if id == req_id {
-                                    self.permissions.record_decision(&call.tool_name, dec);
-                                    approved = dec != PermissionDecision::Deny;
-                                    break;
-                                }
-                            }
-                            approved
-                        }
-                    };
-
-                    if authorized {
-                        let result = tool.execute(&call.call_id, call.parameters.clone()).await;
-                        let _ = event_tx
-                            .send(TuryaEvent::ToolCallCompleted(result.clone()))
-                            .await;
-                        // Record genuine tool failures for the reflection loop
-                        // (permission denials are user decisions, not lessons).
-                        if !result.success {
-                            self.record_tool_error(&call.tool_name, &result).await;
-                        }
-                        // Step 10 hook: freshly written files get a live diagnostic check.
-                        if call.tool_name == "write_file" {
-                            self.check_written_file(&call, &event_tx).await;
-                        }
-                    } else {
-                        let _ = event_tx
-                            .send(TuryaEvent::ToolCallCompleted(turya_protocol::ToolResult {
-                                call_id: call.call_id,
+            while let Some(step) = step_rx.recv().await {
+                match step {
+                    ProviderStep::Token(chunk) => {
+                        assistant_text.push_str(&chunk);
+                        let _ = event_tx.send(TuryaEvent::TokenDelta { chunk }).await;
+                    }
+                    ProviderStep::CallTool(call) => {
+                        tool_calls_this_pass += 1;
+                        // Tool budget: stop executing, but stay coherent — the
+                        // denial completes like any other result so the model
+                        // sees it in history instead of hanging.
+                        if tool_executions >= MAX_TOOL_CALLS_PER_TURN {
+                            tool_cap_hit = true;
+                            let res = turya_protocol::ToolResult {
+                                call_id: call.call_id.clone(),
                                 success: false,
                                 output: String::new(),
-                                error: Some("Permission denied by user".to_string()),
-                            }))
-                            .await;
+                                error: Some("tool budget exhausted".to_string()),
+                            };
+                            let _ = event_tx
+                                .send(TuryaEvent::ToolCallInitiated(call.clone()))
+                                .await;
+                            let _ = event_tx.send(TuryaEvent::ToolCallCompleted(res)).await;
+                            history.push(format!(
+                                "Tool '{}' result (success=false): tool budget exhausted",
+                                call.tool_name
+                            ));
+                            continue;
+                        }
+                        tool_executions += 1;
+                        let result = self.execute_tool_call(&call, &event_tx, &mut perm_rx).await;
+                        let summary = result
+                            .error
+                            .clone()
+                            .filter(|_| !result.success)
+                            .unwrap_or_else(|| result.output.clone());
+                        history.push(format!(
+                            "Tool '{}' result (success={}): {}",
+                            call.tool_name,
+                            result.success,
+                            truncate_history(&summary, MAX_TOOL_HISTORY_CHARS)
+                        ));
                     }
+                    ProviderStep::Finish => break,
                 }
-                ProviderStep::Finish => break,
+            }
+
+            // Provider failures must surface: previously `let _ =` swallowed
+            // them into a silent empty turn; inside a loop that trap repeats.
+            match join.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    turn_error = Some(e);
+                    break;
+                }
+                Err(join_err) => {
+                    turn_error = Some(format!("provider task failed: {join_err}"));
+                    break;
+                }
+            }
+
+            if !assistant_text.is_empty() {
+                history.push(format!("Assistant: {assistant_text}"));
+            }
+            // A pass with no tool calls is a final answer: the turn is over.
+            tools_last_pass = tool_calls_this_pass;
+            if tool_calls_this_pass == 0 {
+                break;
             }
         }
 
+        if (passes as usize == MAX_MODEL_CALLS && tools_last_pass > 0) || tool_cap_hit {
+            // The budget — not a final answer — ended the turn. Say so visibly.
+            let _ = event_tx
+                .send(TuryaEvent::Error {
+                    message: format!(
+                        "step budget ({MAX_MODEL_CALLS} model calls / \
+                         {MAX_TOOL_CALLS_PER_TURN} tool calls) exhausted; \
+                         showing results so far"
+                    ),
+                })
+                .await;
+        }
+        if let Some(ref e) = turn_error {
+            let _ = event_tx
+                .send(TuryaEvent::Error { message: e.clone() })
+                .await;
+        }
+
+        let success = turn_error.is_none();
         let _ = event_tx
             .send(TuryaEvent::TurnCompleted {
                 turn_id: turn_id.to_string(),
-                success: true,
+                success,
             })
             .await;
 
@@ -184,8 +225,93 @@ impl TuryaEngine {
         // Reflection (distilling failures into rules) runs inside the hook
         // implementation, never in the kernel.
         if let Some(ref hook) = self.memory_hook {
-            hook.record_turn_completed(&self.session_id, turn_id, prompt, true)
+            hook.record_turn_completed(&self.session_id, turn_id, prompt, success)
                 .await;
+        }
+    }
+
+    /// Execute one tool call: announce, permission-gate, run, announce the
+    /// result. Extracted from `run_turn` so the agentic loop stays readable;
+    /// behavior matches the old inline block exactly.
+    async fn execute_tool_call(
+        &self,
+        call: &turya_protocol::ToolCall,
+        event_tx: &mpsc::Sender<TuryaEvent>,
+        perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
+    ) -> turya_protocol::ToolResult {
+        let _ = event_tx
+            .send(TuryaEvent::ToolCallInitiated(call.clone()))
+            .await;
+        let tool = match self.tools.get(&call.tool_name) {
+            Some(t) => t,
+            None => {
+                let res = turya_protocol::ToolResult {
+                    call_id: call.call_id.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Unknown tool: {}", call.tool_name)),
+                };
+                let _ = event_tx
+                    .send(TuryaEvent::ToolCallCompleted(res.clone()))
+                    .await;
+                return res;
+            }
+        };
+
+        let risk = tool.risk_level(&call.parameters);
+        let authorized = match self.permissions.check(&call.tool_name, risk) {
+            Some(decision) => decision != PermissionDecision::Deny,
+            None => {
+                // Issue challenge
+                let req_id = format!("req_{}", call.call_id);
+                let _ = event_tx
+                    .send(TuryaEvent::PermissionRequested {
+                        request_id: req_id.clone(),
+                        action: call.tool_name.clone(),
+                        risk_level: risk,
+                        details: call.parameters.to_string(),
+                    })
+                    .await;
+
+                // Wait for UI to resolve
+                let mut approved = false;
+                while let Some((id, dec)) = perm_rx.recv().await {
+                    if id == req_id {
+                        self.permissions.record_decision(&call.tool_name, dec);
+                        approved = dec != PermissionDecision::Deny;
+                        break;
+                    }
+                }
+                approved
+            }
+        };
+
+        if authorized {
+            let result = tool.execute(&call.call_id, call.parameters.clone()).await;
+            let _ = event_tx
+                .send(TuryaEvent::ToolCallCompleted(result.clone()))
+                .await;
+            // Record genuine tool failures for the reflection loop
+            // (permission denials are user decisions, not lessons).
+            if !result.success {
+                self.record_tool_error(&call.tool_name, &result).await;
+            }
+            // Step 10 hook: freshly written files get a live diagnostic check.
+            if call.tool_name == "write_file" {
+                self.check_written_file(call, event_tx).await;
+            }
+            result
+        } else {
+            let res = turya_protocol::ToolResult {
+                call_id: call.call_id.clone(),
+                success: false,
+                output: String::new(),
+                error: Some("Permission denied by user".to_string()),
+            };
+            let _ = event_tx
+                .send(TuryaEvent::ToolCallCompleted(res.clone()))
+                .await;
+            res
         }
     }
 
@@ -244,4 +370,14 @@ impl TuryaEngine {
                 .await;
         }
     }
+}
+
+/// Truncate by chars (never split a boundary) for history entries.
+fn truncate_history(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push_str("…[truncated]");
+    out
 }

@@ -122,6 +122,15 @@ pub struct TuiApp {
     /// `/auth <provider>` jumps straight into that provider's login once
     /// the provider list arrives.
     pending_auth: Option<String>,
+    /// Turn lifecycle for the progress indicator: set by `TurnStarted`,
+    /// cleared by `TurnCompleted`/`Error`. Drives the spinner in the top bar.
+    turn_active: bool,
+    /// Spinner animation frame, advanced by the 120ms tick in `run()`.
+    /// A plain counter (not time-derived) so headless tests set it directly.
+    spin_tick: u64,
+    /// Manual scroll-back: lines the transcript is lifted above the bottom.
+    /// `0` = follow live output. PageUp/PageDown adjust, End/new prompt resets.
+    scroll_lines_up: usize,
 }
 
 impl Default for TuiApp {
@@ -145,6 +154,9 @@ impl TuiApp {
             completer: None,
             flow: Flow::None,
             pending_auth: None,
+            turn_active: false,
+            spin_tick: 0,
+            scroll_lines_up: 0,
         }
     }
 
@@ -153,6 +165,39 @@ impl TuiApp {
     fn log_line(&mut self, line: String) {
         self.streamed_text.push_str(&line);
         self.streamed_text.push('\n');
+    }
+
+    /// Approximate wrapped line count for scroll math (no new deps):
+    /// each logical line occupies ceil(chars/width) rows, minimum 1.
+    /// Close enough to `Wrap { trim: false }` that the tail-stays-visible
+    /// test holds; exactness is not required, clamping is.
+    fn wrapped_lines(text: &str, width: usize) -> usize {
+        let w = width.max(1);
+        text.split('\n')
+            .map(|l| {
+                let n = l.chars().count();
+                if n == 0 {
+                    1
+                } else {
+                    n.div_ceil(w)
+                }
+            })
+            .sum()
+    }
+
+    /// Lift the transcript viewport up (read back history).
+    fn scroll_up(&mut self) {
+        self.scroll_lines_up = self.scroll_lines_up.saturating_add(10);
+    }
+
+    /// Lower the viewport toward live output.
+    fn scroll_down(&mut self) {
+        self.scroll_lines_up = self.scroll_lines_up.saturating_sub(10);
+    }
+
+    /// Pin the viewport back to the live bottom.
+    fn scroll_to_bottom(&mut self) {
+        self.scroll_lines_up = 0;
     }
 
     /// Format a character count as estimated tokens (≈ chars/4).
@@ -165,18 +210,39 @@ impl TuiApp {
         }
     }
 
-    /// One-line status bar: provider/model, token estimates, thinking flag.
-    /// Token counts are char-based estimates (≈), clearly marked — true
-    /// provider usage blocks are a follow-up.
-    fn status_line(&self) -> String {
-        let model = self
+    /// One-row top bar: identity when idle, live state when working.
+    /// The spinner sits FIRST when active (the layout shift pulls the eye);
+    /// least-important info stays rightmost (narrow screens clip the right).
+    fn top_line(&self) -> String {
+        let sel = self
             .provider
             .as_ref()
             .map(|(p, m, via)| format!("{p}/{m} ({via})"))
             .unwrap_or_else(|| "no provider".to_string());
+        if self.turn_active {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let f = frames[(self.spin_tick as usize) % frames.len()];
+            // Deterministic pick (lowest tool name) so the line is stable
+            // when several tools run at once.
+            let mut tools: Vec<&String> = self.pending_tools.values().collect();
+            tools.sort();
+            match tools.first() {
+                Some(tool) => format!("{f} {tool}… │ {sel}"),
+                None => format!("{f} working · {sel}"),
+            }
+        } else {
+            format!(" Turya v{} │ {sel}", env!("CARGO_PKG_VERSION"))
+        }
+    }
+
+    /// One-line status bar: token estimates, thinking flag, mode.
+    /// The `Esc stop · Ctrl+C quit` hint lives in the input-box title, so it
+    /// is not duplicated here (frees ~22 cols on narrow screens).
+    /// Token counts are char-based estimates (≈), clearly marked — true
+    /// provider usage blocks are a follow-up.
+    fn status_line(&self) -> String {
         format!(
-            " {} │ ↑{} ↓{}≈tok │ think:{} │ Esc stop · Ctrl+C quit",
-            model,
+            " ↑{} ↓{}≈tok │ think:{} │ Build · Review-for-me",
             Self::fmt_tokens(self.sent_chars),
             Self::fmt_tokens(self.recv_chars),
             if self.show_thinking { "on" } else { "off" },
@@ -184,9 +250,11 @@ impl TuiApp {
     }
 
     /// Submit a prompt: echo it into the transcript (so your messages are
-    /// visible) and forward it to the engine.
+    /// visible) and forward it to the engine. A new turn starts at the
+    /// live bottom, releasing any scroll-back lock.
     async fn submit_prompt(&mut self, prompt: String, cmd_tx: &mpsc::Sender<TuryaCommand>) {
         self.sent_chars += prompt.len();
+        self.scroll_to_bottom();
         self.streamed_text.push_str(&format_user_message(&prompt));
         let _ = cmd_tx
             .send(TuryaCommand::SubmitPrompt {
@@ -563,10 +631,19 @@ impl TuiApp {
             } => {
                 self.pending_permission = Some((request_id.clone(), action.clone()));
             }
+            TuryaEvent::TurnStarted { .. } => {
+                // Progress indicator on: spinner runs until the turn settles.
+                // Scroll lock resets — a new turn starts at the live bottom.
+                self.turn_active = true;
+                self.spin_tick = 0;
+                self.scroll_lines_up = 0;
+            }
             TuryaEvent::TurnCompleted { .. } => {
-                self.streamed_text.push_str("\n[Turn Finished]\n");
+                self.turn_active = false;
+                self.log_line("────────────────────────────────────────".to_string());
             }
             TuryaEvent::Error { message } => {
+                self.turn_active = false;
                 self.log_line(format!("⚠ {message}"));
             }
             _ => {}
@@ -578,30 +655,33 @@ impl TuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Header
+                Constraint::Length(1), // Top bar: identity + live spinner
                 Constraint::Min(5),    // Chat transcript (tools inline)
                 Constraint::Length(3), // Input Box / Permission Prompt
                 Constraint::Length(1), // Status bar (no borders: 1 row)
             ])
             .split(f.area());
 
-        // 1. Header
-        let header = Paragraph::new(format!(
-            " Turya v{} | Mode: Build | Security: Review-for-me",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(Block::default().borders(Borders::ALL).title("Status"));
-        f.render_widget(header, chunks[0]);
+        // 1. Top bar (borderless): static identity when idle, spinner plus
+        // live state while a turn runs.
+        f.render_widget(
+            Paragraph::new(self.top_line()).style(Style::default().fg(Color::Cyan)),
+            chunks[0],
+        );
 
         // 2. Chat transcript (user messages, assistant tokens, tool
-        // activity, and toasts share one chronological stream).
+        // activity, and toasts share one chronological stream), pinned to
+        // the bottom unless the user scrolled back (see scroll_lines_up).
+        let inner_w = chunks[1].width.saturating_sub(2).max(1) as usize;
+        let inner_h = chunks[1].height.saturating_sub(2) as usize;
+        let total = Self::wrapped_lines(&self.streamed_text, inner_w);
+        let max_off = total.saturating_sub(inner_h).min(u16::MAX as usize);
+        // Follow-bottom by default: the viewport sits max_off down, lifted
+        // toward the top by the scroll-back lock.
+        let off = max_off.saturating_sub(self.scroll_lines_up) as u16;
         let chat = Paragraph::new(self.streamed_text.as_str())
             .wrap(Wrap { trim: false })
+            .scroll((off, 0))
             .block(Block::default().borders(Borders::ALL).title("Assistant"));
         f.render_widget(chat, chunks[1]);
 
@@ -710,6 +790,9 @@ impl TuiApp {
         let mut terminal = Terminal::new(backend)?;
 
         let mut reader = EventStream::new();
+        // Spinner clock: the loop redraws every iteration, so advancing the
+        // frame here animates the top bar (~8fps) with negligible cost.
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
 
         // Ask the host for the current selection so the status bar shows
         // truth from the first frame (the host answers with ProviderState).
@@ -820,6 +903,9 @@ impl TuiApp {
                             }
                             KeyCode::Char(c) => self.input.push(c),
                             KeyCode::Backspace => { self.input.pop(); }
+                            KeyCode::PageUp => self.scroll_up(),
+                            KeyCode::PageDown => self.scroll_down(),
+                            KeyCode::End => self.scroll_to_bottom(),
                             KeyCode::Enter if !self.input.trim().is_empty() => {
                                 let prompt = std::mem::take(&mut self.input);
                                 self.submit_prompt(prompt, &cmd_tx).await;
@@ -832,6 +918,10 @@ impl TuiApp {
                     // Single home for ALL event handling (see feed_flow_event):
                     // the live loop and headless tests drive the same code.
                     self.feed_flow_event(&evt);
+                }
+                _ = ticker.tick() => {
+                    // Wrapping add: process uptime is not a crash reason.
+                    self.spin_tick = self.spin_tick.wrapping_add(1);
                 }
             }
         }
@@ -1185,16 +1275,18 @@ mod tests {
     fn status_line_shows_provider_counters_and_thinking() {
         let mut app = TuiApp::new();
         // No provider yet.
-        assert!(app.status_line().contains("no provider"));
+        assert!(app.top_line().contains("no provider"));
         assert!(app.status_line().contains("think:on"));
         app.feed_flow_event(&TuryaEvent::ProviderState {
             provider: "gemini".to_string(),
             model: "gemini-2.5-flash".to_string(),
             via: "stored-key".to_string(),
         });
-        let line = app.status_line();
-        assert!(line.contains("gemini/gemini-2.5-flash"));
-        assert!(line.contains("stored-key"));
+        // Provider selection lives in the top bar now (status bar keeps
+        // counters + flags so both lines earn their cols on narrow screens).
+        let top = app.top_line();
+        assert!(top.contains("gemini/gemini-2.5-flash"));
+        assert!(top.contains("stored-key"));
         // Counters format as estimated tokens.
         app.sent_chars = 4000;
         app.recv_chars = 8000;
@@ -1223,5 +1315,123 @@ mod tests {
         assert!(app.streamed_text.contains("reasoning display off"));
         app.dispatch_slash("thinking", "", &tx).await;
         assert!(app.show_thinking);
+    }
+
+    /// Render headlessly at any size and read the pixels back as one string.
+    /// The mock screen: no pty, no server, no network.
+    fn rendered(app: &TuiApp, width: u16, height: u16) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn spinner_runs_while_turn_active() {
+        let mut app = TuiApp::new();
+        assert!(!app.top_line().contains('⠋'));
+        app.feed_flow_event(&TuryaEvent::TurnStarted {
+            turn_id: "t1".to_string(),
+            mode: AgentMode::Build,
+        });
+        assert!(app.turn_active);
+        // The tick counter is set directly: no sleeping on a real timer.
+        app.spin_tick = 0;
+        let line = app.top_line();
+        assert!(
+            line.contains('⠋') && line.contains("working"),
+            "line: {line}"
+        );
+        app.spin_tick = 3;
+        assert!(app.top_line().contains('⠸'));
+        app.feed_flow_event(&TuryaEvent::TurnCompleted {
+            turn_id: "t1".to_string(),
+            success: true,
+        });
+        assert!(!app.turn_active);
+        assert!(!app.top_line().contains('⠋'));
+    }
+
+    #[test]
+    fn spinner_names_running_tool() {
+        use turya_protocol::{ToolCall, ToolResult};
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&TuryaEvent::TurnStarted {
+            turn_id: "t".to_string(),
+            mode: AgentMode::Build,
+        });
+        app.feed_flow_event(&TuryaEvent::ToolCallInitiated(ToolCall {
+            call_id: "g1".to_string(),
+            tool_name: "run_bash".to_string(),
+            parameters: serde_json::json!({}),
+        }));
+        assert!(app.top_line().contains("run_bash"));
+        app.feed_flow_event(&TuryaEvent::ToolCallCompleted(ToolResult {
+            call_id: "g1".to_string(),
+            success: true,
+            output: "ok".to_string(),
+            error: None,
+        }));
+        assert!(app.top_line().contains("working"));
+    }
+
+    #[test]
+    fn top_line_shows_identity_when_idle() {
+        let app = TuiApp::new();
+        let line = app.top_line();
+        assert!(
+            line.contains("Turya v") && line.contains("no provider"),
+            "line: {line}"
+        );
+    }
+
+    #[test]
+    fn tiny_terminal_renders_without_panic() {
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&listed());
+        app.feed_flow_event(&TuryaEvent::ProviderState {
+            provider: "gemini".to_string(),
+            model: "gemini-flash-lite-latest".to_string(),
+            via: "stored-key".to_string(),
+        });
+        for i in 0..50 {
+            app.log_line(format!("transcript line {i}"));
+        }
+        // 80x10 forces every pane to its minimum: the exact shape class
+        // that panicked on chunk indices before.
+        let text = rendered(&app, 80, 10);
+        assert!(text.contains("gemini"), "top/status lost:\n{text}");
+        assert!(text.contains("transcript line 49"), "tail clipped:\n{text}");
+    }
+
+    #[test]
+    fn transcript_autoscrolls_to_bottom() {
+        let mut app = TuiApp::new();
+        for i in 0..200 {
+            app.log_line(format!("line {i:03}"));
+        }
+        let text = rendered(&app, 80, 15);
+        assert!(text.contains("line 199"), "newest line hidden:\n{text}");
+        assert!(!text.contains("line 000"), "viewport stuck at top:\n{text}");
+    }
+
+    #[test]
+    fn scroll_keys_lift_and_release_viewport() {
+        let mut app = TuiApp::new();
+        assert_eq!(app.scroll_lines_up, 0);
+        app.scroll_up();
+        assert_eq!(app.scroll_lines_up, 10);
+        app.scroll_down();
+        assert_eq!(app.scroll_lines_up, 0);
+        app.scroll_up();
+        app.scroll_to_bottom();
+        assert_eq!(app.scroll_lines_up, 0);
     }
 }

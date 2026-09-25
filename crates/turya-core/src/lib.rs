@@ -356,4 +356,184 @@ mod tests {
         assert!(saw_feedback);
         let _ = std::fs::remove_file(&target);
     }
+
+    /// Scripted provider for loop tests: serves one canned step-list per
+    /// `generate_turn` call and records the history it was given, so tests
+    /// can assert exactly what the engine fed back. (`MockProvider` replays
+    /// one script forever, which cannot model multi-pass turns.)
+    struct ScriptProvider {
+        scripts: Mutex<Vec<Vec<ProviderStep>>>,
+        seen_history: Mutex<Vec<Vec<String>>>,
+        fail_with: Option<String>,
+    }
+
+    impl ScriptProvider {
+        fn new(scripts: Vec<Vec<ProviderStep>>) -> Self {
+            Self {
+                scripts: Mutex::new(scripts),
+                seen_history: Mutex::new(Vec::new()),
+                fail_with: None,
+            }
+        }
+        fn failing(msg: &str) -> Self {
+            Self {
+                scripts: Mutex::new(Vec::new()),
+                seen_history: Mutex::new(Vec::new()),
+                fail_with: Some(msg.to_string()),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.seen_history.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptProvider {
+        async fn generate_turn(
+            &self,
+            _prompt: &str,
+            history: &[String],
+            tx: mpsc::Sender<ProviderStep>,
+        ) -> Result<(), String> {
+            self.seen_history.lock().unwrap().push(history.to_vec());
+            if let Some(e) = &self.fail_with {
+                return Err(e.clone());
+            }
+            let script = self.scripts.lock().unwrap().remove(0);
+            for step in script {
+                let _ = tx.send(step).await;
+            }
+            Ok(())
+        }
+    }
+
+    fn tool_call(id: &str, tool: &str, params: serde_json::Value) -> ProviderStep {
+        ProviderStep::CallTool(ToolCall {
+            call_id: id.to_string(),
+            tool_name: tool.to_string(),
+            parameters: params,
+        })
+    }
+
+    // run_bash shells out to `bash`, which only exists on Unix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_loop_feeds_tool_results_back_to_provider() {
+        let provider = Arc::new(ScriptProvider::new(vec![
+            vec![
+                tool_call(
+                    "c1",
+                    "run_bash",
+                    serde_json::json!({"command": "echo hello-loop"}),
+                ),
+                ProviderStep::Finish,
+            ],
+            vec![
+                ProviderStep::Token("done".to_string()),
+                ProviderStep::Finish,
+            ],
+        ]));
+        let tools = Arc::new(turya_tools::ToolRegistry::standard());
+        let engine = TuryaEngine::new(provider.clone(), tools, PermissionMode::Open);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (_perm_tx, perm_rx) = mpsc::channel(1);
+
+        engine
+            .run_turn("loop1", "do it", AgentMode::Build, event_tx, perm_rx)
+            .await;
+
+        let mut saw_done = false;
+        let mut completed = false;
+        let mut budget_hit = false;
+        while let Some(evt) = event_rx.recv().await {
+            match evt {
+                TuryaEvent::TokenDelta { chunk } if chunk == "done" => saw_done = true,
+                TuryaEvent::TurnCompleted { .. } => {
+                    completed = true;
+                    break;
+                }
+                TuryaEvent::Error { .. } => budget_hit = true,
+                _ => {}
+            }
+        }
+
+        assert!(saw_done, "follow-up text never streamed");
+        assert!(completed);
+        assert!(!budget_hit, "two-pass turn must not hit the budget");
+        assert_eq!(provider.calls(), 2);
+        let seen = provider.seen_history.lock().unwrap();
+        assert!(
+            seen[1].iter().any(|h| h.contains("hello-loop")),
+            "second call history missing tool output: {:?}",
+            seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loop_stops_at_model_call_budget() {
+        // A provider that never stops calling tools: 8 scripts, one per pass.
+        let scripts: Vec<Vec<ProviderStep>> = (0..8)
+            .map(|i| {
+                vec![
+                    tool_call(&format!("b{i}"), "nope_missing", serde_json::json!({})),
+                    ProviderStep::Finish,
+                ]
+            })
+            .collect();
+        let provider = Arc::new(ScriptProvider::new(scripts));
+        let tools = Arc::new(turya_tools::ToolRegistry::standard());
+        let engine = TuryaEngine::new(provider.clone(), tools, PermissionMode::Open);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let (_perm_tx, perm_rx) = mpsc::channel(1);
+
+        engine
+            .run_turn("loop2", "go", AgentMode::Build, event_tx, perm_rx)
+            .await;
+
+        let mut completed = false;
+        let mut budget_msg = false;
+        while let Some(evt) = event_rx.recv().await {
+            match evt {
+                TuryaEvent::TurnCompleted { .. } => {
+                    completed = true;
+                    break;
+                }
+                TuryaEvent::Error { message } if message.contains("budget") => budget_msg = true,
+                _ => {}
+            }
+        }
+
+        assert_eq!(provider.calls(), 8, "must stop after exactly 8 model calls");
+        assert!(budget_msg, "budget exhaustion must be visible");
+        assert!(completed, "turn must still complete");
+    }
+
+    #[tokio::test]
+    async fn test_provider_error_surfaces_and_ends_turn() {
+        let provider = Arc::new(ScriptProvider::failing("boom"));
+        let tools = Arc::new(turya_tools::ToolRegistry::standard());
+        let engine = TuryaEngine::new(provider, tools, PermissionMode::Open);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let (_perm_tx, perm_rx) = mpsc::channel(1);
+
+        engine
+            .run_turn("loop3", "go", AgentMode::Build, event_tx, perm_rx)
+            .await;
+
+        let mut saw_boom = false;
+        let mut failed_completion = false;
+        while let Some(evt) = event_rx.recv().await {
+            match evt {
+                TuryaEvent::Error { message } if message.contains("boom") => saw_boom = true,
+                TuryaEvent::TurnCompleted { success, .. } => {
+                    failed_completion = !success;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_boom, "provider error must surface as an event");
+        assert!(failed_completion, "turn must complete with success=false");
+    }
 }
