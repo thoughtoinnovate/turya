@@ -33,8 +33,10 @@ fn slot_label(state: &SlotState) -> String {
 /// `turya auth status`: one table, dual slots per provider.
 pub fn status(registry: &ProviderRegistry, store: &dyn CredentialStore) -> Result<(), String> {
     println!("{:<12} {:<12} oauth", "provider", "api-key");
+    let mut any_filled = false;
     for id in registry_ids(registry) {
         let st = auth_status(&id, &methods_for(&id), store);
+        any_filled |= st.is_authenticated();
         println!(
             "{:<12} {:<12} {}",
             id,
@@ -43,7 +45,57 @@ pub fn status(registry: &ProviderRegistry, store: &dyn CredentialStore) -> Resul
         );
         let _ = badge(&st.api_key);
     }
+    // Everything missing can mean "never logged in" OR "backend silently
+    // broken" — disambiguate with a live probe instead of guessing.
+    if !any_filled {
+        if let Some(warning) = backend_health(store) {
+            println!("⚠ {warning}");
+        }
+    }
     Ok(())
+}
+
+/// Probe whether the credential backend actually persists across processes.
+/// Returns `None` when healthy, else a human-readable warning. Uses a
+/// sentinel account (written + deleted) so no user data is touched.
+fn backend_health(store: &dyn CredentialStore) -> Option<String> {
+    const SENTINEL: &str = "__turya-healthcheck__";
+    if store.set(SENTINEL, "ok").is_err() {
+        return Some(
+            "credential backend is not writable here (keychain unavailable?). \
+             Export provider API keys as environment variables instead."
+                .to_string(),
+        );
+    }
+    let persisted = store.get(SENTINEL).as_deref() == Some("ok");
+    let _ = store.delete(SENTINEL);
+    if !persisted {
+        return Some(
+            "credential backend accepted a write but the entry is not readable \
+             back — logins will NOT stick in this environment (per-command dbus \
+             sessions, sudo/HOME mismatch, or transient keyring). Export provider \
+             API keys as environment variables instead."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Confirm a just-written secret reads back identically. Catches backends
+/// that accept writes but don't persist (the silent-login bug).
+fn confirm_persisted(
+    store: &dyn CredentialStore,
+    account: &str,
+    secret: &str,
+) -> Result<(), String> {
+    if store.get(account).as_deref() == Some(secret) {
+        return Ok(());
+    }
+    Err(format!(
+        "keychain accepted the write but '{account}' is not readable back — \
+         this backend does not persist across processes here. Nothing was \
+         relied upon: export the key as an environment variable instead."
+    ))
 }
 
 /// `turya auth logout`: forget one slot, or both when `method` is None.
@@ -102,6 +154,7 @@ pub async fn login(
             store
                 .set(&api_key_account(provider), &key)
                 .map_err(|e| e.to_string())?;
+            confirm_persisted(store, &api_key_account(provider), &key)?;
             println!("Stored {provider} API key.");
             Ok(())
         }
@@ -197,6 +250,7 @@ async fn login_oauth(
     store
         .set(&oauth_refresh_account(provider), &refresh)
         .map_err(|e| e.to_string())?;
+    confirm_persisted(store, &oauth_refresh_account(provider), &refresh)?;
     let _ = store.set(&oauth_client_id_account(provider), &client_id);
     println!("Connected {provider} via OAuth.");
     Ok(())
@@ -233,4 +287,64 @@ fn extract_code(line: &str) -> Result<String, String> {
 /// Default keychain store for CLI use.
 pub fn default_store() -> KeychainStore {
     KeychainStore::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turya_auth::MemStore;
+
+    /// Reproduces the silent-login bug: accepts writes, reads back nothing
+    /// (e.g. transient dbus session collections, sudo/HOME mismatch).
+    struct WriteOnlyStore;
+
+    impl CredentialStore for WriteOnlyStore {
+        fn get(&self, _account: &str) -> Option<String> {
+            None
+        }
+        fn set(&self, _account: &str, _secret: &str) -> Result<(), turya_auth::StoreError> {
+            Ok(())
+        }
+        fn delete(&self, _account: &str) -> Result<(), turya_auth::StoreError> {
+            Ok(())
+        }
+    }
+
+    struct BrokenStore;
+
+    impl CredentialStore for BrokenStore {
+        fn get(&self, _account: &str) -> Option<String> {
+            None
+        }
+        fn set(&self, _account: &str, _secret: &str) -> Result<(), turya_auth::StoreError> {
+            Err(turya_auth::StoreError::Backend("no backend".to_string()))
+        }
+        fn delete(&self, _account: &str) -> Result<(), turya_auth::StoreError> {
+            Err(turya_auth::StoreError::Backend("no backend".to_string()))
+        }
+    }
+
+    #[test]
+    fn confirm_persisted_catches_silent_backend() {
+        let healthy = MemStore::new();
+        assert!(confirm_persisted(&healthy, "gemini-api-key", "k").is_err());
+        healthy.set("gemini-api-key", "k").unwrap();
+        assert!(confirm_persisted(&healthy, "gemini-api-key", "k").is_ok());
+        // Wrong value also fails (not just missing).
+        assert!(confirm_persisted(&healthy, "gemini-api-key", "other").is_err());
+
+        // The reported bug: write "succeeds", read finds nothing.
+        let silent = WriteOnlyStore;
+        silent.set("gemini-api-key", "k").unwrap();
+        assert!(confirm_persisted(&silent, "gemini-api-key", "k").is_err());
+    }
+
+    #[test]
+    fn backend_health_distinguishes_failure_modes() {
+        assert!(backend_health(&MemStore::new()).is_none());
+        let broken = backend_health(&BrokenStore).expect("broken backend must warn");
+        assert!(broken.contains("not writable"));
+        let silent = backend_health(&WriteOnlyStore).expect("silent backend must warn");
+        assert!(silent.contains("not readable"));
+    }
 }
