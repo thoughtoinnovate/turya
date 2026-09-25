@@ -337,6 +337,27 @@ impl HostServices {
         }
     }
 
+    /// Resolve a model's window from the catalog and hand it to the engine.
+    /// Unknown stays unknown: the engine keeps its generous default rather
+    /// than compacting against a guessed number.
+    async fn apply_context_budget(&self, provider: &str, model: &str) {
+        // Catalog facts first (they carry the window); the plugin's static
+        // list is the fallback for the models it knows about.
+        let context_window = self
+            .catalog
+            .cached_models(provider)
+            .into_iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.context_window);
+        if let Some(ctx) = context_window {
+            // Reserve a slice for the reply. Bigger windows get a bigger
+            // reserve, because one turn can produce proportionally more.
+            let reserve = (ctx / 10).clamp(8_000, 64_000) as u32;
+            self.engine
+                .set_context_budget(ctx.min(u32::MAX as u64) as u32, reserve);
+        }
+    }
+
     async fn switch_model(
         &self,
         provider: Option<String>,
@@ -392,6 +413,10 @@ impl HostServices {
                 return;
             }
         };
+        // Hand the loop the new model's token budget as two plain integers.
+        // The kernel never learns a model id or a catalog concept (Rule 3.1),
+        // but it does need to know when a switch shrank the window.
+        self.apply_context_budget(&id, &model).await;
         match plugin.connect(creds, &model) {
             Ok(p) => {
                 self.engine.set_provider(p);

@@ -4,7 +4,9 @@ use crate::provider::{LlmProvider, ProviderStep};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
-use turya_protocol::{AgentMode, Part, PermissionDecision, PermissionMode, Transcript, TuryaEvent};
+use turya_protocol::{
+    AgentMode, ContextBudget, Part, PermissionDecision, PermissionMode, Transcript, TuryaEvent,
+};
 use turya_tools::ToolRegistry;
 
 /// Default per-turn budgets (see `TuryaEngine::set_budgets`). A turn ends at
@@ -51,6 +53,10 @@ pub struct TuryaEngine {
     /// (driven by `UpdateConfig` from the host). Interior mutability:
     /// the engine is shared as `Arc` across turns.
     budgets: RwLock<TurnBudgets>,
+    /// Token budget for the active model, as two plain integers. The host
+    /// builds this from catalog data; the kernel never sees `context_window`,
+    /// a model id, or anything else catalog-shaped (Rule 3.1).
+    context: RwLock<ContextBudget>,
 }
 
 impl TuryaEngine {
@@ -67,6 +73,7 @@ impl TuryaEngine {
             diagnostics_hook: None,
             session_id: "default".to_string(),
             budgets: RwLock::new(TurnBudgets::default()),
+            context: RwLock::new(ContextBudget::generous()),
         }
     }
 
@@ -87,6 +94,27 @@ impl TuryaEngine {
         if let Some(t) = tool_calls {
             b.tool_calls = t.max(1);
         }
+    }
+
+    /// Hand the loop the active model's token budget. The host calls this
+    /// when the model changes so the next turn (and any compaction check)
+    /// uses the new window rather than the old one.
+    pub fn set_context_budget(&self, total: u32, reserve: u32) {
+        *self.context.write().unwrap() = ContextBudget { total, reserve };
+    }
+
+    pub fn context_budget(&self) -> ContextBudget {
+        *self.context.read().unwrap()
+    }
+
+    /// Rough token estimate for the conversation, from the characters we
+    /// hold. Provider-reported usage is authoritative when available; this
+    /// is the floor, and it deliberately never claims precision.
+    pub fn estimate_tokens(text: &str) -> u32 {
+        // ~4 chars/token, and only counting real characters: CJK is closer to
+        // 1 per char, so this is a floor that errs low, not high.
+        let chars = text.chars().count();
+        ((chars / 4) as u32).max(1)
     }
 
     pub fn with_memory_hook(mut self, hook: Arc<dyn MemoryHook>) -> Self {

@@ -827,4 +827,33 @@ mod tests {
         assert!(saw_boom, "provider error must surface as an event");
         assert!(failed_completion, "turn must complete with success=false");
     }
+    #[test]
+    fn context_budget_is_two_plain_integers() {
+        // The kernel compares numbers; it never sees a model id or a catalog
+        // concept. That is the whole point of ContextBudget.
+        let engine = TuryaEngine::new(
+            Arc::new(MockProvider { responses: vec![] }),
+            Arc::new(turya_tools::ToolRegistry::standard()),
+            PermissionMode::Open,
+        );
+        assert_eq!(engine.context_budget().usable(), 180_000);
+        engine.set_context_budget(32_000, 4_000);
+        let b = engine.context_budget();
+        assert_eq!(b.total, 32_000);
+        assert_eq!(b.usable(), 28_000);
+        assert!(b.over(28_001));
+        assert!(!b.over(28_000));
+    }
+
+    #[test]
+    fn token_estimate_is_a_floor_not_a_claim() {
+        assert_eq!(TuryaEngine::estimate_tokens("abcd"), 1);
+        assert_eq!(TuryaEngine::estimate_tokens(&"a".repeat(400)), 100);
+        // Never zero for real content: an empty window would compact forever.
+        assert_eq!(TuryaEngine::estimate_tokens("x"), 1);
+        // Multi-byte text is counted in characters, so the estimate errs low
+        // rather than high for CJK.
+        let cjk = "\u{4f60}\u{597d}\u{4e16}\u{754c}";
+        assert_eq!(TuryaEngine::estimate_tokens(cjk), 1);
+    }
 }
