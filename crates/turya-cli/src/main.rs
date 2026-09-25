@@ -355,6 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         catalog,
         engine,
         config_path,
+        format!("{}/turya.db", turya_home_dir()),
     ));
     let host_sink = host_services::HostEventSink::new(event_tx);
     tokio::spawn(async move {

@@ -394,6 +394,13 @@ pub enum TuryaCommand {
         max_steps: Option<usize>,
         max_tool_calls: Option<u32>,
     },
+    /// Compact the session (`/compact`). `focus` is the user's optional
+    /// instruction, e.g. "focus on the auth bug fix".
+    Compact {
+        focus: Option<String>,
+    },
+    /// Ask for the context breakdown (`/context`).
+    ContextReport,
     /// List stored sessions, newest first (`turya sessions`, `/sessions`).
     ListSessions {
         /// Restrict to one working directory; `None` lists every session.
@@ -441,6 +448,18 @@ pub enum TuryaEvent {
     SessionResumed {
         session: Box<SessionMeta>,
         transcript: Transcript,
+    },
+    /// Compaction is starting (spinner + a note in the transcript).
+    CompactionStarted {
+        turns: usize,
+    },
+    /// Compaction finished. `summary` is shown in a dimmed row; the full
+    /// pre-compaction conversation stays in the session log and is
+    /// searchable, which is what makes compaction non-destructive.
+    CompactionCompleted {
+        before_turns: usize,
+        after_turns: usize,
+        summary: String,
     },
     TurnStarted {
         turn_id: String,

@@ -1,3 +1,4 @@
+pub mod context;
 pub mod engine;
 pub mod hooks;
 pub mod permissions;
@@ -5,6 +6,7 @@ pub mod plugins;
 pub mod provider;
 pub mod tasks;
 
+pub use context::{compacted, compaction_prompt, prune_transcript, tail_turns};
 pub use engine::TuryaEngine;
 pub use hooks::{DiagnosticsHook, FileDiagnostic, MemoryHook};
 pub use permissions::PermissionBroker;

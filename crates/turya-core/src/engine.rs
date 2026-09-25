@@ -18,6 +18,11 @@ const DEFAULT_TOOL_CALLS: u32 = 32;
 /// Tool outputs are truncated in history: one `cat` of a huge file must not
 /// blow the context window on every follow-up call.
 const MAX_TOOL_HISTORY_CHARS: usize = 2000;
+/// Compact once the estimate passes this percentage of the usable window.
+/// The margin absorbs a bad estimate and one more turn of output.
+const COMPACT_AT_PERCENT: u32 = 85;
+/// Give up auto-compacting after this many consecutive failures.
+const MAX_COMPACT_FAILURES: u32 = 3;
 
 /// Per-turn step budgets: model generations (cost/latency) and tool
 /// executions (side effects). One model response can emit many `CallTool`
@@ -57,6 +62,15 @@ pub struct TuryaEngine {
     /// builds this from catalog data; the kernel never sees `context_window`,
     /// a model id, or anything else catalog-shaped (Rule 3.1).
     context: RwLock<ContextBudget>,
+    /// Automatic compaction on the threshold (host-driven setting).
+    auto_compact: RwLock<bool>,
+    /// Set when a model switch shrank the window below the current estimate:
+    /// the next prompt compacts first.
+    deferred_compact: RwLock<bool>,
+    /// Consecutive compaction failures. Above the cap we stop trying this
+    /// session, because a session whose context is irrecoverably over the
+    /// limit otherwise retries forever.
+    compact_failures: RwLock<u32>,
 }
 
 impl TuryaEngine {
@@ -74,6 +88,9 @@ impl TuryaEngine {
             session_id: "default".to_string(),
             budgets: RwLock::new(TurnBudgets::default()),
             context: RwLock::new(ContextBudget::generous()),
+            auto_compact: RwLock::new(true),
+            deferred_compact: RwLock::new(false),
+            compact_failures: RwLock::new(0),
         }
     }
 
@@ -100,11 +117,218 @@ impl TuryaEngine {
     /// when the model changes so the next turn (and any compaction check)
     /// uses the new window rather than the old one.
     pub fn set_context_budget(&self, total: u32, reserve: u32) {
-        *self.context.write().unwrap() = ContextBudget { total, reserve };
+        let next = ContextBudget { total, reserve };
+        // A switch to a smaller window can put the existing conversation over
+        // the limit. Record that and let the next prompt compact first, so a
+        // switch never guarantees an overflow on the very next request.
+        if next.total > 0 && next.total < self.context.read().unwrap().total {
+            *self.deferred_compact.write().unwrap() = true;
+        }
+        *self.context.write().unwrap() = next;
+    }
+
+    /// The stored conversation, as the next turn would see it. Used by
+    /// `/context` so the report describes the real thing, not a guess.
+    pub async fn stored_transcript(&self) -> Transcript {
+        match self.memory_hook {
+            Some(ref hook) => {
+                let prior = hook
+                    .load_transcript(&self.session_id)
+                    .await
+                    .unwrap_or_default();
+                let mut t = Transcript::new(&self.session_id);
+                t.turns = prior;
+                t
+            }
+            None => Transcript::new(&self.session_id),
+        }
+    }
+
+    /// Host-driven setting: automatic compaction on the threshold.
+    pub fn set_auto_compact(&self, enabled: bool) {
+        *self.auto_compact.write().unwrap() = enabled;
+    }
+
+    /// True when the next prompt must compact first (a window shrank under us).
+    pub fn needs_deferred_compact(&self) -> bool {
+        *self.deferred_compact.read().unwrap()
+    }
+
+    pub fn clear_deferred_compact(&self) {
+        *self.deferred_compact.write().unwrap() = false;
     }
 
     pub fn context_budget(&self) -> ContextBudget {
         *self.context.read().unwrap()
+    }
+
+    /// Compact before a turn when the threshold or a shrunken window demands
+    /// it. Returns the transcript to run with (unchanged on failure), and
+    /// records the outcome so a failing compactor stops retrying.
+    async fn maybe_compact(
+        &self,
+        transcript: Transcript,
+        event_tx: &mpsc::Sender<TuryaEvent>,
+    ) -> Transcript {
+        if transcript.turns.is_empty() {
+            return transcript;
+        }
+        if *self.compact_failures.read().unwrap() >= MAX_COMPACT_FAILURES {
+            return transcript;
+        }
+        let forced = *self.deferred_compact.read().unwrap();
+        if !forced && !self.should_compact(&transcript) {
+            return transcript;
+        }
+        match self.compact(None, event_tx).await {
+            Ok((next, _)) => {
+                *self.compact_failures.write().unwrap() = 0;
+                *self.deferred_compact.write().unwrap() = false;
+                // The compacted view is what this turn runs on. The store
+                // still holds everything, so nothing is lost.
+                self.persist_compacted(&next).await;
+                next
+            }
+            Err(e) => {
+                // Scope the guards: a std RwLock guard held across an await
+                // makes the whole future non-Send, and the turn is spawned.
+                let failures = {
+                    let mut n = self.compact_failures.write().unwrap();
+                    *n += 1;
+                    *n
+                };
+                *self.deferred_compact.write().unwrap() = false;
+                let _ = event_tx
+                    .send(TuryaEvent::Error {
+                        message: format!(
+                            "compaction skipped ({e}); {failures} consecutive failure(s), \
+                             giving up after {MAX_COMPACT_FAILURES}"
+                        ),
+                    })
+                    .await;
+                transcript
+            }
+        }
+    }
+
+    /// Record a compaction marker so the stored log explains the jump, and the
+    /// pre-compaction turns stay searchable underneath it.
+    async fn persist_compacted(&self, next: &Transcript) {
+        let Some(hook) = &self.memory_hook else {
+            return;
+        };
+        if let Some(turn) = next.turns.first() {
+            let _ = hook.append_turn(&self.session_id, turn).await;
+        }
+    }
+
+    /// Compact the session transcript. `focus` is the user's optional
+    /// instruction ("focus on the auth fix"); `None` is the automatic pass.
+    ///
+    /// Prunes old tool output first (cheapest win), then asks the model for a
+    /// structured summary with tools structurally dropped, then keeps the last
+    /// two turns verbatim so exact values survive. Returns the new transcript
+    /// and a short note describing what was kept, or `None` when the
+    /// conversation is too short to be worth compacting.
+    pub async fn compact(
+        &self,
+        focus: Option<&str>,
+        event_tx: &mpsc::Sender<TuryaEvent>,
+    ) -> Result<(Transcript, String), String> {
+        let mut transcript = match self.memory_hook {
+            Some(ref hook) => {
+                let prior = hook.load_transcript(&self.session_id).await?;
+                let mut t = Transcript::new(&self.session_id);
+                t.turns = prior;
+                t
+            }
+            None => return Err("no session store: nothing to compact".to_string()),
+        };
+        if transcript.turns.len() < 3 {
+            return Err("nothing to compact yet (need at least 3 turns)".to_string());
+        }
+        let before = transcript.turns.len();
+        let _ = event_tx
+            .send(TuryaEvent::CompactionStarted { turns: before })
+            .await;
+
+        let pruned = crate::context::prune_transcript(&mut transcript);
+        let tail = crate::context::tail_turns(&transcript);
+
+        // One summarising pass, tools dropped. A failure here is not fatal:
+        // the caller keeps the pruned transcript, which is still smaller.
+        let summary = self
+            .summarize(&transcript, focus, event_tx)
+            .await
+            .unwrap_or_else(|_| {
+                format!("Automatic summary unavailable; {pruned} older tool results were pruned.")
+            });
+
+        let marker = format!(
+            "{before} turns -> summary + last {} ({} tool results pruned)",
+            tail.len(),
+            pruned
+        );
+        let next = crate::context::compacted(&self.session_id, &summary, &tail, &marker);
+        let _ = event_tx
+            .send(TuryaEvent::CompactionCompleted {
+                before_turns: before,
+                after_turns: next.turns.len(),
+                summary,
+            })
+            .await;
+        Ok((next, marker))
+    }
+
+    /// One text-only pass that produces a compaction summary. Tool calls are
+    /// announced as denied and never executed, so this cannot act.
+    async fn summarize(
+        &self,
+        transcript: &Transcript,
+        focus: Option<&str>,
+        event_tx: &mpsc::Sender<TuryaEvent>,
+    ) -> Result<String, String> {
+        let mut probe = transcript.clone();
+        probe.push(Part::Instruction {
+            text: crate::context::compaction_prompt(focus),
+        });
+        let (step_tx, mut step_rx) = mpsc::channel(32);
+        let provider = self.provider.read().unwrap().clone();
+        let handle = tokio::spawn(async move { provider.generate_turn(&probe, step_tx).await });
+        let mut out = String::new();
+        while let Some(step) = step_rx.recv().await {
+            match step {
+                ProviderStep::Token(chunk) => out.push_str(&chunk),
+                // Structural: a tool call during compaction is dropped, not run.
+                ProviderStep::CallTool(_) => {
+                    let _ = event_tx
+                        .send(TuryaEvent::Error {
+                            message: "compaction summary attempted a tool call; ignored"
+                                .to_string(),
+                        })
+                        .await;
+                }
+                ProviderStep::Finish => break,
+            }
+        }
+        match handle.await {
+            Ok(Ok(())) if !out.trim().is_empty() => Ok(out),
+            Ok(Ok(())) => Err("model returned an empty summary".to_string()),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(format!("compaction task failed: {e}")),
+        }
+    }
+
+    /// Would a compaction run right now? The threshold is a fraction of the
+    /// usable window, so a bigger model compacts later in absolute terms.
+    pub fn should_compact(&self, transcript: &Transcript) -> bool {
+        let budget = self.context_budget();
+        if !*self.auto_compact.read().unwrap() {
+            return false;
+        }
+        let estimate = crate::context::estimate_transcript_tokens(transcript);
+        // Never on the first turns: a young session is not a context problem.
+        transcript.turns.len() >= 3 && budget.over(estimate * 100 / COMPACT_AT_PERCENT)
     }
 
     /// Rough token estimate for the conversation, from the characters we
@@ -168,7 +392,7 @@ impl TuryaEngine {
         // the model actually remembers earlier turns. Without it the turn
         // starts from nothing, which is correct for a first turn and wrong
         // for every one after it.
-        let mut transcript = match self.memory_hook {
+        let transcript = match self.memory_hook {
             Some(ref hook) => {
                 let prior = hook
                     .load_transcript(&self.session_id)
@@ -180,6 +404,9 @@ impl TuryaEngine {
             }
             None => Transcript::new(&self.session_id),
         };
+        // Compaction happens *before* the new user turn is recorded, so the
+        // summary covers the history and not the question being asked.
+        let mut transcript = self.maybe_compact(transcript, &event_tx).await;
         transcript.start_turn(turn_id);
         // The user's turn is recorded here, once. Providers serialize the
         // transcript as-is; there is no separate prompt to append.

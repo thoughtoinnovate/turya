@@ -228,3 +228,88 @@ async fn live_reads_a_real_file_and_writes_one_back() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn live_compaction_preserves_a_fact_from_earlier() {
+    require_live!();
+    let creds = match live_credentials().await {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no live credential available");
+            return;
+        }
+    };
+    // The real eval gate: plant a fact, bury it, compact with a real model,
+    // then ask. Only a genuine summary can answer this.
+    let store = Arc::new(turya_memory::MemoryStore::open_in_memory().unwrap());
+    let session = "live-compact";
+    turya_core::MemoryHook::begin_session(store.as_ref(), session, "/repo", "compact probe")
+        .await
+        .unwrap();
+    let engine = Arc::new(
+        TuryaEngine::new(
+            LiveProvider::build(&creds),
+            Arc::new(ToolRegistry::standard()),
+            PermissionMode::Open,
+        )
+        .with_memory_hook(store.clone())
+        .with_session_id(session),
+    );
+    let mut app = TuiApp::new();
+
+    // Enough turns that compaction is meaningful.
+    for i in 1..=4 {
+        let (text, ok) = run_turn(
+            engine.clone(),
+            &format!(
+                "Turn {i}: say the single word ACK{i} and nothing else. \
+                 The gateway token is ZEBRAFISH-9931."
+            ),
+            &mut app,
+        )
+        .await;
+        assert!(ok, "turn {i} failed:\n{text}");
+    }
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+    let (compacted_view, marker) = engine
+        .compact(Some("preserve identifiers exactly"), &event_tx)
+        .await
+        .expect("compaction runs against a live model");
+    eprintln!("compaction marker: {marker}");
+    // Drop the sender before draining: recv() would otherwise never return
+    // None while this test still holds it.
+    drop(event_tx);
+    while event_rx.recv().await.is_some() {}
+    assert!(
+        compacted_view.turns.len() < 5,
+        "the compacted view must be smaller: {}",
+        compacted_view.turns.len()
+    );
+    let summary = compacted_view.turns[0]
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            turya_protocol::Part::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<String>();
+    eprintln!("--- summary ---\n{summary}\n---");
+    assert!(
+        summary.contains("## Objective"),
+        "the summary must follow the requested shape:\n{summary}"
+    );
+
+    // Now the question that matters.
+    let (answer, ok) = run_turn(
+        engine.clone(),
+        "What was the gateway token? Reply with just the token.",
+        &mut app,
+    )
+    .await;
+    assert!(ok, "post-compaction turn failed:\n{answer}");
+    assert!(
+        answer.to_uppercase().contains("ZEBRAFISH-9931"),
+        "the token must survive a real compaction:\n{answer}\n(summary was: {summary})"
+    );
+}

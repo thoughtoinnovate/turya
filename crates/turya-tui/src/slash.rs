@@ -100,6 +100,27 @@ impl SlashRegistry {
                 kind: CommandKind::Local,
                 source: CommandSource::Builtin,
             },
+            SlashCommand {
+                name: "compact",
+                description: "Summarize older turns to free context: /compact [focus]",
+                hint: "focus on the auth bug",
+                kind: CommandKind::Local,
+                source: CommandSource::Builtin,
+            },
+            SlashCommand {
+                name: "context",
+                description: "Show context usage against the model window",
+                hint: "",
+                kind: CommandKind::Local,
+                source: CommandSource::Builtin,
+            },
+            SlashCommand {
+                name: "sessions",
+                description: "List stored sessions: /sessions [id] to resume",
+                hint: "s-1730000000-1234",
+                kind: CommandKind::Local,
+                source: CommandSource::Builtin,
+            },
         ] {
             reg.register(cmd);
         }
@@ -161,17 +182,25 @@ impl Completer {
 
 /// Build popup rows (`❯` marks the selection, clamped). Pure: the draw
 /// code maps these to `Line`s, keeping render logic unit-testable.
+/// How many rows the command popup shows before it scrolls.
+pub const POPUP_ROWS: usize = 7;
+
 pub fn popup_rows(matches: &[&SlashCommand], selected: usize) -> Vec<String> {
     if matches.is_empty() {
         return vec![];
     }
     let sel = selected.min(matches.len() - 1);
+    // Window the list so the selection is always visible. Without this, a
+    // selection past the viewport rendered *no* selected row at all, which is
+    // how a 10-command list silently broke arrow navigation.
+    let start = sel.saturating_sub(POPUP_ROWS - 1);
     matches
         .iter()
-        .take(7)
+        .skip(start)
+        .take(POPUP_ROWS)
         .enumerate()
         .map(|(i, c)| {
-            let marker = if i == sel { "❯" } else { " " };
+            let marker = if i + start == sel { "❯" } else { " " };
             format!("{marker} /{} — {}", c.name, c.description)
         })
         .collect()
@@ -208,7 +237,7 @@ mod tests {
     #[test]
     fn builtins_registered_once() {
         let reg = registry();
-        assert_eq!(reg.filter("").len(), 7);
+        assert_eq!(reg.filter("").len(), 10);
         let mut dup = registry();
         dup.register(SlashCommand {
             name: "models",
@@ -217,7 +246,7 @@ mod tests {
             kind: CommandKind::Local,
             source: CommandSource::Plugin,
         });
-        assert_eq!(dup.filter("").len(), 7);
+        assert_eq!(dup.filter("").len(), 10);
         assert_eq!(
             dup.get("models").unwrap().description,
             "Browse providers & switch model"
@@ -232,7 +261,10 @@ mod tests {
         let all: Vec<_> = reg.filter("").iter().map(|c| c.name).collect();
         assert_eq!(
             all,
-            vec!["auth", "clear", "efforts", "help", "models", "steps", "thinking"]
+            vec![
+                "auth", "clear", "compact", "context", "efforts", "help", "models", "sessions",
+                "steps", "thinking"
+            ]
         );
         let ci: Vec<_> = reg.filter("MO").iter().map(|c| c.name).collect();
         assert_eq!(ci, vec!["models"]);
@@ -263,7 +295,7 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "auth");
         // Bare slash lists everything.
-        assert_eq!(c.matches("/", &reg).len(), 7);
+        assert_eq!(c.matches("/", &reg).len(), 10);
     }
 
     #[test]
@@ -276,9 +308,16 @@ mod tests {
         // Out-of-range selection clamps to last row.
         let all = c.matches("/", &reg);
         let rows = popup_rows(&all, 99);
-        assert_eq!(rows.len(), 7);
-        assert!(rows[6].starts_with("❯"));
+        // The popup is a fixed-height viewport: it shows a window of the
+        // matches, not all of them, and clamps the selection to the last row.
+        assert!(rows.len() <= POPUP_ROWS, "viewport is bounded");
+        assert_eq!(rows.len(), all.len().min(POPUP_ROWS));
+        // The window scrolled to the clamped selection, and it is marked.
+        assert!(rows.last().unwrap().starts_with("❯"), "rows: {rows:?}");
         assert!(rows[0].starts_with("  "));
+        // Every command stays reachable by arrowing down.
+        let mid = popup_rows(&all, 3);
+        assert!(mid[3].starts_with("❯"), "rows: {mid:?}");
         assert!(popup_rows(&[], 0).is_empty());
     }
 

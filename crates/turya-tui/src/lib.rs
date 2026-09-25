@@ -649,6 +649,35 @@ impl TuiApp {
                         if self.show_thinking { "on" } else { "off" }
                     ));
                 }
+                "compact" => {
+                    // `/compact [focus...]`: summarise older turns. The focus
+                    // text rides along as the summariser's instruction, which
+                    // is more useful than our own guess at what matters.
+                    let focus = args.trim();
+                    let _ = cmd_tx
+                        .send(TuryaCommand::Compact {
+                            focus: (!focus.is_empty()).then(|| focus.to_string()),
+                        })
+                        .await;
+                }
+                "context" => {
+                    let _ = cmd_tx.send(TuryaCommand::ContextReport).await;
+                }
+                "sessions" => {
+                    let id = args.trim();
+                    if id.is_empty() {
+                        let _ = cmd_tx
+                            .send(TuryaCommand::ListSessions {
+                                cwd: None,
+                                limit: Some(20),
+                            })
+                            .await;
+                    } else {
+                        let _ = cmd_tx
+                            .send(TuryaCommand::ResumeSession { id: id.to_string() })
+                            .await;
+                    }
+                }
                 "steps" => {
                     // `/steps [model_calls] [tool_calls]`: per-turn budgets.
                     // Bare `/steps` reports the convention (engine owns truth;
@@ -1036,6 +1065,43 @@ impl TuiApp {
                 request_id, action, ..
             } => {
                 self.pending_permission = Some((request_id.clone(), action.clone()));
+            }
+            TuryaEvent::CompactionStarted { turns } => {
+                // Reuse the live spinner: a compaction is real work and the
+                // user must not watch a frozen screen.
+                self.turn_active = true;
+                self.log_dim(format!("── compacting {turns} turns… ──"));
+            }
+            TuryaEvent::CompactionCompleted {
+                before_turns,
+                after_turns,
+                summary,
+            } => {
+                self.turn_active = false;
+                self.log_dim(format!(
+                    "── compacted {before_turns} turns → {after_turns} (full history still searchable) ──"
+                ));
+                self.push_block(summary.trim(), false);
+            }
+            TuryaEvent::SessionsListed { sessions } => {
+                if sessions.is_empty() {
+                    self.log_dim("ℹ no stored sessions yet".to_string());
+                } else {
+                    for s in sessions {
+                        let mark = if s.repaired { " *" } else { "" };
+                        self.log_dim(format!(
+                            "{} · {} turn(s) · {}{mark}   (/sessions {} to resume)",
+                            s.id, s.seq, s.updated_at, s.title
+                        ));
+                    }
+                }
+            }
+            TuryaEvent::SessionResumed {
+                session,
+                transcript,
+            } => {
+                self.log_dim(format!("── resumed {} ──", session.id));
+                self.load_transcript(transcript);
             }
             TuryaEvent::TurnStarted { .. } => {
                 // Progress indicator on: spinner runs until the turn settles.

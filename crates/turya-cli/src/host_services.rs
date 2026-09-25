@@ -69,6 +69,9 @@ pub struct HostServices {
     catalog: turya_catalog::Catalog,
     engine: Arc<TuryaEngine>,
     config_path: String,
+    /// Session database path. The host owns session reads/writes so the
+    /// kernel never learns a file path (Rule 3.1).
+    db_path: String,
     flows: Mutex<HashMap<String, PendingFlow>>,
     flow_seq: Mutex<u64>,
 }
@@ -80,6 +83,7 @@ impl HostServices {
         catalog: turya_catalog::Catalog,
         engine: Arc<TuryaEngine>,
         config_path: String,
+        db_path: String,
     ) -> Self {
         Self {
             registry,
@@ -87,6 +91,7 @@ impl HostServices {
             catalog,
             engine,
             config_path,
+            db_path,
             flows: Mutex::new(HashMap::new()),
             flow_seq: Mutex::new(0),
         }
@@ -220,6 +225,42 @@ impl HostServices {
     /// forward unconsumed commands to the session proxy afterwards.
     pub async fn handle(&self, cmd: &TuryaCommand, events: &HostEventSink) -> bool {
         match cmd {
+            // Compaction and context live here, not in the server: the host
+            // owns the session store, the kernel owns the policy.
+            TuryaCommand::Compact { focus } => {
+                // Events go through the caller's sink, so the client that
+                // asked for the compaction is the one that sees it.
+                match self.engine.compact(focus.as_deref(), events.sender()).await {
+                    Ok((_, marker)) => {
+                        events
+                            .send(TuryaEvent::TokenDelta {
+                                chunk: format!("\n{marker}\n"),
+                            })
+                            .await
+                    }
+                    Err(e) => events.send(TuryaEvent::Error { message: e }).await,
+                }
+                true
+            }
+            TuryaCommand::ContextReport => {
+                let report = self.context_report().await;
+                events.send(TuryaEvent::TokenDelta { chunk: report }).await;
+                true
+            }
+            TuryaCommand::ListSessions { cwd, limit } => {
+                let sessions = self
+                    .list_sessions(cwd.as_deref(), limit.unwrap_or(20))
+                    .await;
+                events.send(TuryaEvent::SessionsListed { sessions }).await;
+                true
+            }
+            TuryaCommand::ResumeSession { id } => {
+                match self.resume_session(id).await {
+                    Ok(ev) => events.send(ev).await,
+                    Err(e) => events.send(TuryaEvent::Error { message: e }).await,
+                }
+                true
+            }
             TuryaCommand::ListProviders => {
                 // Auth gate: metadata refresh only when at least one provider
                 // is authenticated — locked setups never phone home.
@@ -356,6 +397,82 @@ impl HostServices {
             self.engine
                 .set_context_budget(ctx.min(u32::MAX as u64) as u32, reserve);
         }
+    }
+
+    /// Session listing, scoped to a working directory when asked. The store
+    /// is the only source; the kernel holds no session index.
+    async fn list_sessions(
+        &self,
+        cwd: Option<&str>,
+        limit: usize,
+    ) -> Vec<turya_protocol::SessionMeta> {
+        let Ok(store) = self.session_store() else {
+            return Vec::new();
+        };
+        // Fully qualified: the store also has a synchronous inherent method
+        // of the same name, and the trait one is the async seam.
+        use turya_core::MemoryHook;
+        MemoryHook::list_sessions(store.as_ref(), cwd, limit)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Turya: cannot list sessions: {e}");
+                Vec::new()
+            })
+    }
+
+    /// Replay one session into the client.
+    async fn resume_session(&self, id: &str) -> Result<TuryaEvent, String> {
+        let store = self.session_store()?;
+        use turya_core::MemoryHook;
+        let session = MemoryHook::session_meta(store.as_ref(), id)
+            .await?
+            .ok_or_else(|| format!("no session with id '{id}' (try /sessions)"))?;
+        let turns = MemoryHook::load_transcript(store.as_ref(), id).await?;
+        Ok(TuryaEvent::SessionResumed {
+            session: Box::new(session),
+            transcript: turya_protocol::Transcript {
+                session_id: id.to_string(),
+                turns,
+            },
+        })
+    }
+
+    /// Open the session store for host-side session work.
+    fn session_store(&self) -> Result<Arc<turya_memory::MemoryStore>, String> {
+        turya_memory::MemoryStore::open(&self.db_path)
+            .map(|(store, note)| {
+                if let Some(note) = note {
+                    eprintln!("Turya: {note}");
+                }
+                Arc::new(store)
+            })
+            .map_err(|e| format!("cannot open the session store: {e}"))
+    }
+
+    /// Human-readable context breakdown for `/context`. Every number is an
+    /// estimate and says so; provider-reported usage is authoritative when
+    /// the provider gives us any.
+    async fn context_report(&self) -> String {
+        let budget = self.engine.context_budget();
+        let stored = self.engine.stored_transcript().await;
+        let tokens = turya_core::context::estimate_transcript_tokens(&stored);
+        let turns = stored.turns.len();
+        let usable = budget.usable();
+        let pct = if usable == 0 {
+            0
+        } else {
+            tokens
+                .saturating_mul(100)
+                .checked_div(usable)
+                .unwrap_or(0)
+                .min(999)
+        };
+        format!(
+            "context ≈{tokens} of {usable} usable tokens ({pct}%) across {turns} turn(s)\n\
+             model window {} tokens, reserve {} for the reply\n\
+             estimates are ~4 chars/token (lower bound); CJK and images count more",
+            budget.total, budget.reserve
+        )
     }
 
     async fn switch_model(
@@ -895,6 +1012,11 @@ impl HostEventSink {
     pub async fn send(&self, event: TuryaEvent) {
         let _ = self.tx.send(event).await;
     }
+
+    /// The channel itself, for engine calls that emit progress events.
+    pub fn sender(&self) -> &mpsc::Sender<TuryaEvent> {
+        &self.tx
+    }
 }
 
 #[cfg(test)]
@@ -946,6 +1068,7 @@ mod tests {
             catalog,
             engine,
             "/tmp/turya-host-router-test-config.toml".to_string(),
+            "/tmp/turya-host-router-test.db".to_string(),
         );
         (host, tx, rx)
     }
@@ -1093,6 +1216,10 @@ mod tests {
             catalog,
             engine,
             config_path.to_string_lossy().to_string(),
+            config_path
+                .with_extension("db")
+                .to_string_lossy()
+                .to_string(),
         );
         let sink = HostEventSink::new(tx);
         let consumed = host
