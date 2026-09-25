@@ -379,6 +379,14 @@ pub enum TuryaCommand {
         /// Files handed to the model. Required vec: empty means none.
         attachments: Vec<Attachment>,
     },
+    /// Enqueue work to run after the current turn finishes. The prompt is
+    /// not seen by the running agent: queueing is for follow-ups you want
+    /// answered in order, not for changing its mind.
+    QueuePrompt {
+        prompt: String,
+    },
+    /// Clear the pending queue.
+    ClearQueue,
     ResolvePermission {
         request_id: String,
         decision: PermissionDecision,
@@ -448,6 +456,11 @@ pub enum TuryaEvent {
     SessionResumed {
         session: Box<SessionMeta>,
         transcript: Transcript,
+    },
+    /// Queue state, emitted whenever it changes so a client can show a
+    /// count without tracking commands itself.
+    QueueChanged {
+        pending: usize,
     },
     /// Compaction is starting (spinner + a note in the transcript).
     CompactionStarted {

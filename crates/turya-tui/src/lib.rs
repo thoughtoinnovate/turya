@@ -341,6 +341,8 @@ pub struct TuiApp {
     persist_history: bool,
     /// Optional background tints; off unless the user opts in.
     tints: Tints,
+    /// Prompts waiting for the current turn to finish (`/queue`).
+    queued: usize,
     /// `auto` (default) | `on` | `off`, from `/settings mouse`.
     mouse: Option<String>,
     /// Render assistant prose as markdown. On by default; the stored
@@ -401,6 +403,7 @@ impl TuiApp {
             persist_history: false,
             tints: Tints::default(),
             mouse: Some("auto".to_string()),
+            queued: 0,
             render_markdown: true,
             streaming: String::new(),
             stream_start: None,
@@ -873,8 +876,16 @@ impl TuiApp {
     /// Token counts are char-based estimates (≈), clearly marked — true
     /// provider usage blocks are a follow-up.
     fn status_line(&self) -> String {
+        // The queue count lives in the status bar, not the transcript: it is
+        // state about the session, not a message, and it must be visible
+        // while scrolling back through history.
+        let queue = if self.queued == 0 {
+            String::new()
+        } else {
+            format!(" ⏳{}", self.queued)
+        };
         format!(
-            " ↑{} ↓{}≈tok │ think:{} │ Build · Review-for-me",
+            " ↑{} ↓{}≈tok{queue} │ think:{} │ Build · Review-for-me",
             Self::fmt_tokens(self.sent_chars),
             Self::fmt_tokens(self.recv_chars),
             if self.show_thinking { "on" } else { "off" },
@@ -953,6 +964,34 @@ impl TuiApp {
                     }
                     "context" => {
                         let _ = cmd_tx.send(TuryaCommand::ContextReport).await;
+                    }
+                    "queue" => {
+                        // `/queue <prompt>` sends the prompt to run after the
+                        // current turn. It never interrupts: to change a running
+                        // turn's mind, press Esc and rephrase.
+                        let prompt = args.trim();
+                        if prompt.is_empty() {
+                            if self.queued == 0 {
+                                self.log_dim("ℹ nothing queued".to_string());
+                            } else {
+                                self.log_dim(format!(
+                                    "⏳ {} prompt(s) queued; they run as the current turn finishes",
+                                    self.queued
+                                ));
+                            }
+                            return;
+                        }
+                        if prompt.eq_ignore_ascii_case("clear") {
+                            let _ = cmd_tx.send(TuryaCommand::ClearQueue).await;
+                            self.log_dim("→ queue cleared".to_string());
+                            return;
+                        }
+                        let _ = cmd_tx
+                            .send(TuryaCommand::QueuePrompt {
+                                prompt: prompt.to_string(),
+                            })
+                            .await;
+                        self.log_dim(format!("⏳ queued: {prompt}"));
                     }
                     "settings" => {
                         // `/settings` alone shows the current values; with a key it
@@ -1431,6 +1470,11 @@ impl TuiApp {
                 request_id, action, ..
             } => {
                 self.pending_permission = Some((request_id.clone(), action.clone()));
+            }
+            TuryaEvent::QueueChanged { pending } => {
+                // Count only: the running turn must not be interrupted by a
+                // follow-up the user typed while it worked.
+                self.queued = *pending;
             }
             TuryaEvent::CompactionStarted { turns } => {
                 // Reuse the live spinner: a compaction is real work and the
@@ -2906,5 +2950,49 @@ mod tests {
         let out = render_markdown("```rust\nfn main() {\n    let x = 1;", &Tints::default());
         assert!(!out.is_empty(), "something always renders");
         assert!(out.iter().any(|l| l.contains("fn main")));
+    }
+    #[tokio::test]
+    async fn queue_command_enqueues_without_interrupting() {
+        let mut app = TuiApp::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.dispatch_slash("queue", "then run the tests", &tx).await;
+        match rx.recv().await.expect("a command") {
+            TuryaCommand::QueuePrompt { prompt } => assert_eq!(prompt, "then run the tests"),
+            other => panic!("expected QueuePrompt, got {other:?}"),
+        }
+        assert!(
+            app.transcript_text().contains("queued"),
+            "{:?}",
+            app.transcript_text()
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_clear_empties_the_queue() {
+        let mut app = TuiApp::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.dispatch_slash("queue", "clear", &tx).await;
+        assert!(matches!(rx.recv().await, Some(TuryaCommand::ClearQueue)));
+    }
+
+    #[tokio::test]
+    async fn bare_queue_reports_and_sends_nothing() {
+        let mut app = TuiApp::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.dispatch_slash("queue", "", &tx).await;
+        assert!(rx.try_recv().is_err(), "a report must not enqueue");
+        assert!(app.transcript_text().contains("nothing queued"));
+        app.feed_flow_event(&TuryaEvent::QueueChanged { pending: 2 });
+        app.dispatch_slash("queue", "", &tx).await;
+        assert!(app.transcript_text().contains("2 prompt(s) queued"));
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_queue_depth() {
+        let mut app = TuiApp::new();
+        assert!(!app.status_line().contains('⏳'), "no count when empty");
+        app.feed_flow_event(&TuryaEvent::QueueChanged { pending: 3 });
+        let line = app.status_line();
+        assert!(line.contains("⏳3"), "{line}");
     }
 }

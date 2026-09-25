@@ -115,6 +115,13 @@ impl SlashRegistry {
                 source: CommandSource::Builtin,
             },
             SlashCommand {
+                name: "queue",
+                description: "Queue a follow-up to run after the current turn",
+                hint: "then run the tests",
+                kind: CommandKind::Local,
+                source: CommandSource::Builtin,
+            },
+            SlashCommand {
                 name: "settings",
                 description: "Show and change settings: /settings [key value]",
                 hint: "user_bg #1b2735",
@@ -244,7 +251,7 @@ mod tests {
     #[test]
     fn builtins_registered_once() {
         let reg = registry();
-        assert_eq!(reg.filter("").len(), 11);
+        assert_eq!(reg.filter("").len(), 12);
         let mut dup = registry();
         dup.register(SlashCommand {
             name: "models",
@@ -253,7 +260,7 @@ mod tests {
             kind: CommandKind::Local,
             source: CommandSource::Plugin,
         });
-        assert_eq!(dup.filter("").len(), 11);
+        assert_eq!(dup.filter("").len(), 12);
         assert_eq!(
             dup.get("models").unwrap().description,
             "Browse providers & switch model"
@@ -269,8 +276,8 @@ mod tests {
         assert_eq!(
             all,
             vec![
-                "auth", "clear", "compact", "context", "efforts", "help", "models", "sessions",
-                "settings", "steps", "thinking"
+                "auth", "clear", "compact", "context", "efforts", "help", "models", "queue",
+                "sessions", "settings", "steps", "thinking"
             ]
         );
         let ci: Vec<_> = reg.filter("MO").iter().map(|c| c.name).collect();
@@ -302,7 +309,7 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "auth");
         // Bare slash lists everything.
-        assert_eq!(c.matches("/", &reg).len(), 11);
+        assert_eq!(c.matches("/", &reg).len(), 12);
     }
 
     #[test]
