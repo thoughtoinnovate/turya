@@ -10,7 +10,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
-    Terminal,
+    Frame, Terminal,
 };
 use std::io::stdout;
 use tokio::sync::mpsc;
@@ -421,6 +421,137 @@ impl TuiApp {
             _ => {}
         }
     }
+    /// Render one full frame. Split out of `run()` so headless tests can
+    /// drive the REAL draw path with ratatui's `TestBackend`.
+    fn render(&self, f: &mut Frame) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Header
+                Constraint::Min(5),    // Content & Streamed Text
+                Constraint::Length(5), // Tool Activity Log
+                Constraint::Length(3), // Input Box / Permission Prompt
+            ])
+            .split(f.area());
+
+        // 1. Header
+        let header = Paragraph::new(format!(
+            " Turya v{} | Mode: Build | Security: Review-for-me",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(Block::default().borders(Borders::ALL).title("Status"));
+        f.render_widget(header, chunks[0]);
+
+        // 2. Chat Stream
+        let chat = Paragraph::new(self.streamed_text.as_str())
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Assistant"));
+        f.render_widget(chat, chunks[1]);
+
+        // 3. Tool Activity
+        let logs: Vec<Line> = self
+            .tool_logs
+            .iter()
+            .map(|l| Line::from(Span::raw(l)))
+            .collect();
+        let tools_widget = Paragraph::new(logs).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Tool Activity"),
+        );
+        f.render_widget(tools_widget, chunks[2]);
+
+        // 4. Input or Permission Prompt
+        if let Some((_, ref action)) = self.pending_permission {
+            let prompt = Paragraph::new(format!(
+                "Allow '{}'? Press [y] to allow, [n] to deny",
+                action
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Permission Required"),
+            );
+            f.render_widget(prompt, chunks[3]);
+        } else {
+            let input_widget = Paragraph::new(self.input.as_str()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Prompt (Enter send · / commands · Esc stop · Ctrl+C quit)"),
+            );
+            f.render_widget(input_widget, chunks[3]);
+        }
+
+        // 5. Slash autocomplete popup (overlay above the input pane).
+        if let Some(ref comp) = self.completer {
+            let matches = comp.matches(&self.input, &self.registry);
+            let rows: Vec<Line> = slash::popup_rows(&matches, comp.selected)
+                .into_iter()
+                .map(Line::from)
+                .collect();
+            if !rows.is_empty() {
+                let area = centered_popup(f.area(), 60, (rows.len() as u16 + 2).min(9));
+                let popup = Paragraph::new(rows)
+                    .block(Block::default().borders(Borders::ALL).title("Commands"));
+                f.render_widget(ratatui::widgets::Clear, area);
+                f.render_widget(popup, area);
+            }
+        }
+
+        // 6. Flow overlay (/models browser, /auth stages).
+        match &self.flow {
+            Flow::None => {}
+            Flow::Browser(b) => {
+                let (left, right) = flows::render_browser(b);
+                let height = (left.len().max(right.len()) as u16 + 2).min(16);
+                let area = centered_popup(f.area(), 72, height);
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+                    .split(area);
+                f.render_widget(ratatui::widgets::Clear, area);
+                let left_title = match b.mode {
+                    BrowserMode::Models => "Providers — type to filter",
+                    BrowserMode::AuthPick => "Providers — type to filter, Enter to log in",
+                };
+                let left_widget =
+                    Paragraph::new(left.into_iter().map(Line::from).collect::<Vec<_>>())
+                        .block(Block::default().borders(Borders::ALL).title(left_title));
+                let right_title = b
+                    .current()
+                    .map(|p| format!("Models: {}", p.display_name))
+                    .unwrap_or_else(|| "Models".to_string());
+                let right_widget =
+                    Paragraph::new(right.into_iter().map(Line::from).collect::<Vec<_>>())
+                        .block(Block::default().borders(Borders::ALL).title(right_title));
+                f.render_widget(left_widget, cols[0]);
+                f.render_widget(right_widget, cols[1]);
+            }
+            Flow::Auth(a) => {
+                let rows: Vec<Line> = flows::render_auth(a).into_iter().map(Line::from).collect();
+                let area = centered_popup(f.area(), 70, (rows.len() as u16 + 2).min(14));
+                let popup = Paragraph::new(rows).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Auth")
+                        .style(Style::default().fg(Color::Yellow)),
+                );
+                f.render_widget(ratatui::widgets::Clear, area);
+                f.render_widget(popup, area);
+            }
+        }
+    }
+
     pub async fn run(
         mut self,
         cmd_tx: mpsc::Sender<TuryaCommand>,
@@ -436,133 +567,7 @@ impl TuiApp {
 
         loop {
             terminal.draw(|f| {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3), // Header
-                        Constraint::Min(5),    // Content & Streamed Text
-                        Constraint::Length(5), // Tool Activity Log
-                        Constraint::Length(3), // Input Box / Permission Prompt
-                    ])
-                    .split(f.area());
-
-                // 1. Header
-                let header = Paragraph::new(format!(
-                    " Turya v{} | Mode: Build | Security: Review-for-me",
-                    env!("CARGO_PKG_VERSION")
-                ))
-                .style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .block(Block::default().borders(Borders::ALL).title("Status"));
-                f.render_widget(header, chunks[0]);
-
-                // 2. Chat Stream
-                let chat = Paragraph::new(self.streamed_text.as_str())
-                    .wrap(Wrap { trim: false })
-                    .block(Block::default().borders(Borders::ALL).title("Assistant"));
-                f.render_widget(chat, chunks[1]);
-
-                // 3. Tool Activity
-                let logs: Vec<Line> = self
-                    .tool_logs
-                    .iter()
-                    .map(|l| Line::from(Span::raw(l)))
-                    .collect();
-                let tools_widget = Paragraph::new(logs).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Tool Activity"),
-                );
-                f.render_widget(tools_widget, chunks[2]);
-
-                // 4. Input or Permission Prompt
-                if let Some((_, ref action)) = self.pending_permission {
-                    let prompt = Paragraph::new(format!(
-                        "Allow '{}'? Press [y] to allow, [n] to deny",
-                        action
-                    ))
-                    .style(
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("Permission Required"),
-                    );
-                    f.render_widget(prompt, chunks[3]);
-                } else {
-                    let input_widget = Paragraph::new(self.input.as_str()).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("Prompt (Enter send · / commands · Esc stop · Ctrl+C quit)"),
-                    );
-                    f.render_widget(input_widget, chunks[3]);
-                }
-
-                // 5. Slash autocomplete popup (overlay above the input pane).
-                if let Some(ref comp) = self.completer {
-                    let matches = comp.matches(&self.input, &self.registry);
-                    let rows: Vec<Line> = slash::popup_rows(&matches, comp.selected)
-                        .into_iter()
-                        .map(Line::from)
-                        .collect();
-                    if !rows.is_empty() {
-                        let area = centered_popup(f.area(), 60, (rows.len() as u16 + 2).min(9));
-                        let popup = Paragraph::new(rows)
-                            .block(Block::default().borders(Borders::ALL).title("Commands"));
-                        f.render_widget(ratatui::widgets::Clear, area);
-                        f.render_widget(popup, area);
-                    }
-                }
-
-                // 6. Flow overlay (/models browser, /auth stages).
-                match &self.flow {
-                    Flow::None => {}
-                    Flow::Browser(b) => {
-                        let (left, right) = flows::render_browser(b);
-                        let height = (left.len().max(right.len()) as u16 + 2).min(16);
-                        let area = centered_popup(f.area(), 72, height);
-                        let cols = Layout::default()
-                            .direction(Direction::Horizontal)
-                            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-                            .split(area);
-                        f.render_widget(ratatui::widgets::Clear, area);
-                        let left_title = match b.mode {
-                            BrowserMode::Models => "Providers — type to filter",
-                            BrowserMode::AuthPick => "Providers — type to filter, Enter to log in",
-                        };
-                        let left_widget =
-                            Paragraph::new(left.into_iter().map(Line::from).collect::<Vec<_>>())
-                                .block(Block::default().borders(Borders::ALL).title(left_title));
-                        let right_title = b
-                            .current()
-                            .map(|p| format!("Models: {}", p.display_name))
-                            .unwrap_or_else(|| "Models".to_string());
-                        let right_widget =
-                            Paragraph::new(right.into_iter().map(Line::from).collect::<Vec<_>>())
-                                .block(Block::default().borders(Borders::ALL).title(right_title));
-                        f.render_widget(left_widget, cols[0]);
-                        f.render_widget(right_widget, cols[1]);
-                    }
-                    Flow::Auth(a) => {
-                        let rows: Vec<Line> =
-                            flows::render_auth(a).into_iter().map(Line::from).collect();
-                        let area = centered_popup(f.area(), 70, (rows.len() as u16 + 2).min(14));
-                        let popup = Paragraph::new(rows).block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title("Auth")
-                                .style(Style::default().fg(Color::Yellow)),
-                        );
-                        f.render_widget(ratatui::widgets::Clear, area);
-                        f.render_widget(popup, area);
-                    }
-                }
+                self.render(f);
             })?;
 
             tokio::select! {
@@ -932,6 +937,46 @@ mod tests {
             }
             _ => panic!("expected browser flow"),
         }
+    }
+
+    #[tokio::test]
+    async fn headless_draw_shows_model_filter_results() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // Drive the REAL draw path headlessly: open browser, Tab into
+        // models, type "flash", render, and read the pixels back.
+        let mut app = TuiApp::new();
+        app.flow = Flow::Browser(BrowserFlow::new(BrowserMode::Models));
+        app.feed_flow_event(&listed());
+        let (tx, _rx) = mpsc::channel(32);
+        app.handle_flow_key(KeyCode::Tab, &tx).await;
+        for c in ['f', 'l', 'a', 's', 'h'] {
+            app.handle_flow_key(KeyCode::Char(c), &tx).await;
+        }
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+
+        // Filter header, narrowed provider, and the flash model all visible.
+        assert!(text.contains("/flash"), "filter header missing:\n{text}");
+        assert!(
+            text.contains("type to filter"),
+            "browser overlay missing:\n{text}"
+        );
+        assert!(
+            text.contains("Gemini 2.5 Flash"),
+            "filtered model missing:\n{text}"
+        );
+        // Non-matching provider is filtered out of the drawn overlay.
+        assert!(!text.contains("OpenAI"), "stale provider shown:\n{text}");
     }
 
     #[tokio::test]
