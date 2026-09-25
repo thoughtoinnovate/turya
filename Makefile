@@ -21,11 +21,17 @@ build-release:
 test:
 	cargo test --workspace
 
+# NOTE: install pins CARGO_HOME to $(HOME)/.cargo on the command line.
+# The dev image exports CARGO_HOME=/opt/cargo globally, but that dir is an
+# empty root-owned skeleton (no registry cache, not writable), while the
+# pre-populated cache and write permission live in ~/.cargo. Without this,
+# `cargo install` fails on `.crates.toml` / registry writes (os error 13)
+# and re-resolves + re-downloads instead of reusing the workspace lockfile.
 install:
-	cargo install --path crates/turya-cli --force
+	CARGO_HOME=$(HOME)/.cargo cargo install --path crates/turya-cli --force
 
 install-release:
-	cargo install --path crates/turya-cli --release --force
+	CARGO_HOME=$(HOME)/.cargo cargo install --path crates/turya-cli --release --force
 
 clean:
 	cargo clean
