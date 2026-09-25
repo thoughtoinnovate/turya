@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{Event, EventStream, KeyCode},
+    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -37,6 +37,28 @@ fn centered_popup(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// Ctrl+C / Ctrl+D quits from anywhere — explicit quit always wins,
+/// even inside permission modals, flows, or autocomplete.
+fn is_quit_key(key: &KeyEvent) -> bool {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    matches!(
+        key.code,
+        KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('d') | KeyCode::Char('D')
+    )
+}
+
+/// What Esc does depends on UI state. Esc never quits and never answers
+/// a permission modal (risky actions must be answered explicitly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscAction {
+    CloseCompleter,
+    CloseFlow,
+    Ignore,
+    AbortTurn,
+}
+
 pub struct TuiApp {
     input: String,
     streamed_text: String,
@@ -67,6 +89,18 @@ impl TuiApp {
             completer: None,
             flow: Flow::None,
             pending_auth: None,
+        }
+    }
+
+    fn esc_action(&self) -> EscAction {
+        if self.completer.is_some() {
+            EscAction::CloseCompleter
+        } else if !matches!(self.flow, Flow::None) {
+            EscAction::CloseFlow
+        } else if self.pending_permission.is_some() {
+            EscAction::Ignore
+        } else {
+            EscAction::AbortTurn
         }
     }
 
@@ -444,7 +478,7 @@ impl TuiApp {
                     let input_widget = Paragraph::new(self.input.as_str()).block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title("Prompt (Enter to send, Esc to exit)"),
+                            .title("Prompt (Enter send · / commands · Esc stop · Ctrl+C quit)"),
                     );
                     f.render_widget(input_widget, chunks[3]);
                 }
@@ -513,12 +547,28 @@ impl TuiApp {
             tokio::select! {
                 Some(Ok(event)) = reader.next() => {
                     if let Event::Key(key) = event {
-                        // Esc closes autocomplete first; quits only from plain input.
-                        if key.code == KeyCode::Esc {
-                            if self.completer.take().is_some() {
-                                continue;
-                            }
+                        // Explicit quit wins everywhere (modal, flow, completer).
+                        if is_quit_key(&key) {
                             break;
+                        }
+                        // Esc never quits: it unwinds UI state, then stops
+                        // the running turn. Permission modals must be answered.
+                        if key.code == KeyCode::Esc {
+                            match self.esc_action() {
+                                EscAction::CloseCompleter => {
+                                    self.completer = None;
+                                    continue;
+                                }
+                                EscAction::CloseFlow => {
+                                    self.handle_flow_key(KeyCode::Esc, &cmd_tx).await;
+                                    continue;
+                                }
+                                EscAction::Ignore => continue,
+                                EscAction::AbortTurn => {
+                                    let _ = cmd_tx.send(TuryaCommand::AbortTurn).await;
+                                    continue;
+                                }
+                            }
                         }
                         if let Some((req_id, _)) = self.pending_permission.take() {
                             match key.code {
@@ -626,6 +676,9 @@ impl TuiApp {
                         }
                         TuryaEvent::TurnCompleted { .. } => {
                             self.streamed_text.push_str("\n[Turn Finished]\n");
+                        }
+                        TuryaEvent::Error { message } => {
+                            self.tool_logs.push(format!("⚠ {message}"));
                         }
                         _ => {}
                     }
@@ -742,6 +795,44 @@ mod tests {
             reason: "bad code".to_string(),
         });
         assert!(app.tool_logs.iter().any(|l| l.contains("bad code")));
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn quit_keys_require_control() {
+        use KeyCode::Char;
+        assert!(is_quit_key(&key(Char('c'), KeyModifiers::CONTROL)));
+        assert!(is_quit_key(&key(Char('C'), KeyModifiers::CONTROL)));
+        assert!(is_quit_key(&key(Char('d'), KeyModifiers::CONTROL)));
+        assert!(is_quit_key(&key(Char('D'), KeyModifiers::CONTROL)));
+        // Plain typing must never quit.
+        assert!(!is_quit_key(&key(Char('c'), KeyModifiers::NONE)));
+        assert!(!is_quit_key(&key(Char('d'), KeyModifiers::NONE)));
+        assert!(!is_quit_key(&key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!is_quit_key(&key(KeyCode::Enter, KeyModifiers::CONTROL)));
+        // Shift+letter is not quit (shift is commonly held while typing).
+        assert!(!is_quit_key(&key(Char('C'), KeyModifiers::SHIFT)));
+    }
+
+    #[test]
+    fn esc_routing_prefers_ui_state_over_abort() {
+        let mut app = TuiApp::new();
+        // Plain input → abort the running turn.
+        assert_eq!(app.esc_action(), EscAction::AbortTurn);
+        // Open completer wins over abort.
+        app.completer = Some(Completer::new());
+        assert_eq!(app.esc_action(), EscAction::CloseCompleter);
+        app.completer = None;
+        // Open flow wins over abort.
+        app.flow = Flow::Browser(BrowserFlow::new(BrowserMode::Models));
+        assert_eq!(app.esc_action(), EscAction::CloseFlow);
+        app.flow = Flow::None;
+        // Permission modal: Esc must not answer, must not abort.
+        app.pending_permission = Some(("req_1".to_string(), "run_bash".to_string()));
+        assert_eq!(app.esc_action(), EscAction::Ignore);
     }
 
     #[tokio::test]

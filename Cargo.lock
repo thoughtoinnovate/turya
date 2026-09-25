@@ -3221,6 +3221,7 @@ dependencies = [
  "tracing",
  "turya-core",
  "turya-protocol",
+ "turya-tools",
 ]
 
 [[package]]

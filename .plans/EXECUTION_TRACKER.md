@@ -105,3 +105,6 @@ microkernel items (why essential + why the architecture holds) vs plugin items.*
   `storage` scope, CI microkernel gates (Rule 3.4).
 - [x] **Milestone:** `make build/test/e2e` green, `fmt` + `clippy -D warnings`
   clean, `turya auth status` renders dual-slot table.
+- [x] **Keybinding rework:** Esc aborts the running turn (server kills the
+  task, acks `TurnCompleted{success:false}` + toast); Ctrl+C / Ctrl+D quits
+  from anywhere; Esc never quits and never answers permission modals.
