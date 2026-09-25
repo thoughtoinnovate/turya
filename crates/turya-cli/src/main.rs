@@ -367,6 +367,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut app = TuiApp::new_restoring();
+    // Presentation settings from the config file: tints are opt-in, and the
+    // mouse mode is `auto` unless the user pinned it.
+    app.apply_settings(
+        Some((
+            settings.user_bg.as_deref().unwrap_or("none"),
+            settings.assistant_bg.as_deref().unwrap_or("none"),
+            settings.tool_bg.as_deref().unwrap_or("none"),
+        )),
+        settings.mouse.as_deref(),
+    );
     // `turya resume <id>`: replay the stored conversation so the session looks
     // exactly as it did before the process exited. The engine also loads it
     // for the model; this is the user-visible half.

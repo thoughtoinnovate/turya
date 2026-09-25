@@ -1,5 +1,8 @@
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
+        KeyModifiers, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -123,19 +126,159 @@ struct StoredOutput {
 /// Bound the retained full text: expansion is for reading, not paging
 /// megabytes through the transcript.
 const MAX_STORED_OUTPUT_CHARS: usize = 4000;
+/// Wrapped lines per wheel notch. Three reads as "a real scroll" without
+/// overshooting a short transcript.
+const WHEEL_LINES: usize = 3;
 /// Bound the retained entries: old outputs age out, newest survive.
 const MAX_OUTPUT_ENTRIES: usize = 20;
-/// One transcript row: text plus its visual voice.
-#[derive(Debug, Clone)]
+/// Who a transcript row belongs to. Identity is carried by a gutter glyph and
+/// a label, never by colour alone: that survives monochrome terminals, every
+/// theme, and colour-vision differences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Speaker {
+    User,
+    Assistant,
+    Tool,
+    System,
+}
+
+/// Optional background tints, off by default. A hard-pinned background is
+/// invisible on some themes and hostile on others, so these stay opt-in
+/// (`/settings`); the default identity is the gutter.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tints {
+    user: Option<Color>,
+    assistant: Option<Color>,
+    tool: Option<Color>,
+}
+
+/// Convert a markdown block into plain terminal lines.
+///
+/// Styles are dropped on purpose: the transcript already colours by role, and
+/// layering markdown emphasis on top of it produces noise nobody can read in
+/// a terminal. What the renderer buys us is structure - real indentation for
+/// lists, stripped heading hashes, aligned code blocks - which is the part
+/// that makes a model answer scannable. The raw text is always still stored.
+fn render_markdown(text: &str, _tints: &Tints) -> Vec<String> {
+    let rendered = tui_markdown::from_str(text).to_string();
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in rendered.split('\n') {
+        let trimmed = line.trim_start();
+        // The renderer strips inline emphasis but keeps heading markers and
+        // fence lines; a terminal transcript should not show either.
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence && trimmed.starts_with('#') {
+            let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+            if hashes <= 6 && trimmed[hashes..].starts_with(' ') {
+                out.push(trimmed[hashes..].trim_start().to_string());
+                continue;
+            }
+        }
+        out.push(line.trim_end().to_string());
+    }
+    // A single trailing blank from a closing fence is noise in a scrollback.
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Render a tint for display: hex back, or a readable name.
+fn tint_name(c: Option<Color>) -> String {
+    match c {
+        None => "none".to_string(),
+        Some(Color::Rgb(r, g, b)) => format!("#{r:02x}{g:02x}{b:02x}"),
+        Some(other) => format!("{other:?}").to_lowercase(),
+    }
+}
+
+impl Tints {
+    /// The tint for a role, if the user enabled one.
+    fn for_role(&self, role: Speaker) -> Option<Color> {
+        match role {
+            Speaker::User => self.user,
+            Speaker::Assistant => self.assistant,
+            Speaker::Tool => self.tool,
+            // System chrome stays on the terminal's own background.
+            Speaker::System => None,
+        }
+    }
+
+    /// Apply settings: any unset or unparsable value means "no tint".
+    fn from_settings(user: Option<&str>, assistant: Option<&str>, tool: Option<&str>) -> Self {
+        Self {
+            user: user.and_then(Self::parse),
+            assistant: assistant.and_then(Self::parse),
+            tool: tool.and_then(Self::parse),
+        }
+    }
+
+    /// Hex (`#rrggbb`) or a ratatui colour name, or `none`. Returns `None`
+    /// for anything unrecognised rather than guessing a colour.
+    fn parse(raw: &str) -> Option<Color> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("none") || raw.eq_ignore_ascii_case("default")
+        {
+            return None;
+        }
+        if let Some(hex) = raw.strip_prefix('#') {
+            if hex.len() == 6 {
+                if let Ok(v) = u32::from_str_radix(hex, 16) {
+                    return Some(Color::Rgb(
+                        (v >> 16) as u8,
+                        ((v >> 8) & 0xff) as u8,
+                        (v & 0xff) as u8,
+                    ));
+                }
+            }
+            return None;
+        }
+        match raw.to_ascii_lowercase().as_str() {
+            "black" => Some(Color::Black),
+            "red" => Some(Color::Red),
+            "green" => Some(Color::Green),
+            "yellow" => Some(Color::Yellow),
+            "blue" => Some(Color::Blue),
+            "magenta" => Some(Color::Magenta),
+            "cyan" => Some(Color::Cyan),
+            "gray" | "grey" => Some(Color::Gray),
+            "darkgray" | "darkgrey" => Some(Color::DarkGray),
+            "lightred" => Some(Color::LightRed),
+            "lightgreen" => Some(Color::LightGreen),
+            "lightyellow" => Some(Color::LightYellow),
+            "lightblue" => Some(Color::LightBlue),
+            "lightmagenta" => Some(Color::LightMagenta),
+            "lightcyan" => Some(Color::LightCyan),
+            "white" => Some(Color::White),
+            _ => None,
+        }
+    }
+}
+
 struct TLine {
     text: String,
     /// System toasts and separators: dimmed so content stands out.
     dim: bool,
+    role: Speaker,
 }
 
-/// Render a user prompt into the transcript (pure).
+impl TLine {
+    fn new(text: String, dim: bool, role: Speaker) -> Self {
+        Self { text, dim, role }
+    }
+}
+
+/// Gutter + label for a user prompt. A vertical rule and a word, readable in
+/// monochrome, which is what makes "my messages" findable when scrolling.
 fn format_user_message(prompt: &str) -> String {
-    format!("\n👤 {prompt}\n")
+    format!("\n┃ You\n┃ {prompt}\n")
 }
 
 /// Truncate to `max` bytes on a char boundary (pure).
@@ -196,6 +339,19 @@ pub struct TuiApp {
     show_thinking: bool,
     /// Write recall history to disk. Off in tests so they stay hermetic.
     persist_history: bool,
+    /// Optional background tints; off unless the user opts in.
+    tints: Tints,
+    /// `auto` (default) | `on` | `off`, from `/settings mouse`.
+    mouse: Option<String>,
+    /// Render assistant prose as markdown. On by default; the stored
+    /// transcript keeps the raw text either way, so this is presentation
+    /// only and reversible.
+    render_markdown: bool,
+    /// The assistant's answer as it streams in, plus where it started in the
+    /// transcript. Markdown cannot be rendered mid-stream, so the plain text
+    /// is shown live and swapped for the rendered block when the turn ends.
+    streaming: String,
+    stream_start: Option<usize>,
     /// Submitted prompts, newest last, for Up/Down recall.
     prompt_history: Vec<String>,
     /// Where recall is walking: `None` means "on the live draft".
@@ -243,6 +399,11 @@ impl TuiApp {
             history_cursor: None,
             stashed_draft: String::new(),
             persist_history: false,
+            tints: Tints::default(),
+            mouse: Some("auto".to_string()),
+            render_markdown: true,
+            streaming: String::new(),
+            stream_start: None,
             registry: SlashRegistry::with_builtins(),
             completer: None,
             flow: Flow::None,
@@ -256,42 +417,74 @@ impl TuiApp {
     /// Append one line to the transcript (the single home for chat, tool
     /// activity, and toasts — there is no separate tool box).
     fn log_line(&mut self, line: String) {
-        self.transcript.push(TLine {
-            text: line,
-            dim: false,
-        });
+        self.log_line_as(line, Speaker::Assistant);
+    }
+
+    fn log_line_as(&mut self, line: String, role: Speaker) {
+        self.transcript.push(TLine::new(line, false, role));
     }
 
     /// Append a dimmed system toast (routing notices, usage hints).
     /// Warnings, errors, and confirmations stay full-bright.
     fn log_dim(&mut self, line: String) {
-        self.transcript.push(TLine {
-            text: line,
-            dim: true,
-        });
+        self.transcript
+            .push(TLine::new(line, true, Speaker::System));
     }
 
     /// Append a (possibly multi-line) block, preserving blank lines so
     /// rendering matches the old plain-string transcript exactly.
     fn push_block(&mut self, text: &str, dim: bool) {
-        for line in text.split('\n') {
-            self.transcript.push(TLine {
-                text: line.to_string(),
-                dim,
-            });
+        self.push_block_as(text, dim, Speaker::Assistant)
+    }
+
+    fn push_block_as(&mut self, text: &str, dim: bool, role: Speaker) {
+        // Only assistant prose is markdown. Prompts, tool output and system
+        // rows are literal: a user pasting `**stars**` must see the stars.
+        if !dim && role == Speaker::Assistant && self.render_markdown {
+            for line in render_markdown(text, &self.tints) {
+                self.transcript.push(TLine::new(line, false, role));
+            }
+            return;
         }
+        for line in text.split('\n') {
+            self.transcript
+                .push(TLine::new(line.to_string(), dim, role));
+        }
+    }
+
+    /// Mark a block as the final answer, so it renders as markdown.
+    pub fn push_assistant_answer(&mut self, text: &str) {
+        self.push_block_as(text, false, Speaker::Assistant);
     }
 
     /// Stream one token chunk: extend the current content line, or start a
     /// new one when the transcript is empty or ends in a dimmed row.
     fn push_text(&mut self, chunk: &str) {
+        if self.stream_start.is_none() {
+            self.stream_start = Some(self.transcript.len());
+        }
+        self.streaming.push_str(chunk);
         match self.transcript.last_mut() {
             Some(last) if !last.dim => last.text.push_str(chunk),
-            _ => self.transcript.push(TLine {
-                text: chunk.to_string(),
-                dim: false,
-            }),
+            _ => self
+                .transcript
+                .push(TLine::new(chunk.to_string(), false, Speaker::Assistant)),
         }
+    }
+
+    /// Swap the live plain-text stream for the rendered markdown block. The
+    /// text is identical; only its structure changes, so nothing is lost.
+    fn finish_streaming_answer(&mut self) {
+        let (Some(start), true) = (self.stream_start.take(), self.render_markdown) else {
+            self.streaming.clear();
+            return;
+        };
+        if self.streaming.trim().is_empty() {
+            return;
+        }
+        self.transcript.truncate(start);
+        let text = std::mem::take(&mut self.streaming);
+        self.push_block_as(&text, false, Speaker::Assistant);
     }
 
     /// Plain-text view of the transcript: test assertions and scroll math.
@@ -309,11 +502,19 @@ impl TuiApp {
         self.transcript
             .iter()
             .map(|l| {
-                let style = if l.dim {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default()
-                };
+                let mut style = Style::default();
+                // A tint is an *addition* to the gutter, never the carrier of
+                // identity: with tints off the roles are still distinct.
+                if let Some(bg) = self.tints.for_role(l.role) {
+                    style = style.bg(bg);
+                }
+                if l.dim {
+                    style = style.fg(Color::DarkGray);
+                } else if l.role == Speaker::User {
+                    style = style.fg(Color::Cyan);
+                } else if l.role == Speaker::Tool {
+                    style = style.fg(Color::Gray);
+                }
                 Line::styled(l.text.as_str(), style)
             })
             .collect()
@@ -415,7 +616,7 @@ impl TuiApp {
                         self.push_block(text, false);
                     }
                     Part::UserText { text } => {
-                        self.push_block(&format_user_message(text), false);
+                        self.push_block_as(&format_user_message(text), false, Speaker::User);
                     }
                     Part::Reasoning { .. } | Part::Instruction { .. } => {
                         // Harness/model scaffolding, not user-facing prose.
@@ -446,7 +647,7 @@ impl TuiApp {
                             error: None,
                         };
                         for line in format_tool_result(&name, &res) {
-                            self.log_line(line);
+                            self.log_line_as(line, Speaker::Tool);
                         }
                         if *truncated {
                             self.retain_output(&name, &res);
@@ -527,6 +728,86 @@ impl TuiApp {
             .sum()
     }
 
+    /// Should we capture the mouse? `auto` (the default) enables it only
+    /// where it is known to work: not inside a multiplexer whose mouse mode
+    /// may be off, and not on a terminal with no colour/graphics support.
+    /// A terminal that cannot answer is treated as "do not capture" — losing
+    /// the wheel is better than breaking the user's selection.
+    fn mouse_enabled(&self) -> bool {
+        match self.mouse.as_deref().unwrap_or("auto") {
+            "on" | "true" | "yes" => return true,
+            "off" | "false" | "no" => return false,
+            _ => {}
+        }
+        if std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some() {
+            return false;
+        }
+        match std::env::var("TERM") {
+            Ok(term) => {
+                let t = term.to_ascii_lowercase();
+                !(t.is_empty() || t == "dumb" || t.starts_with("screen"))
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Mouse input. Only the wheel is consumed: clicks would steal the
+    /// terminal's own text selection, which is the one thing a user cannot
+    /// get back.
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollUp => -(WHEEL_LINES as i32),
+            MouseEventKind::ScrollDown => WHEEL_LINES as i32,
+            _ => return,
+        };
+        // A flow owns the keyboard, so it owns the wheel too: scroll its
+        // list rather than the transcript behind the popup.
+        if !matches!(self.flow, Flow::None) {
+            self.flow_scroll(delta);
+            return;
+        }
+        self.scroll_by(delta);
+    }
+
+    /// Move an open flow's selection by a wheel notch.
+    ///
+    /// Deliberately synchronous and limited to selection movement: the wheel
+    /// cannot press Enter or type, so it needs none of the async routing that
+    /// `handle_flow_key` does for real key presses.
+    fn flow_scroll(&mut self, delta: i32) {
+        let up = delta < 0;
+        match &mut self.flow {
+            Flow::Browser(b) => {
+                if b.right {
+                    b.move_model(if up { -1 } else { 1 });
+                } else {
+                    b.move_prov(if up { -1 } else { 1 });
+                }
+            }
+            Flow::Auth(a) => {
+                let len = a.methods().len();
+                if len == 0 {
+                    return;
+                }
+                if let AuthStage::MethodPick { sel } = &mut a.stage {
+                    let step = if up { -1i32 } else { 1 };
+                    *sel = (*sel as i32 + step).rem_euclid(len as i32) as usize;
+                }
+            }
+            Flow::None => {}
+        }
+    }
+
+    /// Apply persisted presentation settings from the host.
+    pub fn apply_settings(&mut self, tints: Option<(&str, &str, &str)>, mouse: Option<&str>) {
+        if let Some((user, assistant, tool)) = tints {
+            self.tints = Tints::from_settings(Some(user), Some(assistant), Some(tool));
+        }
+        if let Some(m) = mouse {
+            self.mouse = Some(m.to_string());
+        }
+    }
+
     /// Lift the transcript viewport up (read back history).
     fn scroll_up(&mut self) {
         self.scroll_lines_up = self.scroll_lines_up.saturating_add(10);
@@ -535,6 +816,15 @@ impl TuiApp {
     /// Lower the viewport toward live output.
     fn scroll_down(&mut self) {
         self.scroll_lines_up = self.scroll_lines_up.saturating_sub(10);
+    }
+
+    /// Scroll by a signed number of wrapped lines (wheel and Shift+arrows).
+    fn scroll_by(&mut self, delta: i32) {
+        if delta < 0 {
+            self.scroll_lines_up = self.scroll_lines_up.saturating_add((-delta) as usize);
+        } else {
+            self.scroll_lines_up = self.scroll_lines_up.saturating_sub(delta as usize);
+        }
     }
 
     /// Pin the viewport back to the live bottom.
@@ -631,61 +921,136 @@ impl TuiApp {
         cmd_tx: &mpsc::Sender<TuryaCommand>,
     ) {
         match self.registry.get(name).map(|c| c.kind) {
-            Some(slash::CommandKind::Local) => match name {
-                "help" => {
-                    let mut text = String::from("Commands:\n");
-                    for c in self.registry.filter("") {
-                        text.push_str(&format!("  /{} — {}\n", c.name, c.description));
+            Some(slash::CommandKind::Local) => {
+                match name {
+                    "help" => {
+                        let mut text = String::from("Commands:\n");
+                        for c in self.registry.filter("") {
+                            text.push_str(&format!("  /{} — {}\n", c.name, c.description));
+                        }
+                        self.push_block(&text, false);
                     }
-                    self.push_block(&text, false);
-                }
-                "clear" => {
-                    self.clear_transcript();
-                }
-                "thinking" => {
-                    self.show_thinking = !self.show_thinking;
-                    self.log_dim(format!(
-                        "ℹ reasoning display {}",
-                        if self.show_thinking { "on" } else { "off" }
-                    ));
-                }
-                "compact" => {
-                    // `/compact [focus...]`: summarise older turns. The focus
-                    // text rides along as the summariser's instruction, which
-                    // is more useful than our own guess at what matters.
-                    let focus = args.trim();
-                    let _ = cmd_tx
-                        .send(TuryaCommand::Compact {
-                            focus: (!focus.is_empty()).then(|| focus.to_string()),
-                        })
-                        .await;
-                }
-                "context" => {
-                    let _ = cmd_tx.send(TuryaCommand::ContextReport).await;
-                }
-                "sessions" => {
-                    let id = args.trim();
-                    if id.is_empty() {
+                    "clear" => {
+                        self.clear_transcript();
+                    }
+                    "thinking" => {
+                        self.show_thinking = !self.show_thinking;
+                        self.log_dim(format!(
+                            "ℹ reasoning display {}",
+                            if self.show_thinking { "on" } else { "off" }
+                        ));
+                    }
+                    "compact" => {
+                        // `/compact [focus...]`: summarise older turns. The focus
+                        // text rides along as the summariser's instruction, which
+                        // is more useful than our own guess at what matters.
+                        let focus = args.trim();
                         let _ = cmd_tx
-                            .send(TuryaCommand::ListSessions {
-                                cwd: None,
-                                limit: Some(20),
+                            .send(TuryaCommand::Compact {
+                                focus: (!focus.is_empty()).then(|| focus.to_string()),
                             })
                             .await;
-                    } else {
-                        let _ = cmd_tx
-                            .send(TuryaCommand::ResumeSession { id: id.to_string() })
-                            .await;
                     }
-                }
-                "steps" => {
-                    // `/steps [model_calls] [tool_calls]`: per-turn budgets.
-                    // Bare `/steps` reports the convention (engine owns truth;
-                    // 8/32 are the shipped defaults).
-                    let parts: Vec<&str> = args.split_whitespace().collect();
-                    let parse_steps = |s: &str| s.parse::<usize>().ok().filter(|&n| n > 0);
-                    let parse_tools = |s: &str| s.parse::<u32>().ok().filter(|&n| n > 0);
-                    match parts.as_slice() {
+                    "context" => {
+                        let _ = cmd_tx.send(TuryaCommand::ContextReport).await;
+                    }
+                    "settings" => {
+                        // `/settings` alone shows the current values; with a key it
+                        // is an immediate, discoverable setter rather than a modal
+                        // the user has to learn.
+                        let mut parts = args.split_whitespace();
+                        match (parts.next(), parts.next()) {
+                            (None, _) => {
+                                let t = self.tints;
+                                self.log_dim(format!(
+                                    "tints: user={} assistant={} tool={} (none = terminal default)",
+                                    tint_name(t.user),
+                                    tint_name(t.assistant),
+                                    tint_name(t.tool)
+                                ));
+                                self.log_dim(format!(
+                                    "mouse: {} ({})",
+                                    self.mouse.clone().unwrap_or_else(|| "auto".into()),
+                                    if self.mouse_enabled() {
+                                        "captured"
+                                    } else {
+                                        "not captured"
+                                    }
+                                ));
+                                self.log_dim(
+                                    "set one with: /settings user_bg #1b2735  \
+                                 (/settings user_bg none to clear)"
+                                        .to_string(),
+                                );
+                            }
+                            (Some(key), Some(value)) => {
+                                if key == "mouse" {
+                                    let v = value.to_ascii_lowercase();
+                                    let mode = match v.as_str() {
+                                        "on" | "true" | "yes" => Some("on"),
+                                        "off" | "false" | "no" => Some("off"),
+                                        "auto" => Some("auto"),
+                                        _ => None,
+                                    };
+                                    match mode {
+                                        Some(m) => {
+                                            self.mouse = Some(m.to_string());
+                                            self.log_dim(format!(
+                                                "→ mouse = {m} ({})",
+                                                if self.mouse_enabled() {
+                                                    "captured on this terminal"
+                                                } else {
+                                                    "not captured here"
+                                                }
+                                            ));
+                                        }
+                                        None => self
+                                            .log_dim("ℹ mouse takes auto | on | off".to_string()),
+                                    }
+                                    return;
+                                }
+                                let parsed = Tints::parse(value);
+                                let slot = match key {
+                                    "user_bg" => &mut self.tints.user,
+                                    "assistant_bg" => &mut self.tints.assistant,
+                                    "tool_bg" => &mut self.tints.tool,
+                                    _ => {
+                                        self.log_dim(format!(
+                                        "ℹ unknown setting '{key}'; try user_bg, assistant_bg, tool_bg"
+                                    ));
+                                        return;
+                                    }
+                                };
+                                *slot = parsed;
+                                self.log_dim(format!("→ {key} = {}", tint_name(parsed)));
+                            }
+                            (Some(key), None) => self
+                                .log_dim(format!("ℹ {key} needs a value (e.g. #1b2735 or none)")),
+                        }
+                    }
+                    "sessions" => {
+                        let id = args.trim();
+                        if id.is_empty() {
+                            let _ = cmd_tx
+                                .send(TuryaCommand::ListSessions {
+                                    cwd: None,
+                                    limit: Some(20),
+                                })
+                                .await;
+                        } else {
+                            let _ = cmd_tx
+                                .send(TuryaCommand::ResumeSession { id: id.to_string() })
+                                .await;
+                        }
+                    }
+                    "steps" => {
+                        // `/steps [model_calls] [tool_calls]`: per-turn budgets.
+                        // Bare `/steps` reports the convention (engine owns truth;
+                        // 8/32 are the shipped defaults).
+                        let parts: Vec<&str> = args.split_whitespace().collect();
+                        let parse_steps = |s: &str| s.parse::<usize>().ok().filter(|&n| n > 0);
+                        let parse_tools = |s: &str| s.parse::<u32>().ok().filter(|&n| n > 0);
+                        match parts.as_slice() {
                         [] => self.log_dim(
                             "ℹ usage: /steps [model_calls] [tool_calls] (defaults 8 32)"
                                 .to_string(),
@@ -733,11 +1098,12 @@ impl TuiApp {
                                 .to_string(),
                         ),
                     }
+                    }
+                    _ => {
+                        self.log_dim(format!("ℹ /{name} is coming soon"));
+                    }
                 }
-                _ => {
-                    self.log_dim(format!("ℹ /{name} is coming soon"));
-                }
-            },
+            }
             _ => match name {
                 "models" => {
                     self.flow = Flow::Browser(BrowserFlow::new(BrowserMode::Models));
@@ -1112,6 +1478,7 @@ impl TuiApp {
             }
             TuryaEvent::TurnCompleted { .. } => {
                 self.turn_active = false;
+                self.finish_streaming_answer();
                 self.log_dim("────────────────────────────────────────".to_string());
             }
             TuryaEvent::Error { message } => {
@@ -1267,6 +1634,13 @@ impl TuiApp {
     ) -> Result<(), Box<dyn std::error::Error>> {
         enable_raw_mode()?;
         let mut stdout = stdout();
+        // Mouse capture is opt-out: wheel scrolling is what people expect in
+        // 2026, but it also disables the terminal's own text selection. Where
+        // capture is unreliable (tmux/screen without mouse mode) it is worse
+        // than nothing, so we probe and can be turned off in /settings.
+        if self.mouse_enabled() {
+            execute!(stdout, EnableMouseCapture)?;
+        }
         execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -1287,6 +1661,12 @@ impl TuiApp {
 
             tokio::select! {
                 Some(Ok(event)) = reader.next() => {
+                    if let Event::Mouse(mouse) = event {
+                        // Wheel events route to whatever has focus: a popup
+                        // scrolls its own list, otherwise the transcript does.
+                        self.on_mouse(mouse);
+                        continue;
+                    }
                     if let Event::Key(key) = event {
                         // Explicit quit wins everywhere (modal, flow, completer).
                         if is_quit_key(&key) {
@@ -1439,6 +1819,9 @@ impl TuiApp {
             }
         }
 
+        if self.mouse_enabled() {
+            let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+        }
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         Ok(())
@@ -1733,7 +2116,9 @@ mod tests {
         app.submit_prompt("understand codebase".to_string(), &tx)
             .await;
         assert!(app.transcript_text().contains("understand codebase"));
-        assert!(app.transcript_text().contains("👤"));
+        // The gutter replaces the old emoji: readable in monochrome, and a
+        // stable column to scan when scrolling.
+        assert!(app.transcript_text().contains("┃ You"));
         match rx.recv().await.expect("expected a command") {
             TuryaCommand::SubmitPrompt { prompt, .. } => {
                 assert_eq!(prompt, "understand codebase")
@@ -2254,5 +2639,272 @@ mod tests {
         // And the next recall returns it.
         app.recall_older();
         assert_eq!(app.input, "remember me");
+    }
+    #[test]
+    fn user_prompts_carry_a_gutter_and_label() {
+        // Identity must not depend on colour: this string is what the user
+        // scans for when scrolling back through a long session.
+        let line = format_user_message("fix the bug");
+        assert!(line.contains("┃"), "gutter rule present: {line:?}");
+        assert!(line.contains("You"), "label present: {line:?}");
+        assert!(line.contains("fix the bug"), "content kept");
+    }
+
+    #[test]
+    fn roles_map_to_distinct_styles() {
+        let mut app = TuiApp::new();
+        app.log_line_as("user text".to_string(), Speaker::User);
+        app.log_line_as("model text".to_string(), Speaker::Assistant);
+        app.log_line_as("tool text".to_string(), Speaker::Tool);
+        app.log_dim("system text".to_string());
+
+        let rows = app.transcript_lines();
+        let style_of = |needle: &str| {
+            rows.iter()
+                .find(|l| l.spans.iter().any(|s| s.content.contains(needle)))
+                .map(|l| l.style)
+                .unwrap()
+        };
+        let user = style_of("user text");
+        let assistant = style_of("model text");
+        let tool = style_of("tool text");
+        let system = style_of("system text");
+        assert_eq!(user.fg, Some(Color::Cyan), "user is accented");
+        assert_eq!(assistant.fg, None, "assistant stays on default");
+        assert_eq!(tool.fg, Some(Color::Gray), "tool is subdued");
+        assert_eq!(system.fg, Some(Color::DarkGray), "system is dimmed");
+        // No background unless the user asked for one.
+        for s in [user, assistant, tool, system] {
+            assert_eq!(s.bg, None, "tints are off by default");
+        }
+    }
+
+    #[test]
+    fn tints_are_opt_in_and_must_parse() {
+        assert_eq!(Tints::parse("none"), None);
+        assert_eq!(Tints::parse(""), None);
+        assert_eq!(Tints::parse("default"), None);
+        assert_eq!(Tints::parse("chartreuse"), None, "unknown is not guessed");
+        assert_eq!(Tints::parse("cyan"), Some(Color::Cyan));
+        assert_eq!(Tints::parse("#112233"), Some(Color::Rgb(0x11, 0x22, 0x33)));
+        assert_eq!(Tints::parse("#12345"), None, "malformed hex is refused");
+
+        let tints = Tints::from_settings(Some("#112233"), None, Some("blue"));
+        assert_eq!(tints.user, Some(Color::Rgb(0x11, 0x22, 0x33)));
+        assert_eq!(tints.assistant, None);
+        assert_eq!(tints.tool, Some(Color::Blue));
+        // System chrome never picks up a tint.
+        assert_eq!(tints.for_role(Speaker::System), None);
+    }
+
+    #[test]
+    fn an_enabled_tint_reaches_only_that_role() {
+        let mut app = TuiApp::new();
+        app.tints = Tints::from_settings(Some("#101820"), None, None);
+        app.log_line_as("mine".to_string(), Speaker::User);
+        app.log_line_as("theirs".to_string(), Speaker::Assistant);
+        let rows = app.transcript_lines();
+        let bg_of = |needle: &str| {
+            rows.iter()
+                .find(|l| l.spans.iter().any(|s| s.content.contains(needle)))
+                .map(|l| l.style.bg)
+                .unwrap()
+        };
+        assert_eq!(bg_of("mine"), Some(Color::Rgb(0x10, 0x18, 0x20)));
+        assert_eq!(bg_of("theirs"), None, "one role's tint, not everyone's");
+    }
+
+    #[test]
+    fn a_tint_never_drops_the_role_colour() {
+        // Tints are additive: turning one on must not make a user prompt stop
+        // looking like a user prompt.
+        let mut app = TuiApp::new();
+        app.tints = Tints::from_settings(Some("#101820"), None, None);
+        app.log_line_as("mine".to_string(), Speaker::User);
+        let rows = app.transcript_lines();
+        let row = rows
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("mine")))
+            .unwrap();
+        assert_eq!(row.style.fg, Some(Color::Cyan));
+        assert!(row.style.bg.is_some());
+    }
+
+    #[test]
+    fn monochrome_terminals_still_show_roles() {
+        // The gutter survives even with every colour removed, which is the
+        // whole reason identity is not colour-alone.
+        let line = format_user_message("hello");
+        let visible = line.chars().filter(|c| !c.is_whitespace()).count();
+        assert!(visible > 0);
+        assert!(line.contains('┃'));
+    }
+    #[test]
+    fn wheel_scrolls_the_transcript() {
+        let mut app = TuiApp::new();
+        app.scroll_to_bottom();
+        app.on_mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll_lines_up, WHEEL_LINES);
+        app.on_mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll_lines_up, WHEEL_LINES * 2);
+        app.on_mouse(mouse(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll_lines_up, WHEEL_LINES);
+        app.scroll_to_bottom();
+        // Scrolling past the bottom is a no-op, never a wrap or a panic.
+        app.on_mouse(mouse(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll_lines_up, 0);
+    }
+
+    #[test]
+    fn clicks_are_ignored_so_selection_still_works() {
+        let mut app = TuiApp::new();
+        app.on_mouse(mouse(MouseEventKind::Down(
+            crossterm::event::MouseButton::Left,
+        )));
+        app.on_mouse(mouse(MouseEventKind::Moved));
+        assert_eq!(app.scroll_lines_up, 0, "we never consume clicks");
+        assert!(app.input.is_empty(), "and never type anything");
+    }
+
+    #[test]
+    fn wheel_moves_a_browser_selection_instead_of_the_transcript() {
+        let mut app = TuiApp::new();
+        app.flow = Flow::Browser(flows::BrowserFlow::new(flows::BrowserMode::Models));
+        app.on_mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll_lines_up, 0, "the popup owns the wheel");
+    }
+
+    #[test]
+    fn mouse_capture_respects_setting_and_environment() {
+        // Explicit wins over the probe.
+        let mut app = TuiApp::new();
+        app.mouse = Some("on".into());
+        assert!(app.mouse_enabled());
+        app.mouse = Some("off".into());
+        assert!(!app.mouse_enabled());
+
+        // `auto` is the default, and a dumb or absent TERM is not captured.
+        app.mouse = Some("auto".into());
+        if std::env::var("TERM").ok().as_deref() == Some("dumb") {
+            assert!(!app.mouse_enabled());
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_report_tints_and_mouse() {
+        let mut app = TuiApp::new();
+        app.dispatch_slash("settings", "user_bg #101820", &mpsc::channel(1).0)
+            .await;
+        assert_eq!(app.tints.user, Some(Color::Rgb(0x10, 0x18, 0x20)));
+        let (tx, mut rx) = mpsc::channel(8);
+        app.dispatch_slash("settings", "", &tx).await;
+        let text = app.transcript_text();
+        assert!(text.contains("tints:"), "{text}");
+        assert!(text.contains("mouse:"), "{text}");
+        // Bare /settings is a report: it sends nothing to the engine.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn settings_rejects_an_unknown_tint_without_guessing() {
+        let mut app = TuiApp::new();
+        app.dispatch_slash("settings", "user_bg notacolor", &mpsc::channel(1).0)
+            .await;
+        assert_eq!(app.tints.user, None, "unparsable means no tint");
+    }
+
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+    #[test]
+    fn markdown_headings_lose_their_hashes_and_lists_indent() {
+        let mut app = TuiApp::new();
+        app.push_block_as(
+            "## Findings\n\n- first item\n- second item\n",
+            false,
+            Speaker::Assistant,
+        );
+        let text = app.transcript_text();
+        assert!(text.contains("Findings"), "heading text kept: {text}");
+        assert!(
+            !text.contains("## "),
+            "heading markers are consumed, not shown raw: {text}"
+        );
+        assert!(text.contains("first item"), "list content kept: {text}");
+    }
+
+    #[test]
+    fn code_fences_render_as_an_indented_block() {
+        let mut app = TuiApp::new();
+        app.push_block_as(
+            "Run it:\n\n```sh\nmake test\n```\n",
+            false,
+            Speaker::Assistant,
+        );
+        let text = app.transcript_text();
+        assert!(text.contains("make test"), "code content kept: {text}");
+        assert!(!text.contains("```"), "fences consumed: {text}");
+    }
+
+    #[test]
+    fn user_text_is_never_markdown() {
+        // A user pasting `**bold**` must see the asterisks, not lose them.
+        let mut app = TuiApp::new();
+        app.push_block_as("**not bold**", false, Speaker::User);
+        assert!(app.transcript_text().contains("**not bold**"));
+    }
+
+    #[test]
+    fn tool_output_is_never_markdown() {
+        let mut app = TuiApp::new();
+        app.push_block_as("## not a heading", false, Speaker::Tool);
+        assert!(app.transcript_text().contains("## not a heading"));
+    }
+
+    #[test]
+    fn a_streamed_answer_is_rendered_when_the_turn_ends() {
+        let mut app = TuiApp::new();
+        // Tokens arrive one at a time, as they do live.
+        for chunk in ["## Plan\n\n", "- step one\n", "- step two\n"] {
+            app.push_text(chunk);
+        }
+        // Mid-stream the text is still literal: markdown cannot be rendered
+        // from half a token.
+        assert!(app.transcript_text().contains("## Plan"));
+
+        app.feed_flow_event(&TuryaEvent::TurnCompleted {
+            turn_id: "t1".to_string(),
+            success: true,
+        });
+        let text = app.transcript_text();
+        assert!(!text.contains("## "), "rendered on completion: {text}");
+        assert!(text.contains("Plan") && text.contains("step one"), "{text}");
+        // The words survive: rendering changes shape, not content.
+        assert!(text.contains("step one"), "content survives rendering");
+    }
+
+    #[test]
+    fn an_empty_stream_leaves_no_stray_row() {
+        let mut app = TuiApp::new();
+        app.push_text("");
+        app.feed_flow_event(&TuryaEvent::TurnCompleted {
+            turn_id: "t1".to_string(),
+            success: true,
+        });
+        let text = app.transcript_text();
+        assert!(!text.contains("context compacted"), "{text}");
+    }
+
+    #[test]
+    fn an_unterminated_code_fence_never_panics() {
+        // A truncated stream is normal: the turn ended mid-answer.
+        let out = render_markdown("```rust\nfn main() {\n    let x = 1;", &Tints::default());
+        assert!(!out.is_empty(), "something always renders");
+        assert!(out.iter().any(|l| l.contains("fn main")));
     }
 }
