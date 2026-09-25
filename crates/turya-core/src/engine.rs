@@ -142,6 +142,11 @@ impl TuryaEngine {
                     if authorized {
                         let result = tool.execute(&call.call_id, call.parameters.clone()).await;
                         let _ = event_tx.send(TuryaEvent::ToolCallCompleted(result.clone())).await;
+                        // Record genuine tool failures for the reflection loop
+                        // (permission denials are user decisions, not lessons).
+                        if !result.success {
+                            self.record_tool_error(&call.tool_name, &result);
+                        }
                         // Step 10 hook: freshly written files get a live diagnostic check.
                         if call.tool_name == "write_file" {
                             self.check_written_file(&call, &event_tx).await;
@@ -176,7 +181,34 @@ impl TuryaEngine {
                     "TurnCompleted",
                     &serde_json::json!({"turn_id": turn_id, "prompt": prompt, "success": true}),
                 );
+                // Reflection loop: distill this session's tool failures into rules.
+                let _ = store.reflect_session(&self.session_id);
             }
+        }
+    }
+
+    fn record_tool_error(&self, tool_name: &str, result: &turya_protocol::ToolResult) {
+        let memory = match self.memory.as_ref() {
+            Some(m) => m,
+            None => return,
+        };
+        if result
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("Permission denied"))
+        {
+            return;
+        }
+        if let Ok(store) = memory.lock() {
+            let _ = store.record_event(
+                &self.session_id,
+                "ToolError",
+                &serde_json::json!({
+                    "tool": tool_name,
+                    "call_id": result.call_id,
+                    "error": result.error.clone().unwrap_or_else(|| "tool reported failure".to_string()),
+                }),
+            );
         }
     }
 

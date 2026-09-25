@@ -229,8 +229,11 @@ async fn run_lsp_session(
     writer.write_all(&encode_message(&did_open)).await?;
 
     // Collect publishDiagnostics notifications for a short window.
+    // Note: servers send an empty batch first, then the real diagnostics,
+    // so only stop early on a non-empty batch for our file.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut diags = Vec::new();
+    let want_uri = format!("file://{}", path.display());
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -241,9 +244,19 @@ async fn run_lsp_session(
                 if msg.get("method").and_then(|m| m.as_str())
                     == Some("textDocument/publishDiagnostics")
                 {
+                    let uri = msg
+                        .pointer("/params/uri")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("");
+                    if uri != want_uri {
+                        continue;
+                    }
                     if let Some(items) =
                         msg.pointer("/params/diagnostics").and_then(|d| d.as_array())
                     {
+                        if items.is_empty() {
+                            continue;
+                        }
                         for item in items {
                             let line = item
                                 .pointer("/range/start/line")

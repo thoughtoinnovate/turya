@@ -95,6 +95,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_failed_tool_yields_reflected_rule() {
+        let store = Arc::new(std::sync::Mutex::new(
+            turya_memory::MemoryStore::open_in_memory().unwrap(),
+        ));
+        let mock_provider = Arc::new(MockProvider {
+            responses: vec![
+                ProviderStep::CallTool(ToolCall {
+                    call_id: "f1".to_string(),
+                    tool_name: "run_bash".to_string(),
+                    parameters: serde_json::json!({"command": "exit 1"}),
+                }),
+                ProviderStep::Finish,
+            ],
+        });
+        let tools = Arc::new(turya_tools::ToolRegistry::standard());
+        let engine = TuryaEngine::new(mock_provider, tools, PermissionMode::Open)
+            .with_memory(store.clone())
+            .with_session_id("reflect-session");
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let (_perm_tx, perm_rx) = mpsc::channel(1);
+
+        engine
+            .run_turn("t3", "break it", AgentMode::Build, event_tx, perm_rx)
+            .await;
+        while event_rx.recv().await.is_some() {}
+
+        let store = store.lock().unwrap();
+        let history = store.session_history("reflect-session", 10).unwrap();
+        assert!(history.iter().any(|(kind, _)| kind == "ToolError"));
+        let rules = store.rules_for("retry run_bash again", 5).unwrap();
+        assert!(rules.iter().any(|r| r.rule.contains("run_bash")));
+    }
+
+    #[tokio::test]
     async fn test_write_triggers_lsp_check_without_errors() {
         let dir = std::env::temp_dir().join("turya-engine-lsp-test");
         std::fs::create_dir_all(&dir).unwrap();

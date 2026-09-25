@@ -161,6 +161,43 @@ impl MemoryStore {
             &output[output.len() - tail..]
         )
     }
+
+    /// Reflection subagent (heuristic pass): turn recorded `ToolError` rows
+    /// into durable project rules so future `pre_turn` injection surfaces them.
+    /// Returns the number of newly saved rules (deduped against existing ones).
+    pub fn reflect_session(&self, session_id: &str) -> Result<usize, MemoryError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload FROM session_events WHERE session_id = ?1 AND kind = 'ToolError' ORDER BY id",
+        )?;
+        let payloads: Vec<String> = stmt
+            .query_map(params![session_id], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+
+        let existing: Vec<String> = {
+            let mut s = self.conn.prepare("SELECT rule FROM memory_rules")?;
+            let rows = s.query_map([], |row| row.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+
+        let mut saved = 0;
+        for payload in payloads {
+            let value: serde_json::Value =
+                serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+            let tool = value.get("tool").and_then(|t| t.as_str()).unwrap_or("tool");
+            let error = value.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
+            let snippet: String = error.chars().take(200).collect();
+            let rule = format!(
+                "Lesson from session '{}': tool '{}' failed with '{}'. Double-check inputs for '{}' before retrying.",
+                session_id, tool, snippet, tool
+            );
+            if existing.iter().any(|r| r == &rule) {
+                continue;
+            }
+            self.save_rule("project", &rule)?;
+            saved += 1;
+        }
+        Ok(saved)
+    }
 }
 
 #[cfg(test)]
@@ -196,5 +233,22 @@ mod tests {
         let out = MemoryStore::truncate_tool_output(&big, 1000);
         assert!(out.len() < big.len());
         assert!(out.contains("truncated"));
+    }
+
+    #[test]
+    fn reflection_extracts_and_dedupes_lessons() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .record_event(
+                "s9",
+                "ToolError",
+                &json!({"tool": "run_bash", "error": "Exited with code: Some(1)"}),
+            )
+            .unwrap();
+        assert_eq!(store.reflect_session("s9").unwrap(), 1);
+        // Second pass finds nothing new.
+        assert_eq!(store.reflect_session("s9").unwrap(), 0);
+        let rules = store.rules_for("retry the run_bash command", 5).unwrap();
+        assert!(rules.iter().any(|r| r.rule.contains("run_bash")));
     }
 }
