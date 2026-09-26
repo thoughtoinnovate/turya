@@ -72,6 +72,10 @@ enum EscAction {
 /// session cannot grow the history file without limit.
 const MAX_PROMPT_HISTORY: usize = 500;
 
+/// How many finished subagents stay expandable. Their transcripts are already
+/// bounded by the engine; this bounds how many are kept in memory.
+const MAX_SUBAGENT_VIEWS: usize = 32;
+
 /// Prompt history file: one line per entry, oldest first. Plain text so it
 /// stays greppable, and session logs never live here (those may hold secrets).
 fn history_path() -> std::path::PathBuf {
@@ -289,15 +293,38 @@ impl Tints {
 
 struct TLine {
     text: String,
-    /// System toasts and separators: dimmed so content stands out.
+    /// System toasts and separators: dimmed so content stays quiet.
     dim: bool,
     role: Speaker,
+    /// Which expandable subagent view owns this line, if any.
+    ///
+    /// Owned by id rather than by line index: the user scrolls, appends and
+    /// clears between expanding and collapsing, so a remembered range would be
+    /// stale exactly when it mattered. `None` is the overwhelming majority and
+    /// costs one word.
+    owner: Option<u64>,
 }
 
 impl TLine {
     fn new(text: String, dim: bool, role: Speaker) -> Self {
-        Self { text, dim, role }
+        Self {
+            text,
+            dim,
+            role,
+            owner: None,
+        }
     }
+}
+
+/// One subagent's result, kept so its work can be shown and hidden again.
+struct SubagentView {
+    id: u64,
+    name: String,
+    /// One line, always visible: the entry point for expanding.
+    headline: String,
+    /// The child's whole conversation, bounded by the engine.
+    transcript: String,
+    expanded: bool,
 }
 
 /// Gutter + label for a user prompt. A vertical rule and a word, readable in
@@ -383,6 +410,9 @@ pub struct TuiApp {
     /// Retained full tool outputs for on-demand expansion (`Ctrl+E`).
     /// Only outputs longer than the inline preview are kept, newest last.
     tool_outputs: std::collections::VecDeque<StoredOutput>,
+    /// Subagent results, newest last, each expandable and collapsible.
+    subagents: Vec<SubagentView>,
+    next_subagent_id: u64,
     /// Active provider selection: (provider, model, via). Set optimistically
     /// on switch, corrected by `ProviderState` events from the host.
     provider: Option<(String, String, String)>,
@@ -466,6 +496,8 @@ impl TuiApp {
             pending_permission: None,
             pending_tools: std::collections::HashMap::new(),
             tool_outputs: std::collections::VecDeque::new(),
+            subagents: Vec::new(),
+            next_subagent_id: 1,
             provider: None,
             sent_chars: 0,
             recv_chars: 0,
@@ -806,10 +838,25 @@ impl TuiApp {
         }
     }
 
-    /// Expand the most recent unexpanded output into the transcript
-    /// (`Ctrl+E`). Each entry expands once; afterwards there is nothing
-    /// left to show and the user is told so.
+    /// `Ctrl+E` on whatever is most recent and expandable.
+    ///
+    /// A subagent is preferred over a tool output, because a subagent row is
+    /// the last thing the user watched happen. Subagent expansion toggles:
+    /// pressing again removes exactly the lines it added, so the transcript
+    /// returns to where it was instead of growing every press.
     fn expand_last_output(&mut self) {
+        // Skips children with nothing to show, so one silent subagent does not
+        // swallow the keypress.
+        if let Some(id) = self
+            .subagents
+            .iter()
+            .rev()
+            .find(|v| !v.transcript.trim().is_empty())
+            .map(|v| v.id)
+        {
+            self.toggle_subagent(id);
+            return;
+        }
         let next = self
             .tool_outputs
             .iter_mut()
@@ -824,8 +871,43 @@ impl TuiApp {
                 self.log_dim(format!("── full output: {tool} ──"));
                 self.push_block(&full, false);
             }
-            None => self.log_dim("ℹ no truncated output to expand".to_string()),
+            None => self.log_dim("ℹ nothing to expand".to_string()),
         }
+    }
+
+    /// Show a subagent's transcript, or hide it again if already shown.
+    fn toggle_subagent(&mut self, id: u64) {
+        let Some(idx) = self.subagents.iter().position(|v| v.id == id) else {
+            return;
+        };
+        if self.subagents[idx].expanded {
+            // Remove exactly the lines this view added, identified by owner.
+            // Matching on the tag rather than a remembered range is what makes
+            // this safe after scrolling or other rows landing in between.
+            self.transcript.retain(|l| l.owner != Some(id));
+            self.subagents[idx].expanded = false;
+            self.log_dim(format!(
+                "── collapsed subagent {} ──",
+                self.subagents[idx].name
+            ));
+            return;
+        }
+        let (name, transcript) = {
+            let v = &self.subagents[idx];
+            (v.name.clone(), v.transcript.clone())
+        };
+
+        let headline = self.subagents[idx].headline.clone();
+        self.log_dim(format!(
+            "── subagent {name}: {headline} — full transcript (Ctrl+E to collapse) ──"
+        ));
+        let start = self.transcript.len();
+        self.push_block(&transcript, true);
+        for line in &mut self.transcript[start..] {
+            line.owner = Some(id);
+        }
+        self.subagents[idx].expanded = true;
+        self.scroll_to_bottom();
     }
 
     /// Approximate wrapped line count for scroll math (no new deps):
@@ -1853,9 +1935,35 @@ impl TuiApp {
                 // tool keeps it visibly moving.
                 self.log_dim(format!("  · {name} using {detail}"));
             }
-            TuryaEvent::SubagentFinished { name, summary, .. } => {
-                let first = summary.lines().next().unwrap_or("").trim();
-                self.log_line_as(format!("▹ subagent {name}: {first}"), Speaker::User);
+            TuryaEvent::SubagentFinished {
+                name,
+                summary,
+                transcript,
+                ..
+            } => {
+                // Kept, not just printed: the transcript is the child's whole
+                // conversation and it was being thrown away here, which is the
+                // only reason there was nothing to expand.
+                let headline = summary.lines().next().unwrap_or("").trim().to_string();
+                let expandable = !transcript.trim().is_empty();
+                let id = self.next_subagent_id;
+                self.next_subagent_id += 1;
+                self.subagents.push(SubagentView {
+                    id,
+                    name: name.clone(),
+                    headline: headline.clone(),
+                    transcript: transcript.clone(),
+                    expanded: false,
+                });
+                // Bounded, like every other retained transcript tail.
+                while self.subagents.len() > MAX_SUBAGENT_VIEWS {
+                    self.subagents.remove(0);
+                }
+                let hint = if expandable { "  (Ctrl+E)" } else { "" };
+                self.log_line_as(
+                    format!("▹ subagent {name}: {headline}{hint}"),
+                    Speaker::User,
+                );
             }
             TuryaEvent::McpStatus { servers } => {
                 if servers.is_empty() {
@@ -3033,7 +3141,7 @@ mod tests {
         app.expand_last_output();
         assert!(app.transcript_text().contains(&big));
         app.expand_last_output();
-        assert!(app.transcript_text().contains("no truncated output"));
+        assert!(app.transcript_text().contains("nothing to expand"));
     }
 
     #[test]
@@ -3053,7 +3161,7 @@ mod tests {
             error: None,
         }));
         app.expand_last_output();
-        assert!(app.transcript_text().contains("no truncated output"));
+        assert!(app.transcript_text().contains("nothing to expand"));
     }
 
     #[test]
@@ -3845,6 +3953,113 @@ mod settings_tests {
         assert!(
             !app.color_enabled(),
             "applying other settings must not silently re-enable colour"
+        );
+    }
+}
+
+#[cfg(test)]
+mod subagent_view_tests {
+    use super::*;
+
+    fn finished(name: &str, summary: &str, transcript: &str) -> TuryaEvent {
+        TuryaEvent::SubagentFinished {
+            task_id: format!("t/{name}"),
+            name: name.to_string(),
+            summary: summary.to_string(),
+            transcript: transcript.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_subagent_transcript_is_kept_rather_than_discarded() {
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&finished(
+            "scribe",
+            "wrote the notes",
+            "SUB-PROMPT: read notes\nTOOL: view_file\nDONE",
+        ));
+        // The headline is what you see without asking.
+        assert!(app.transcript_text().contains("scribe"));
+        assert!(app.transcript_text().contains("wrote the notes"));
+        assert!(
+            !app.transcript_text().contains("SUB-PROMPT"),
+            "not shown yet"
+        );
+        // Ctrl+E reveals the child's own conversation.
+        app.expand_last_output();
+        assert!(app.transcript_text().contains("SUB-PROMPT: read notes"));
+        assert!(app.transcript_text().contains("TOOL: view_file"));
+    }
+
+    #[test]
+    fn pressing_ctrl_e_again_collapses_it_back() {
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&finished("scribe", "done", "SECRET-CHILD-WORK"));
+        let collapsed = app.transcript_text().len();
+
+        app.expand_last_output();
+        assert!(app.transcript_text().contains("SECRET-CHILD-WORK"));
+        assert!(app.transcript_text().len() > collapsed);
+
+        // The whole point of the request: it must fold back up, not grow.
+        app.expand_last_output();
+        assert!(
+            !app.transcript_text().contains("SECRET-CHILD-WORK"),
+            "a second press must hide the child again: {}",
+            app.transcript_text()
+        );
+        assert!(
+            app.transcript_text().contains("scribe"),
+            "the row itself stays"
+        );
+    }
+
+    #[test]
+    fn collapsing_removes_only_that_views_lines() {
+        // Two children, expanded in turn. Collapsing the first must not take
+        // the second's transcript with it.
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&finished("a", "a done", "WORK-FROM-A"));
+        app.feed_flow_event(&finished("b", "b done", "WORK-FROM-B"));
+
+        // Ctrl+E acts on the most recent, so expand b then a.
+        app.expand_last_output();
+        let first_id = app.subagents[0].id;
+        app.toggle_subagent(first_id);
+        assert!(app.transcript_text().contains("WORK-FROM-A"));
+        assert!(app.transcript_text().contains("WORK-FROM-B"));
+
+        app.toggle_subagent(first_id);
+        assert!(!app.transcript_text().contains("WORK-FROM-A"));
+        assert!(
+            app.transcript_text().contains("WORK-FROM-B"),
+            "collapsing one child must not touch another's"
+        );
+    }
+
+    #[test]
+    fn a_child_with_nothing_to_show_says_so_and_offers_no_expand() {
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&finished("quiet", "nothing to report", "   "));
+        assert!(
+            !app.transcript_text().contains("Ctrl+E"),
+            "nothing to expand"
+        );
+        // And pressing it falls through to the tool-output path harmlessly.
+        app.expand_last_output();
+        assert!(app.transcript_text().contains("nothing to expand"));
+    }
+
+    #[test]
+    fn retained_children_are_bounded() {
+        let mut app = TuiApp::new();
+        for i in 0..(MAX_SUBAGENT_VIEWS + 10) {
+            app.feed_flow_event(&finished(&format!("s{i}"), "done", "work"));
+        }
+        assert_eq!(
+            app.subagents.len(),
+            MAX_SUBAGENT_VIEWS,
+            "a long session must not accumulate every child forever"
         );
     }
 }
