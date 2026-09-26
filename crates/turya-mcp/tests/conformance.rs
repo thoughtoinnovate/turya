@@ -62,25 +62,6 @@ fn write_mock() -> std::path::PathBuf {
     .clone()
 }
 
-/// Same one-write rule as `write_mock`; a second write would race the
-/// exec of the first.
-fn write_silent() -> std::path::PathBuf {
-    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("turya-mcp-mock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("silent-server.sh");
-        std::fs::write(&path, "#!/bin/sh\nexec sleep 3600\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        path
-    })
-    .clone()
-}
-
 fn registry() -> turya_mcp::McpRegistry {
     let mut r = turya_mcp::McpRegistry::empty();
     r.connect(
@@ -167,12 +148,16 @@ async fn mcp_tools_are_high_risk_so_the_broker_asks() {
 fn a_server_that_says_nothing_times_out_instead_of_hanging_forever() {
     // A real regression guard for the no-timeout bug this client was written
     // to avoid: `BufRead::read_line` would block here indefinitely.
-    let path = write_silent();
+    //
+    // `sleep`, not a shell script: the subject is a process that never answers,
+    // and exec'ing a script another test may still hold open is how this very
+    // test used to fail intermittently with ETXTBSY.
+    //
     // A short deadline proves the same thing as the 30s production bound
     // without making the suite sleep for half a minute on every CI run.
     let mut r = turya_mcp::McpRegistry::empty().with_request_timeout(Duration::from_secs(2));
     let started = std::time::Instant::now();
-    let res = r.connect("silent", path.to_str().unwrap(), &[]);
+    let res = r.connect("silent", "sleep", &["3600".to_string()]);
     let elapsed = started.elapsed();
     let err = res.unwrap_err();
     assert!(err.contains("timed out"), "{err}");
