@@ -53,6 +53,37 @@ pub struct McpServerStatus {
     pub error: Option<String>,
 }
 
+/// A tool the model may call, in vendor-neutral shape.
+///
+/// The kernel owns the registry, so the kernel decides what is callable and
+/// hands this to the provider; the provider only knows how to render it into
+/// its own wire format. That split is why a runtime-discovered tool (an MCP
+/// server's) reaches the model as a real declared function instead of a
+/// sentence of prose in the transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    /// What the tool is for, including when to reach for it. This is the only
+    /// place behavioural guidance can live, so it is written for the model.
+    pub description: String,
+    /// JSON Schema for the arguments object.
+    pub parameters: serde_json::Value,
+}
+
+impl ToolSpec {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
+}
+
 /// A skill advertised to the model (tier 1 of progressive disclosure).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillRef {

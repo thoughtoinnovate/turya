@@ -81,7 +81,11 @@ impl GeminiProvider {
     /// ride as `functionResponse` inside a `user` turn (the convention the
     /// Generative Language API requires for function results), and files
     /// become `inlineData`/`fileData` parts.
-    fn request_body(&self, transcript: &Transcript) -> serde_json::Value {
+    fn request_body(
+        &self,
+        transcript: &Transcript,
+        tools: &[turya_protocol::ToolSpec],
+    ) -> serde_json::Value {
         let contents: Vec<serde_json::Value> = transcript
             .to_messages()
             .iter()
@@ -137,7 +141,7 @@ impl GeminiProvider {
             .collect();
         let mut body = json!({
             "contents": contents,
-            "tools": [{"functionDeclarations": Self::function_declarations()}],
+            "tools": [{"functionDeclarations": Self::function_declarations(tools)}],
         });
         let effort = self.effort.read().unwrap().clone();
         if let Some(budget) = effort.as_deref().and_then(thinking_budget) {
@@ -148,39 +152,20 @@ impl GeminiProvider {
         body
     }
 
-    fn function_declarations() -> serde_json::Value {
-        json!([
-            {
-                "name": "view_file",
-                "description": "Read file content from the filesystem",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }
-            },
-            {
-                "name": "write_file",
-                "description": "Write or overwrite file content",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string" },
-                        "content": { "type": "string" }
-                    },
-                    "required": ["path", "content"]
-                }
-            },
-            {
-                "name": "run_bash",
-                "description": "Execute a bash shell command",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "command": { "type": "string" } },
-                    "required": ["command"]
-                }
-            }
-        ])
+    /// Render the kernel's tool list into Gemini's wire shape.
+    ///
+    /// Nothing here is hardcoded. A tool the engine did not offer - an MCP
+    /// server's, or the kernel's own `spawn_agent` - reaches the model as a
+    /// real declared function rather than a sentence of prose it would ignore.
+    fn function_declarations(tools: &[turya_protocol::ToolSpec]) -> serde_json::Value {
+        json!(tools
+            .iter()
+            .map(|t| json!({
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            }))
+            .collect::<Vec<_>>())
     }
 
     /// Translate one decoded SSE JSON payload into steps (pure: unit-tested).
@@ -335,10 +320,11 @@ impl LlmProvider for GeminiProvider {
     async fn generate_turn(
         &self,
         transcript: &Transcript,
+        tools: &[turya_protocol::ToolSpec],
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         let (url, bearer) = self.request_target();
-        let body = self.request_body(transcript);
+        let body = self.request_body(transcript, tools);
         let client = reqwest::Client::new();
         let mut req = client.post(&url).header("content-type", "application/json");
         if let Some(token) = bearer {
@@ -458,13 +444,38 @@ mod tests {
             text: "hi".to_string(),
         });
         let provider = GeminiProvider::new("k".to_string(), "m".to_string());
-        let body = provider.request_body(&t);
+        // Whatever the kernel offers is what is declared - the old version of
+        // this test asserted a hardcoded list of three, which is the bug.
+        let offered = vec![
+            turya_protocol::ToolSpec::new(
+                "spawn_agent",
+                "delegate a side task",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "name": { "type": "string" }, "task": { "type": "string" } },
+                    "required": ["name", "task"]
+                }),
+            ),
+            turya_protocol::ToolSpec::new(
+                "mcp_lookup",
+                "an MCP tool the kernel discovered at runtime",
+                serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+            ),
+        ];
+        let body = provider.request_body(&t, &offered);
         let decls = body
             .pointer("/tools/0/functionDeclarations")
             .and_then(|d| d.as_array())
             .unwrap();
-        assert_eq!(decls.len(), 3);
-        assert!(decls.iter().any(|d| d["name"] == "run_bash"));
+        assert_eq!(decls.len(), 2, "declared exactly what the kernel offered");
+        assert!(decls.iter().any(|d| d["name"] == "spawn_agent"));
+        assert!(decls.iter().any(|d| d["name"] == "mcp_lookup"));
+        // The schema must survive the translation, not just the name.
+        let spawn = decls.iter().find(|d| d["name"] == "spawn_agent").unwrap();
+        assert_eq!(spawn["parameters"]["required"][0], "name");
+        // And an empty tool list is still valid JSON, not a malformed body.
+        let none = provider.request_body(&t, &[]);
+        assert!(none.pointer("/tools/0/functionDeclarations").is_some());
         let contents = body.get("contents").and_then(|c| c.as_array()).unwrap();
         assert_eq!(contents.len(), 1, "one user turn is one turn");
         assert_eq!(contents[0]["role"], "user");
@@ -493,7 +504,7 @@ mod tests {
         });
 
         let provider = GeminiProvider::new("k".to_string(), "m".to_string());
-        let body = provider.request_body(&t);
+        let body = provider.request_body(&t, &[]);
         let contents = body.get("contents").and_then(|c| c.as_array()).unwrap();
         // user turn, then the model turn (text + functionCall merged), then
         // the function response as a user turn.
@@ -526,7 +537,7 @@ mod tests {
             signature: Some("sig-1".to_string()),
         });
         let provider = GeminiProvider::new("k".to_string(), "m".to_string());
-        let body = provider.request_body(&t);
+        let body = provider.request_body(&t, &[]);
         let contents = body.get("contents").and_then(|c| c.as_array()).unwrap();
         assert_eq!(contents[0]["role"], "user");
     }
@@ -563,7 +574,7 @@ mod tests {
             signature: call.signature.clone(),
         });
         let provider = GeminiProvider::new("k".to_string(), "m".to_string());
-        let body = provider.request_body(&t);
+        let body = provider.request_body(&t, &[]);
         let parts = body
             .pointer("/contents/1/parts/0")
             .expect("model turn part exists");
@@ -587,7 +598,7 @@ mod tests {
             signature: None,
         });
         let provider = GeminiProvider::new("k".to_string(), "m".to_string());
-        let body = provider.request_body(&t);
+        let body = provider.request_body(&t, &[]);
         let part = &body["contents"][1]["parts"][0];
         assert!(part.get("thoughtSignature").is_none(), "{part}");
     }
@@ -705,20 +716,23 @@ mod tests {
         t.push(turya_protocol::Part::UserText {
             text: "hi".to_string(),
         });
-        let plain = provider.request_body(&t);
+        let plain = provider.request_body(&t, &[]);
         assert!(
             plain.get("generationConfig").is_none(),
             "no effort means the provider default"
         );
 
         provider.set_effort(Some("high".to_string()));
-        let thinking = provider.request_body(&t);
+        let thinking = provider.request_body(&t, &[]);
         assert_eq!(
             thinking["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             24576
         );
 
         provider.set_effort(None);
-        assert!(provider.request_body(&t).get("generationConfig").is_none());
+        assert!(provider
+            .request_body(&t, &[])
+            .get("generationConfig")
+            .is_none());
     }
 }

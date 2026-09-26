@@ -35,6 +35,7 @@ impl LlmProvider for Scripted {
     async fn generate_turn(
         &self,
         transcript: &Transcript,
+        _tools: &[turya_protocol::ToolSpec],
         tx: tokio::sync::mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         self.seen.lock().unwrap().push(transcript.clone());

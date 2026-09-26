@@ -83,6 +83,12 @@ impl Tool for McpTool {
         &self.description
     }
 
+    /// The server's own input schema, verbatim. Inventing a schema here would
+    /// be a lie the model could act on.
+    fn schema(&self) -> serde_json::Value {
+        self.schema.clone()
+    }
+
     fn risk_level(&self, _params: &Value) -> RiskLevel {
         // An MCP tool can do anything its server can, so it starts at the
         // highest tier and the broker asks the user. Assuming otherwise is
@@ -468,6 +474,9 @@ impl Tool for McpToolHandle {
     }
     fn description(&self) -> &str {
         self.0.description()
+    }
+    fn schema(&self) -> serde_json::Value {
+        self.0.schema()
     }
     fn risk_level(&self, params: &serde_json::Value) -> RiskLevel {
         self.0.risk_level(params)

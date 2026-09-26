@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Stdio;
 use tokio::fs;
 use tokio::process::Command;
-use turya_protocol::{RiskLevel, ToolResult};
+use turya_protocol::{RiskLevel, ToolResult, ToolSpec};
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -11,6 +11,12 @@ pub trait Tool: Send + Sync {
     /// MCP server's tool) has no static name to return.
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    /// JSON Schema for this tool's arguments, sent to the model as a real
+    /// function declaration. Prose in the transcript does not compete with a
+    /// declared function, so anything the model is meant to call needs one.
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
     fn risk_level(&self, params: &serde_json::Value) -> RiskLevel;
     async fn execute(&self, call_id: &str, params: serde_json::Value) -> ToolResult;
 }
@@ -295,6 +301,14 @@ impl ToolRegistry {
     /// Tool names, in registration order (drives the MCP listing).
     pub fn names(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// Every tool, as declarations for the model to call.
+    pub fn specs(&self) -> Vec<ToolSpec> {
+        self.tools
+            .iter()
+            .map(|t| ToolSpec::new(t.name(), t.description(), t.schema()))
+            .collect()
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {

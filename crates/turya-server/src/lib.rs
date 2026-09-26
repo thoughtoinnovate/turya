@@ -252,6 +252,7 @@ mod tests {
         async fn generate_turn(
             &self,
             _transcript: &turya_protocol::Transcript,
+            _tools: &[turya_protocol::ToolSpec],
             _tx: mpsc::Sender<ProviderStep>,
         ) -> Result<(), String> {
             self.entered.notify_one();

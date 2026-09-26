@@ -292,7 +292,14 @@ async fn live_compaction_preserves_a_fact_from_earlier() {
             &mut app,
         )
         .await;
-        assert!(ok, "turn {i} failed:\n{text}");
+        if !ok {
+            // This test makes the most calls of any in the suite, so it is
+            // the first to hit an exhausted free-tier quota. A throttle is
+            // not a compaction bug and must not be reported as one.
+            assert!(!is_quota_failure(&text), "turn {i} failed:\n{text}");
+            eprintln!("skip: provider quota exhausted, not a product failure");
+            return;
+        }
     }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
@@ -460,9 +467,15 @@ async fn live_model_calls_a_tool_over_real_mcp_stdio() {
         &mut app,
     )
     .await;
-    // The substance first: the tool call and the answer are what this test is
-    // about, and both can be true even if the turn's last generation was
-    // throttled after the tool had already answered.
+    // Quota is checked FIRST. If the model was throttled before it could call
+    // the tool, the answer is missing for a reason that says nothing about
+    // this code - and asserting the substance first would report a throttle
+    // as a broken MCP client.
+    if !text.contains("BANANA-COLOUR-IS-YELLOW") && is_quota_failure(&text) {
+        eprintln!("skip: provider quota exhausted, not a product failure");
+        return;
+    }
+    // The substance: the tool call and the answer are what this test is about.
     assert!(
         text.contains("BANANA-COLOUR-IS-YELLOW"),
         "the model must have called the MCP tool and used its answer:\n{text}"

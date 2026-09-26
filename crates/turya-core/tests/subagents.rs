@@ -28,6 +28,7 @@ impl LlmProvider for Scripted {
     async fn generate_turn(
         &self,
         transcript: &Transcript,
+        _offered: &[turya_protocol::ToolSpec],
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         let text = || {
@@ -164,111 +165,62 @@ async fn the_child_innards_do_not_leak_into_the_users_transcript() {
 }
 
 #[tokio::test]
-async fn the_tool_catalog_advertises_delegation_to_the_parent() {
-    let (provider, seen) = scripted(false);
-    run(engine(provider)).await;
-    let seen = seen.lock().unwrap();
-    let catalog = seen[0]
-        .turns
-        .iter()
-        .flat_map(|t| t.parts.iter())
-        .filter_map(|p| match p {
-            Part::Instruction { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .find(|t| t.contains(SPAWN_AGENT_TOOL))
-        .unwrap_or_else(|| panic!("the model was never told it can delegate: {:?}", seen[0]));
-    assert!(
-        catalog.contains("name: string") && catalog.contains("task: string"),
-        "the delegation tool must document its arguments: {catalog}"
-    );
-}
-
-/// Delegates, but the child returns without saying anything.
-struct MuteChild {
-    seen: Arc<std::sync::Mutex<Vec<Transcript>>>,
-}
-
-#[async_trait::async_trait]
-impl LlmProvider for MuteChild {
-    async fn generate_turn(
-        &self,
-        transcript: &Transcript,
-        tx: mpsc::Sender<ProviderStep>,
-    ) -> Result<(), String> {
-        self.seen.lock().unwrap().push(transcript.clone());
-        let is_child = transcript
-            .turns
-            .iter()
-            .flat_map(|t| t.parts.iter())
-            .filter_map(|p| match p {
-                Part::UserText { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .any(|t| t.contains("You are the subagent"));
-        if is_child {
-            // Says nothing at all: the worst case a summary has to handle.
+async fn delegation_is_offered_to_the_model_as_a_real_declaration() {
+    // This is the bug that made the model ignore `use 5 subagents`. The tool
+    // used to be described in a sentence of prose while three builtin tools
+    // were declared as real functions, so the model never reached for it.
+    // Asserted on what the provider is actually handed, not on a transcript
+    // string.
+    struct Capture(Arc<std::sync::Mutex<Option<Vec<turya_protocol::ToolSpec>>>>);
+    #[async_trait::async_trait]
+    impl LlmProvider for Capture {
+        async fn generate_turn(
+            &self,
+            _t: &Transcript,
+            tools: &[turya_protocol::ToolSpec],
+            tx: mpsc::Sender<ProviderStep>,
+        ) -> Result<(), String> {
+            *self.0.lock().unwrap() = Some(tools.to_vec());
             let _ = tx.send(ProviderStep::Finish).await;
-            return Ok(());
+            Ok(())
         }
-        let already = transcript
-            .turns
-            .iter()
-            .flat_map(|t| t.parts.iter())
-            .any(|p| matches!(p, Part::ToolResult { .. }));
-        if !already {
-            let _ = tx
-                .send(ProviderStep::CallTool(ToolCall {
-                    call_id: "q1".into(),
-                    tool_name: SPAWN_AGENT_TOOL.into(),
-                    parameters: serde_json::json!({ "name": "mute", "task": "say nothing" }),
-                    signature: None,
-                }))
-                .await;
-        } else {
-            let _ = tx.send(ProviderStep::Token("parent done".into())).await;
-        }
-        Ok(())
     }
-}
-
-#[tokio::test]
-async fn a_child_that_says_nothing_is_a_failure_not_an_empty_success() {
-    // An empty summary handed to the parent as a success would be read as
-    // "the work is done", which is the most expensive kind of wrong answer.
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let events = run(TuryaEngine::new(
-        Arc::new(MuteChild { seen: seen.clone() }),
+    let slot = Arc::new(std::sync::Mutex::new(None));
+    let engine = TuryaEngine::new(
+        Arc::new(Capture(slot.clone())),
         Arc::new(ToolRegistry::standard()),
         PermissionMode::Open,
-    ))
-    .await;
+    );
+    run(engine).await;
 
-    let refusal = seen
+    let seen = slot
         .lock()
         .unwrap()
+        .clone()
+        .expect("the provider was called");
+    let spawn = seen
         .iter()
-        .filter(|t| {
-            t.turns
-                .iter()
-                .flat_map(|x| x.parts.iter())
-                .filter_map(|p| match p {
-                    Part::UserText { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .any(|x| !x.contains("You are the subagent"))
-        })
-        .flat_map(|t| t.turns.iter().flat_map(|x| x.parts.iter()))
-        .find_map(|p| match p {
-            Part::ToolResult { output, .. } => Some(output.clone()),
-            _ => None,
-        })
-        .expect("the parent must have been told the delegation failed");
-    assert!(
-        refusal.contains("returned nothing") || refusal.contains("unfulfilled"),
-        "the parent must be told the task was unfulfilled, got: {refusal}"
+        .find(|s| s.name == SPAWN_AGENT_TOOL)
+        .expect("spawn_agent must be declared to the model");
+    assert_eq!(
+        spawn.parameters["required"],
+        serde_json::json!(["name", "task"]),
+        "with a real schema, not prose"
     );
-    assert!(!events.is_empty());
+    assert!(
+        spawn
+            .description
+            .contains("Not available inside a subagent"),
+        "the depth cap has to be visible to the model: {}",
+        spawn.description
+    );
+    // And the builtins are declared too, so nothing is prose-only any more.
+    for name in ["view_file", "write_file", "run_bash"] {
+        assert!(
+            seen.iter().any(|s| s.name == name),
+            "{name} must be declared"
+        );
+    }
 }
 
 /// A provider that delegates from the child too, to prove the depth cap is
@@ -283,6 +235,7 @@ impl LlmProvider for Recursive {
     async fn generate_turn(
         &self,
         transcript: &Transcript,
+        _offered: &[turya_protocol::ToolSpec],
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         let is_child = transcript
@@ -381,6 +334,7 @@ impl LlmProvider for Chatty {
     async fn generate_turn(
         &self,
         transcript: &Transcript,
+        _offered: &[turya_protocol::ToolSpec],
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         self.seen.lock().unwrap().push(transcript.clone());
@@ -469,6 +423,7 @@ impl LlmProvider for NeedyChild {
     async fn generate_turn(
         &self,
         transcript: &Transcript,
+        _offered: &[turya_protocol::ToolSpec],
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         self.seen.lock().unwrap().push(transcript.clone());
@@ -589,6 +544,7 @@ impl LlmProvider for Looper {
     async fn generate_turn(
         &self,
         _transcript: &Transcript,
+        _offered: &[turya_protocol::ToolSpec],
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         let _ = tx
@@ -657,6 +613,7 @@ async fn a_legitimate_repeat_after_a_different_call_still_runs() {
         async fn generate_turn(
             &self,
             transcript: &Transcript,
+            _offered: &[turya_protocol::ToolSpec],
             tx: mpsc::Sender<ProviderStep>,
         ) -> Result<(), String> {
             let n = transcript
@@ -735,6 +692,7 @@ impl LlmProvider for FailingTool {
     async fn generate_turn(
         &self,
         transcript: &Transcript,
+        _offered: &[turya_protocol::ToolSpec],
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         if let Some(t) = transcript.turns.last() {

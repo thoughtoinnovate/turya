@@ -23,6 +23,39 @@ const MAX_TOOL_HISTORY_CHARS: usize = 2000;
 const COMPACT_AT_PERCENT: u32 = 85;
 /// Give up auto-compacting after this many consecutive failures.
 const MAX_COMPACT_FAILURES: u32 = 3;
+/// `spawn_agent` as the model sees it.
+///
+/// The description is the only place behavioural guidance can live now that
+/// the tool is a real declaration rather than a line of prose, so it carries
+/// the whole contract: what delegation is for, and what the child is expected
+/// to hand back.
+pub fn spawn_agent_spec() -> turya_protocol::ToolSpec {
+    turya_protocol::ToolSpec::new(
+        SPAWN_AGENT_TOOL,
+        "Delegate a self-contained side task to a subagent, and get back only its \
+         conclusion. Use this when a task is separable and its intermediate steps \
+         would only clutter this context - surveying a directory, checking one \
+         hypothesis, reading a set of files whose contents you do not need in \
+         full. The subagent gets its own context and its own smaller budget, and \
+         its individual tool calls are not shown to the user, so ask it to report \
+         a result rather than narrate its work. Not available inside a subagent.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "A short label for this subagent, shown in the transcript"
+                },
+                "task": {
+                    "type": "string",
+                    "description": "Complete, self-contained instructions, including exactly what to return"
+                }
+            },
+            "required": ["name", "task"]
+        }),
+    )
+}
+
 /// The kernel-owned delegation tool. Not in the `ToolRegistry`: it needs the
 /// engine, and a tool holding an `Arc` back to the engine that owns the
 /// registry is a reference cycle.
@@ -267,43 +300,20 @@ impl TuryaEngine {
     /// instruction ("focus on the auth fix"); `None` is the automatic pass.
     ///
     /// Prunes old tool output first (cheapest win), then asks the model for a
-    /// What the model is told it can call.
+    /// Every tool the model may call this turn, as real declarations.
     ///
-    /// Built per turn rather than cached, because the registry can grow at
-    /// runtime — an MCP server connecting mid-session must become callable
+    /// Built per pass rather than cached, because the registry can grow at
+    /// runtime: an MCP server connecting mid-session must become callable
     /// without a restart.
-    fn tool_catalog_instruction(&self, depth: u8) -> String {
-        let mut lines = Vec::new();
-        for name in self.tools.names() {
-            let Some(t) = self.tools.get(&name) else {
-                continue;
-            };
-            let first = t
-                .description()
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("")
-                .trim();
-            lines.push(format!("- {name}: {first}"));
-        }
-        if lines.is_empty() {
-            return String::new();
-        }
-        // Advertised only where it is callable. A subagent that could spawn
-        // another subagent would be a depth cap the model cannot see.
+    fn tool_specs(&self, depth: u8) -> Vec<turya_protocol::ToolSpec> {
+        let mut specs = self.tools.specs();
+        // `spawn_agent` is answered by the kernel rather than the registry, so
+        // it is declared here. Omitted inside a subagent: a depth cap the
+        // model cannot see is not a cap.
         if depth < MAX_SUBAGENT_DEPTH {
-            lines.push(format!(
-                "- {SPAWN_AGENT_TOOL}: delegate a self-contained side task to a \
-                 subagent with its own context and budget. Arguments: \
-                 name: string — a short label; task: string — full instructions, \
-                 including what to return."
-            ));
+            specs.push(spawn_agent_spec());
         }
-        format!(
-            "You can call these tools. To use one, emit a tool call with its exact \
-             name and JSON arguments.\n{}",
-            lines.join("\n")
-        )
+        specs
     }
 
     /// Run a delegated side task and return only its conclusion.
@@ -530,7 +540,11 @@ impl TuryaEngine {
         });
         let (step_tx, mut step_rx) = mpsc::channel(32);
         let provider = self.provider.read().unwrap().clone();
-        let handle = tokio::spawn(async move { provider.generate_turn(&probe, step_tx).await });
+        // The summarising pass advertises no tools: a tool call during
+        // compaction is dropped anyway, so declaring them would only invite
+        // the model to waste a call.
+        let handle =
+            tokio::spawn(async move { provider.generate_turn(&probe, &[], step_tx).await });
         let mut out = String::new();
         while let Some(step) = step_rx.recv().await {
             match step {
@@ -699,14 +713,6 @@ impl TuryaEngine {
         // Skills are advertised before the prompt, once, as instructions
         // rather than as conversation: the model reads the catalog and loads a
         // body only if a task actually matches.
-        // The tool catalog goes in as an instruction, not as a provider
-        // feature: the model has no other way to learn a name, and an MCP
-        // server's tools are unknowable by guesswork. Names and one-line
-        // summaries only — the schema stays with the tool.
-        let catalog = self.tool_catalog_instruction(ctx.depth);
-        if !catalog.is_empty() {
-            transcript.push(Part::Instruction { text: catalog });
-        }
         if let Some(ref hook) = self.skills_hook {
             let catalog = hook.skill_catalog(&self.session_id).await;
             let rendered = crate::skills_catalog(&catalog);
@@ -889,8 +895,10 @@ impl TuryaEngine {
         let (step_tx, mut step_rx) = mpsc::channel(32);
         let provider = self.provider.read().unwrap().clone();
         let transcript = transcript.clone();
+        let specs = self.tool_specs(ctx.depth);
 
-        let join = tokio::spawn(async move { provider.generate_turn(&transcript, step_tx).await });
+        let join =
+            tokio::spawn(async move { provider.generate_turn(&transcript, &specs, step_tx).await });
 
         let mut assistant_text = String::new();
         let mut parts: Vec<Part> = Vec::new();

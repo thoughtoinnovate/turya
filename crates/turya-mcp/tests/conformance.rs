@@ -48,7 +48,7 @@ done
 fn write_mock() -> std::path::PathBuf {
     static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
-        let dir = std::env::temp_dir().join("turya-mcp-mock");
+        let dir = std::env::temp_dir().join(format!("turya-mcp-mock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mock-server.sh");
         std::fs::write(&path, MOCK).unwrap();
@@ -67,7 +67,7 @@ fn write_mock() -> std::path::PathBuf {
 fn write_silent() -> std::path::PathBuf {
     static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
-        let dir = std::env::temp_dir().join("turya-mcp-mock");
+        let dir = std::env::temp_dir().join(format!("turya-mcp-mock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("silent-server.sh");
         std::fs::write(&path, "#!/bin/sh\nexec sleep 3600\n").unwrap();
@@ -188,4 +188,36 @@ fn one_broken_server_does_not_stop_the_next_one() {
         .expect("the healthy server still connects after a failure");
     assert_eq!(r.listing().len(), 1);
     assert_eq!(r.listing()[0].0, "good");
+}
+
+#[tokio::test]
+async fn a_discovered_tool_declares_the_servers_own_schema_to_the_model() {
+    // The point of the dynamic declaration path: a tool that did not exist
+    // when the provider was written still reaches the model as a real
+    // function, carrying the server's schema rather than one we invented.
+    use turya_tools::Tool;
+    let mut r = turya_mcp::McpRegistry::empty();
+    r.connect(
+        "mock",
+        write_mock().to_str().unwrap(),
+        &["--stdio".to_string()],
+    )
+    .expect("mock server must connect");
+    let tools = r.tools_for("mock");
+    let spec = tools[0].schema();
+    assert_eq!(spec["properties"]["text"]["type"], "string");
+    assert_eq!(spec["required"], serde_json::json!(["text"]));
+
+    // And it flows through the registry into a spec list unchanged.
+    let mut reg = turya_tools::ToolRegistry::standard();
+    for t in r.tools_for("mock") {
+        reg.register(Box::new(turya_mcp::McpToolHandle(t)));
+    }
+    let specs = reg.specs();
+    let echoed = specs
+        .iter()
+        .find(|s| s.name == "echo")
+        .expect("the MCP tool must appear in the registry's specs");
+    assert_eq!(echoed.parameters["required"], serde_json::json!(["text"]));
+    assert!(echoed.description.contains("Echo a string back"));
 }

@@ -126,39 +126,19 @@ impl AnthropicProvider {
         out
     }
 
-    fn tool_schemas() -> serde_json::Value {
-        json!([
-            {
-                "name": "view_file",
-                "description": "Read file content from the filesystem",
-                "input_schema": {
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }
-            },
-            {
-                "name": "write_file",
-                "description": "Write or overwrite file content",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string" },
-                        "content": { "type": "string" }
-                    },
-                    "required": ["path", "content"]
-                }
-            },
-            {
-                "name": "run_bash",
-                "description": "Execute a bash shell command",
-                "input_schema": {
-                    "type": "object",
-                    "properties": { "command": { "type": "string" } },
-                    "required": ["command"]
-                }
-            }
-        ])
+    /// Render the kernel's tool list into Anthropic's wire shape.
+    ///
+    /// Nothing here is hardcoded, so an MCP tool or the kernel's own
+    /// `spawn_agent` is a real declared tool rather than prose.
+    fn tool_schemas(tools: &[turya_protocol::ToolSpec]) -> serde_json::Value {
+        json!(tools
+            .iter()
+            .map(|t| json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.parameters,
+            }))
+            .collect::<Vec<_>>())
     }
 }
 
@@ -172,6 +152,7 @@ impl LlmProvider for AnthropicProvider {
     async fn generate_turn(
         &self,
         transcript: &Transcript,
+        tools: &[turya_protocol::ToolSpec],
         tx: mpsc::Sender<ProviderStep>,
     ) -> Result<(), String> {
         let messages: Vec<serde_json::Value> = transcript
@@ -231,7 +212,7 @@ impl LlmProvider for AnthropicProvider {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "stream": true,
-            "tools": Self::tool_schemas(),
+            "tools": Self::tool_schemas(tools),
             "messages": messages,
         });
         let effort = self.effort.read().unwrap().clone();
