@@ -8,7 +8,10 @@ pub mod tasks;
 
 pub use context::{compacted, compaction_prompt, prune_transcript, tail_turns};
 pub use engine::TuryaEngine;
-pub use hooks::{DiagnosticsHook, FileDiagnostic, MemoryHook};
+pub use hooks::{
+    render_catalog as skills_catalog, DiagnosticsHook, FileDiagnostic, MemoryHook, SkillHook,
+    SkillRef,
+};
 pub use permissions::PermissionBroker;
 pub use plugins::{
     AuthMethodKind, ModelInfo, ProviderPlugin, ProviderRegistry, ResolvedCreds, UiPlugin,

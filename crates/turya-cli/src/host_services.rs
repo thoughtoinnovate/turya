@@ -72,6 +72,8 @@ pub struct HostServices {
     /// Session database path. The host owns session reads/writes so the
     /// kernel never learns a file path (Rule 3.1).
     db_path: String,
+    /// Skill discovery warnings, captured at boot.
+    skills_warnings: Vec<String>,
     flows: Mutex<HashMap<String, PendingFlow>>,
     flow_seq: Mutex<u64>,
 }
@@ -84,6 +86,7 @@ impl HostServices {
         engine: Arc<TuryaEngine>,
         config_path: String,
         db_path: String,
+        skills_warnings: Vec<String>,
     ) -> Self {
         Self {
             registry,
@@ -92,6 +95,7 @@ impl HostServices {
             engine,
             config_path,
             db_path,
+            skills_warnings,
             flows: Mutex::new(HashMap::new()),
             flow_seq: Mutex::new(0),
         }
@@ -240,6 +244,34 @@ impl HostServices {
                     }
                     Err(e) => events.send(TuryaEvent::Error { message: e }).await,
                 }
+                true
+            }
+            TuryaCommand::ListSkills => {
+                let skills = self.engine.available_skills().await;
+                let warnings = self.skill_warnings();
+                events
+                    .send(TuryaEvent::SkillsListed { skills, warnings })
+                    .await;
+                true
+            }
+            TuryaCommand::LoadSkill { name } => {
+                // An unknown name is not an error the model needs to handle:
+                // it gets a clear "no such skill" text as a tool result.
+                let body = self.engine.load_skill_body(name).await;
+                events
+                    .send(TuryaEvent::SkillsListed {
+                        skills: self.engine.available_skills().await,
+                        warnings: self.skill_warnings(),
+                    })
+                    .await;
+                events
+                    .send(TuryaEvent::TokenDelta {
+                        chunk: match body {
+                            Some(b) => b,
+                            None => format!("no skill named '{name}'"),
+                        },
+                    })
+                    .await;
                 true
             }
             TuryaCommand::QueryEfforts => {
@@ -508,6 +540,12 @@ impl HostServices {
                 Arc::new(store)
             })
             .map_err(|e| format!("cannot open the session store: {e}"))
+    }
+
+    /// Discovery problems, kept alongside the provider so `/skills` can show
+    /// that a skill exists but did not load.
+    fn skill_warnings(&self) -> Vec<String> {
+        self.skills_warnings.clone()
     }
 
     /// The provider/model the session is actually using.
@@ -1169,6 +1207,7 @@ mod tests {
             engine,
             "/tmp/turya-host-router-test-config.toml".to_string(),
             "/tmp/turya-host-router-test.db".to_string(),
+            Vec::new(),
         );
         (host, tx, rx)
     }
@@ -1320,6 +1359,7 @@ mod tests {
                 .with_extension("db")
                 .to_string_lossy()
                 .to_string(),
+            Vec::new(),
         );
         let sink = HostEventSink::new(tx);
         let consumed = host

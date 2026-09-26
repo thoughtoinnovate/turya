@@ -1,4 +1,4 @@
-use crate::hooks::{DiagnosticsHook, MemoryHook};
+use crate::hooks::{DiagnosticsHook, MemoryHook, SkillHook};
 use crate::permissions::PermissionBroker;
 use crate::provider::{LlmProvider, ProviderStep};
 use std::path::Path;
@@ -53,6 +53,8 @@ pub struct TuryaEngine {
     memory_hook: Option<Arc<dyn MemoryHook>>,
     /// Injected diagnostics seam (implementation lives in `turya-lsp`).
     diagnostics_hook: Option<Arc<dyn DiagnosticsHook>>,
+    /// Injected skills seam (implementation lives in `turya-skills`).
+    skills_hook: Option<Arc<dyn SkillHook>>,
     session_id: String,
     /// Step budgets, hot-swappable per session via `set_budgets`
     /// (driven by `UpdateConfig` from the host). Interior mutability:
@@ -85,6 +87,7 @@ impl TuryaEngine {
             permissions: Arc::new(PermissionBroker::new(mode)),
             memory_hook: None,
             diagnostics_hook: None,
+            skills_hook: None,
             session_id: "default".to_string(),
             budgets: RwLock::new(TurnBudgets::default()),
             context: RwLock::new(ContextBudget::generous()),
@@ -352,6 +355,26 @@ impl TuryaEngine {
         self
     }
 
+    /// Inject the skills seam. Its catalog is injected once per turn, before
+    /// the user's prompt, so the model knows what it can load.
+    pub fn with_skills_hook(mut self, hook: Arc<dyn SkillHook>) -> Self {
+        self.skills_hook = Some(hook);
+        self
+    }
+
+    /// Load one skill's body, for the `load_skill` tool.
+    pub async fn load_skill_body(&self, name: &str) -> Option<String> {
+        self.skills_hook.as_ref()?.load_skill(name).await
+    }
+
+    /// The skills the session currently offers, for `/skills`.
+    pub async fn available_skills(&self) -> Vec<crate::hooks::SkillRef> {
+        match self.skills_hook {
+            Some(ref hook) => hook.skill_catalog(&self.session_id).await,
+            None => Vec::new(),
+        }
+    }
+
     pub fn with_diagnostics_hook(mut self, hook: Arc<dyn DiagnosticsHook>) -> Self {
         self.diagnostics_hook = Some(hook);
         self
@@ -416,6 +439,16 @@ impl TuryaEngine {
         transcript.start_turn(turn_id);
         // The user's turn is recorded here, once. Providers serialize the
         // transcript as-is; there is no separate prompt to append.
+        // Skills are advertised before the prompt, once, as instructions
+        // rather than as conversation: the model reads the catalog and loads a
+        // body only if a task actually matches.
+        if let Some(ref hook) = self.skills_hook {
+            let catalog = hook.skill_catalog(&self.session_id).await;
+            let rendered = crate::skills_catalog(&catalog);
+            if !rendered.is_empty() {
+                transcript.push(Part::Instruction { text: rendered });
+            }
+        }
         transcript.push(Part::UserText {
             text: prompt.to_string(),
         });

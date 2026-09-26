@@ -3252,6 +3252,7 @@ dependencies = [
  "turya-provider-anthropic",
  "turya-provider-gemini",
  "turya-server",
+ "turya-skills",
  "turya-tools",
  "turya-tui",
 ]
@@ -3351,6 +3352,18 @@ dependencies = [
  "async-trait",
  "tokio",
  "tracing",
+ "turya-core",
+ "turya-protocol",
+ "turya-tools",
+]
+
+[[package]]
+name = "turya-skills"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "tokio",
  "turya-core",
  "turya-protocol",
  "turya-tools",

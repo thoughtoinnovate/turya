@@ -30,6 +30,16 @@ pub enum RiskLevel {
     Critical,
 }
 
+/// A skill advertised to the model (tier 1 of progressive disclosure).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillRef {
+    pub name: String,
+    pub description: String,
+    /// Absolute path to the `SKILL.md`; the model reads it with its normal
+    /// file tool, so activation needs no special machinery.
+    pub location: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub call_id: String,
@@ -402,6 +412,12 @@ pub enum TuryaCommand {
         max_steps: Option<usize>,
         max_tool_calls: Option<u32>,
     },
+    /// List the skills available to this session (drives `/skills`).
+    ListSkills,
+    /// Load one skill's body (drives the `load_skill` tool).
+    LoadSkill {
+        name: String,
+    },
     /// Ask what reasoning effort levels the active model accepts.
     QueryEfforts,
     /// Set the reasoning effort for subsequent turns.
@@ -462,6 +478,12 @@ pub enum TuryaEvent {
     SessionResumed {
         session: Box<SessionMeta>,
         transcript: Transcript,
+    },
+    /// Answer to `ListSkills`, with any discovery problems attached so a
+    /// malformed skill is visible rather than silently missing.
+    SkillsListed {
+        skills: Vec<SkillRef>,
+        warnings: Vec<String>,
     },
     /// What the active model supports, and what is currently selected.
     /// `efforts` is empty when the source does not say, and

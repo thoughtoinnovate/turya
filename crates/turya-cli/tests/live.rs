@@ -313,3 +313,51 @@ async fn live_compaction_preserves_a_fact_from_earlier() {
         "the token must survive a real compaction:\n{answer}\n(summary was: {summary})"
     );
 }
+
+#[tokio::test]
+async fn live_advertises_a_skill_and_the_model_loads_it() {
+    require_live!();
+    let creds = match live_credentials().await {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no live credential available");
+            return;
+        }
+    };
+    // A real skill on disk, discovered and advertised; the model must read
+    // the body itself and follow an instruction that is only in the file.
+    let root = std::env::temp_dir().join("turya-live-skill");
+    let dir = root.join(".agents/skills/release-notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: release-notes\ndescription: Draft release notes from git commits\n---\n\n         Draft release notes. The first line of your answer must be exactly\n         SKILL-WAS-LOADED, on its own. Then write one short line.\n",
+    )
+    .unwrap();
+
+    let provider = LiveProvider::build(&creds);
+    let engine = Arc::new(
+        TuryaEngine::new(
+            provider,
+            Arc::new(ToolRegistry::standard()),
+            PermissionMode::Open,
+        )
+        .with_skills_hook(Arc::new(turya_skills::FileSkillProvider::new(&[
+            root.to_string_lossy().to_string(),
+        ])))
+        .with_session_id("live-skills"),
+    );
+    let mut app = TuiApp::new();
+    let (text, ok) = run_turn(
+        engine,
+        "Please write release notes for the last commit. Use the release-notes skill.",
+        &mut app,
+    )
+    .await;
+    assert!(ok, "turn failed:\n{text}");
+    assert!(
+        text.contains("SKILL-WAS-LOADED"),
+        "the model must have read SKILL.md and followed it:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

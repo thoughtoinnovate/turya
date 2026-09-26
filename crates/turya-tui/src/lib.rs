@@ -1156,6 +1156,9 @@ impl TuiApp {
                     "context" => {
                         let _ = cmd_tx.send(TuryaCommand::ContextReport).await;
                     }
+                    "skills" => {
+                        let _ = cmd_tx.send(TuryaCommand::ListSkills).await;
+                    }
                     "efforts" => {
                         // `/efforts` asks the host, which is the only side that
                         // knows the catalog. We never guess a level list here.
@@ -1680,6 +1683,26 @@ impl TuiApp {
                 request_id, action, ..
             } => {
                 self.pending_permission = Some((request_id.clone(), action.clone()));
+            }
+            TuryaEvent::SkillsListed { skills, warnings } => {
+                if skills.is_empty() && warnings.is_empty() {
+                    self.log_dim(
+                        "ℹ no skills found (looked in .agents/skills and configured paths)"
+                            .to_string(),
+                    );
+                } else {
+                    for s in skills {
+                        self.log_line_as(
+                            format!("◆ {} — {}", s.name, s.description),
+                            Speaker::User,
+                        );
+                    }
+                    // Discovery problems are shown, never swallowed: a skill
+                    // that exists but does not load is a real problem.
+                    for w in warnings {
+                        self.log_dim(format!("⚠ {w}"));
+                    }
+                }
             }
             TuryaEvent::EffortsChanged {
                 model,

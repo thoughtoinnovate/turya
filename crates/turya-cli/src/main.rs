@@ -325,6 +325,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine = engine.with_memory_hook(store).with_session_id(&session_id);
     }
 
+    // Agent Skills: discovered from .agents/skills and any configured paths.
+    // Internal plugin, injected through the kernel seam.
+    let extra = settings.skills_paths.clone().unwrap_or_default();
+    let skills = turya_skills::FileSkillProvider::new(&extra);
+    for w in skills.warnings() {
+        eprintln!("Turya: skills: {w}");
+    }
+    let found = skills.skills().len();
+    if found > 0 {
+        eprintln!("Turya: {found} skill(s) available");
+    }
+    let skill_warnings = skills.warnings();
+    engine = engine.with_skills_hook(Arc::new(skills));
+
     // Step 10: live diagnostics when a language server is on PATH.
     engine = engine.with_diagnostics_hook(Arc::new(turya_lsp::LspDiagnosticsHook::rust_analyzer()));
 
@@ -356,6 +370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine,
         config_path,
         format!("{}/turya.db", turya_home_dir()),
+        skill_warnings,
     ));
     let host_sink = host_services::HostEventSink::new(event_tx);
     tokio::spawn(async move {

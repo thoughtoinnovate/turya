@@ -76,6 +76,57 @@ pub trait MemoryHook: Send + Sync {
     async fn session_meta(&self, session_id: &str) -> Result<Option<SessionMeta>, String>;
 }
 
+/// A skill the model may load: the catalog entry, not the body.
+///
+/// This is tier 1 of progressive disclosure — name, description and location,
+/// roughly a hundred tokens for the whole set. The body is loaded on demand,
+/// so advertising a skill is cheap and activating one is deliberate. It is the
+/// protocol shape, re-exported, so a skill crosses the seam unchanged.
+pub use turya_protocol::SkillRef;
+
+/// Skills seam: discovery and catalog injection.
+///
+/// Separate from `MemoryHook` because skills are discovered state, not
+/// remembered state: the catalog does not change per prompt, and a future
+/// skill backend (MCP `skill://` resources) should not have to pretend to be
+/// a database.
+#[async_trait]
+pub trait SkillHook: Send + Sync {
+    /// `pre_turn`: the catalog to advertise this turn. Cheap to call, and
+    /// expected to return few enough entries to fit in the prompt.
+    async fn skill_catalog(&self, session_id: &str) -> Vec<SkillRef>;
+
+    /// The full body of one skill, loaded when it is activated. Returns
+    /// `None` for an unknown name rather than an error: the model may have
+    /// guessed, and a guess must not fail a turn.
+    async fn load_skill(&self, name: &str) -> Option<String>;
+}
+
+/// Render the skill catalog for injection into a turn's instructions.
+///
+/// Lives here, beside the trait, so the wording is part of the seam's contract
+/// rather than an implementation detail: a second backend that forgets to say
+/// how to load a skill would advertise a knob that does nothing.
+pub fn render_catalog(skills: &[SkillRef]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "[skills] The following skills are available. Each is a directory \
+         containing a SKILL.md file. When a task matches one, read that file \
+         with your file tool before proceeding, and resolve any relative paths \
+         inside it against the skill's own directory. Do not load a skill that \
+         is not relevant.\n",
+    );
+    for s in skills {
+        out.push_str(&format!(
+            "- {}: {} ({})\n",
+            s.name, s.description, s.location
+        ));
+    }
+    out
+}
+
 /// One file diagnostic in protocol-neutral shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiagnostic {
@@ -147,6 +198,18 @@ mod tests {
         }
     }
 
+    struct NoopSkills;
+
+    #[async_trait]
+    impl SkillHook for NoopSkills {
+        async fn skill_catalog(&self, _s: &str) -> Vec<SkillRef> {
+            Vec::new()
+        }
+        async fn load_skill(&self, _n: &str) -> Option<String> {
+            None
+        }
+    }
+
     struct NoopDiagnostics;
     #[async_trait]
     impl DiagnosticsHook for NoopDiagnostics {
@@ -160,6 +223,10 @@ mod tests {
 
     #[tokio::test]
     async fn hook_traits_are_object_safe_and_send_sync() {
+        let skills: Box<dyn SkillHook> = Box::new(NoopSkills);
+        assert!(skills.skill_catalog("s").await.is_empty());
+        assert!(skills.load_skill("nope").await.is_none());
+
         fn assert_hook<M: MemoryHook + Send + Sync, D: DiagnosticsHook + Send + Sync>(
             _m: M,
             _d: D,

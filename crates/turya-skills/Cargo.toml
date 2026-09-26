@@ -1,0 +1,14 @@
+[package]
+name = "turya-skills"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+turya-core = { path = "../turya-core" }
+turya-protocol = { path = "../turya-protocol" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+turya-tools = { path = "../turya-tools" }
