@@ -76,7 +76,7 @@ turya update              # patch/minor in-place self-update
 turya update --check      # report only, change nothing
 turya upgrade             # cross-major (asks for confirmation)
 turya upgrade --yes       # cross-major, non-interactive
-turya update --version v0.1.3   # explicit pin (may downgrade)
+turya update --version v0.1.4   # explicit pin (may downgrade)
 ```
 
 Both verify SHA256 checksums, keep a `.bak` backup of the replaced binary, and
@@ -96,6 +96,43 @@ turya export <id>           # one session as newline-delimited JSON
 turya auth login gemini     # store a credential
 turya auth status           # what is authenticated, and where it is stored
 ```
+
+### Providers
+
+| Provider | Credential | Models come from |
+|----------|-----------|------------------|
+| `gemini` | API key or Google sign-in | the Gemini API |
+| `anthropic` | API key | the Anthropic API |
+| `ollama` | **none** — it is a server you run | your own daemon, live |
+
+```bash
+turya --provider ollama --model qwen3.5:9b
+turya auth status            # ollama shows as "not required", never locked
+```
+
+A local model needs no API key, so `ollama` works on a machine where nothing
+has ever been authenticated. Point it somewhere other than the default with
+`OLLAMA_HOST` or `ollama_host` in the config file:
+
+```toml
+provider = "ollama"
+model = "qwen3.5:9b"
+ollama_host = "http://192.168.1.10:11434"
+```
+
+`OLLAMA_API_KEY` is optional and only for a reverse proxy or a remote daemon.
+
+**Model detection reads the running server**, not a bundled list, so what you
+have pulled is what `/models` shows. Each model's `capabilities` and context
+length come from the daemon itself, which means a small model correctly
+reports that it cannot call tools. `turya` also pins the context length it
+sends, so the window you see is the window in force — Ollama's own default
+on a machine with no GPU is 4096, well below what most models advertise.
+
+Local models vary enormously in ability. Anything under a few billion
+parameters will stream text and may call a tool, but will not drive a
+multi-step task reliably; use a local model for drafts, search and summaries
+rather than for agentic work.
 
 ### Keys
 
@@ -172,10 +209,21 @@ asks before it runs — a server can do anything its host can.
 ### Subagents
 
 The model can hand a self-contained side task to a subagent and get back a
-summary, keeping the main context for reasoning about the answer. You see one
-row per delegation, not a transcript of everything the child did. Nesting is
-capped at one level: a subagent that could spawn subagents could spawn a fork
-bomb.
+summary, keeping the main context for reasoning about the answer.
+
+**They run in parallel.** Ask for five and you get five at once, not five in a
+row — serial delegation costs five turns of latency for what the model could
+have done in one. At most four run at once; past that the model is told the
+number rather than quietly truncated, because a subagent is a real number of
+model calls.
+
+You see one row per delegation plus a live line as each child works, not a
+transcript of everything it did. `Ctrl+E` opens the child's own conversation
+— its sub-prompt, every tool call, the result — and `Ctrl+E` again folds it
+back.
+
+Nesting is capped at one level: a subagent that could spawn subagents could
+spawn a fork bomb. `Esc` stops the whole turn, children included.
 
 ### Images
 
