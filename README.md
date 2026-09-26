@@ -76,7 +76,7 @@ turya update              # patch/minor in-place self-update
 turya update --check      # report only, change nothing
 turya upgrade             # cross-major (asks for confirmation)
 turya upgrade --yes       # cross-major, non-interactive
-turya update --version v0.1.2   # explicit pin (may downgrade)
+turya update --version v0.1.3   # explicit pin (may downgrade)
 ```
 
 Both verify SHA256 checksums, keep a `.bak` backup of the replaced binary, and
@@ -114,7 +114,7 @@ turya auth status           # what is authenticated, and where it is stored
 ### Slash commands
 
 `/help` `/models` `/auth` `/efforts` `/thinking` `/steps` `/queue` `/compact`
-`/context` `/sessions` `/settings` `/clear`
+`/context` `/sessions` `/settings` `/skills` `/mcp` `/clear`
 
 | Command | Does |
 |---------|------|
@@ -126,7 +126,64 @@ turya auth status           # what is authenticated, and where it is stored
 | `/compact [focus]` | Summarise older turns to free context |
 | `/context` | Context usage against the model window |
 | `/sessions [id]` | List sessions; with an id, resume it |
-| `/settings [key value]` | Tints and mouse capture |
+| `/settings [key value]` | Colour, tints and mouse capture. Saved to the config file |
+| `/skills` | Agent Skills found in this project, with the paths |
+| `/mcp` | MCP servers, the tools each one added, and why a failed one is missing |
+
+## Extending turya
+
+### Agent Skills
+
+Drop a directory with a `SKILL.md` in `.agents/skills/` (or `.turya/skills/`,
+or any path in `skills_paths` in the config file):
+
+```markdown
+---
+name: release-notes
+description: Draft release notes from a range of commits
+---
+
+Draft release notes. Resolve relative paths against this file's own directory.
+```
+
+Only the name, description, and path are put in front of the model, so a
+project with fifty skills does not pay for fifty bodies. The model reads the
+`SKILL.md` itself with its normal file tool when a task actually matches, and
+`/skills` shows what was found. A malformed file is skipped with a reason
+rather than taking the rest of the session's tools away.
+
+### MCP servers
+
+Stdio JSON-RPC servers, configured in the config file:
+
+```toml
+[[mcp_servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/srv/data"]
+```
+
+`initialize`, `tools/list` and `tools/call` are implemented; HTTP transport,
+Tasks and MCP Apps are not, and a server that needs them reports that rather
+than failing silently. Discovered tools are callable exactly like the built-in
+ones, and every one of them is treated as high risk so the permission broker
+asks before it runs — a server can do anything its host can.
+
+### Subagents
+
+The model can hand a self-contained side task to a subagent and get back a
+summary, keeping the main context for reasoning about the answer. You see one
+row per delegation, not a transcript of everything the child did. Nesting is
+capped at one level: a subagent that could spawn subagents could spawn a fork
+bomb.
+
+### Images
+
+An attached image is displayed inline on terminals that can do it — Kitty,
+Ghostty, WezTerm, rio, and iTerm2 — and otherwise shown as a line saying why
+it is not being displayed. Nothing is emitted when output is redirected, and
+`TURYA_IMAGES=off` turns it off deliberately. `NO_COLOR`, or
+`/settings no_color on`, removes all colour including tints and dimming.
 
 ## Cutting a Release
 
