@@ -30,6 +30,17 @@ pub enum RiskLevel {
     Critical,
 }
 
+/// What `/mcp` shows: a server, its command, and the tools it added.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub command: String,
+    pub tools: Vec<String>,
+    /// Why this server is absent or degraded. Present means the user has
+    /// something actionable; absent means it connected cleanly.
+    pub error: Option<String>,
+}
+
 /// A skill advertised to the model (tier 1 of progressive disclosure).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillRef {
@@ -414,6 +425,8 @@ pub enum TuryaCommand {
     },
     /// List the skills available to this session (drives `/skills`).
     ListSkills,
+    /// Report configured MCP servers and the tools each contributed.
+    McpStatus,
     /// Load one skill's body (drives the `load_skill` tool).
     LoadSkill {
         name: String,
@@ -478,6 +491,10 @@ pub enum TuryaEvent {
     SessionResumed {
         session: Box<SessionMeta>,
         transcript: Transcript,
+    },
+    /// Answer to `McpStatus`: one row per server, plus its tools.
+    McpStatus {
+        servers: Vec<McpServerStatus>,
     },
     /// Answer to `ListSkills`, with any discovery problems attached so a
     /// malformed skill is visible rather than silently missing.

@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use turya_auth::{CredentialStore, SlotState};
 use turya_core::{ProviderRegistry, TuryaEngine};
-use turya_protocol::{AuthAction, ModelSummary, ProviderSummary, TuryaCommand, TuryaEvent};
+use turya_protocol::{
+    AuthAction, McpServerStatus, ModelSummary, ProviderSummary, TuryaCommand, TuryaEvent,
+};
 
 /// Pending interactive auth flow (OAuth browser wait or key prompt).
 struct PendingFlow {
@@ -63,6 +65,14 @@ impl HostConfig {
     }
 }
 
+/// Where the host keeps durable state. Grouped so the "which file does what"
+/// question has one answer instead of two bare strings in a constructor.
+#[derive(Debug, Clone)]
+pub struct HostPaths {
+    pub config: String,
+    pub db: String,
+}
+
 pub struct HostServices {
     registry: Arc<ProviderRegistry>,
     store: Arc<dyn CredentialStore>,
@@ -74,6 +84,7 @@ pub struct HostServices {
     db_path: String,
     /// Skill discovery warnings, captured at boot.
     skills_warnings: Vec<String>,
+    mcp: Arc<std::sync::Mutex<turya_mcp::McpRegistry>>,
     flows: Mutex<HashMap<String, PendingFlow>>,
     flow_seq: Mutex<u64>,
 }
@@ -84,18 +95,19 @@ impl HostServices {
         store: Arc<dyn CredentialStore>,
         catalog: turya_catalog::Catalog,
         engine: Arc<TuryaEngine>,
-        config_path: String,
-        db_path: String,
+        paths: HostPaths,
         skills_warnings: Vec<String>,
+        mcp: Arc<std::sync::Mutex<turya_mcp::McpRegistry>>,
     ) -> Self {
         Self {
             registry,
             store,
             catalog,
             engine,
-            config_path,
-            db_path,
+            config_path: paths.config,
+            db_path: paths.db,
             skills_warnings,
+            mcp,
             flows: Mutex::new(HashMap::new()),
             flow_seq: Mutex::new(0),
         }
@@ -244,6 +256,32 @@ impl HostServices {
                     }
                     Err(e) => events.send(TuryaEvent::Error { message: e }).await,
                 }
+                true
+            }
+            TuryaCommand::McpStatus => {
+                let rows = self
+                    .mcp
+                    .lock()
+                    .map(|r| {
+                        r.listing()
+                            .into_iter()
+                            .map(|(name, command, tools, error)| McpServerStatus {
+                                name,
+                                command,
+                                tools,
+                                error,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|_| {
+                        vec![McpServerStatus {
+                            name: "mcp".to_string(),
+                            command: String::new(),
+                            tools: Vec::new(),
+                            error: Some("registry is poisoned".to_string()),
+                        }]
+                    });
+                events.send(TuryaEvent::McpStatus { servers: rows }).await;
                 true
             }
             TuryaCommand::ListSkills => {
@@ -1205,9 +1243,12 @@ mod tests {
             store,
             catalog,
             engine,
-            "/tmp/turya-host-router-test-config.toml".to_string(),
-            "/tmp/turya-host-router-test.db".to_string(),
+            HostPaths {
+                config: "/tmp/turya-host-router-test-config.toml".to_string(),
+                db: "/tmp/turya-host-router-test.db".to_string(),
+            },
             Vec::new(),
+            Arc::new(std::sync::Mutex::new(turya_mcp::McpRegistry::empty())),
         );
         (host, tx, rx)
     }
@@ -1354,12 +1395,15 @@ mod tests {
             store,
             catalog,
             engine,
-            config_path.to_string_lossy().to_string(),
-            config_path
-                .with_extension("db")
-                .to_string_lossy()
-                .to_string(),
+            HostPaths {
+                config: config_path.to_string_lossy().to_string(),
+                db: config_path
+                    .with_extension("db")
+                    .to_string_lossy()
+                    .to_string(),
+            },
             Vec::new(),
+            Arc::new(std::sync::Mutex::new(turya_mcp::McpRegistry::empty())),
         );
         let sink = HostEventSink::new(tx);
         let consumed = host

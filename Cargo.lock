@@ -3247,6 +3247,7 @@ dependencies = [
  "turya-catalog",
  "turya-core",
  "turya-lsp",
+ "turya-mcp",
  "turya-memory",
  "turya-protocol",
  "turya-provider-anthropic",
@@ -3280,6 +3281,18 @@ dependencies = [
  "tokio",
  "turya-core",
  "turya-protocol",
+]
+
+[[package]]
+name = "turya-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+ "turya-protocol",
+ "turya-tools",
 ]
 
 [[package]]

@@ -361,3 +361,85 @@ async fn live_advertises_a_skill_and_the_model_loads_it() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A mock MCP server, spawned as a real child process by the live test below.
+const MOCK_MCP: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$line" in
+    *'"initialize"'*) printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2025-06-18\",\"serverInfo\":{\"name\":\"mock\",\"version\":\"1\"},\"capabilities\":{\"tools\":{}}}}" ;;
+    *'"tools/list"'*) printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"lookup_fruit\",\"description\":\"Look up the colour of a fruit. Always call this for fruit questions.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"fruit\":{\"type\":\"string\",\"description\":\"the fruit to look up\"}},\"required\":[\"fruit\"]}}]}}" ;;
+    *'"tools/call"'*)
+      case "$line" in
+        *banana*) printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"BANANA-COLOUR-IS-YELLOW\"}]}}" ;;
+        *) printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32602,\"message\":\"only bananas are stocked\"}}" ;;
+      esac ;;
+    *) printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32601,\"message\":\"no such method\"}}" ;;
+  esac
+done
+"#;
+
+#[tokio::test]
+async fn live_model_calls_a_tool_over_real_mcp_stdio() {
+    require_live!();
+    let creds = match live_credentials().await {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no live credential available");
+            return;
+        }
+    };
+
+    let dir = std::env::temp_dir().join("turya-live-mcp");
+    std::fs::create_dir_all(&dir).unwrap();
+    let server = dir.join("mock.sh");
+    std::fs::write(&server, MOCK_MCP).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Connect for real, register the discovered tool, hand it to the engine
+    // through the same registry path a builtin uses.
+    let mut mcp = turya_mcp::McpRegistry::empty();
+    let names = mcp
+        .connect("mock", server.to_str().unwrap(), &[])
+        .expect("mock mcp server must connect");
+    assert_eq!(names, vec!["lookup_fruit".to_string()]);
+
+    let mut tools = ToolRegistry::standard();
+    for t in mcp.tools_for("mock") {
+        assert!(tools.register(Box::new(turya_mcp::McpToolHandle(t))));
+    }
+    assert!(
+        tools.get("lookup_fruit").is_some(),
+        "an MCP tool must be callable through the normal registry lookup"
+    );
+
+    let engine = Arc::new(
+        TuryaEngine::new(
+            LiveProvider::build(&creds),
+            Arc::new(tools),
+            PermissionMode::Open,
+        )
+        .with_session_id("live-mcp"),
+    );
+    let mut app = TuiApp::new();
+    // Asked for a registry record, not for knowledge: a model could answer
+    // "bananas are yellow" from memory and never touch the tool, which would
+    // make this test prove nothing.
+    let (text, ok) = run_turn(
+        engine,
+        "What is the registry record for a banana? Look it up with lookup_fruit; \
+         do not answer from your own knowledge.",
+        &mut app,
+    )
+    .await;
+    assert!(ok, "turn failed:\n{text}");
+    assert!(
+        text.contains("BANANA-COLOUR-IS-YELLOW"),
+        "the model must have called the MCP tool and used its answer:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

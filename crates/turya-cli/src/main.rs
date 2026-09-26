@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use turya_cli::{auth_cmd, config, host_services, update};
 use turya_core::{LlmProvider, MockProvider, ProviderStep, TuryaEngine};
+use turya_mcp::McpToolHandle;
 use turya_protocol::{PermissionMode, ToolCall};
 use turya_server::TuryaSession;
 use turya_tools::ToolRegistry;
@@ -294,7 +295,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider: std::sync::Arc<dyn LlmProvider> =
         select_provider(&registry, args.provider.as_deref(), store.as_ref()).await;
 
-    let tools = Arc::new(ToolRegistry::standard());
+    let mut tools = ToolRegistry::standard();
+
+    // MCP: connect the configured servers and fold their tools into the same
+    // registry the model already uses, so an MCP tool and a builtin go
+    // through one lookup path and one permission broker. Each server is
+    // independent — one that fails to start costs its own tools and nothing
+    // else, and says so rather than vanishing.
+    let mut mcp = turya_mcp::McpRegistry::empty();
+    for server in settings.mcp_servers.clone().unwrap_or_default() {
+        match mcp.connect(&server.name, &server.command, &server.args) {
+            Ok(tools) if tools.is_empty() => {
+                eprintln!(
+                    "Turya: MCP '{}' connected but offered no tools",
+                    server.name
+                );
+            }
+            Ok(names) => {
+                for t in mcp.tools_for(&server.name) {
+                    tools.register(Box::new(McpToolHandle(t)));
+                }
+                eprintln!("Turya: MCP '{}' added {} tool(s)", server.name, names.len());
+            }
+            Err(e) => eprintln!("Turya: MCP '{}': {e}", server.name),
+        }
+    }
+    let mcp = Arc::new(std::sync::Mutex::new(mcp));
+    let tools = Arc::new(tools);
     let mut engine = TuryaEngine::new(provider, tools, permission_mode);
 
     // Step 8: episodic memory at $TURYA_HOME or ~/.turya/turya.db (best-effort).
@@ -368,9 +395,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store,
         catalog,
         engine,
-        config_path,
-        format!("{}/turya.db", turya_home_dir()),
+        host_services::HostPaths {
+            config: config_path,
+            db: format!("{}/turya.db", turya_home_dir()),
+        },
         skill_warnings,
+        mcp,
     ));
     let host_sink = host_services::HostEventSink::new(event_tx);
     tokio::spawn(async move {

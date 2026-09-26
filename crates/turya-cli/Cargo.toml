@@ -17,6 +17,7 @@ turya-memory = { path = "../turya-memory" }
 turya-lsp = { path = "../turya-lsp" }
 turya-auth = { path = "../turya-auth" }
 turya-catalog = { path = "../turya-catalog" }
+turya-mcp = { path = "../turya-mcp" }
 turya-skills = { path = "../turya-skills" }
 turya-provider-anthropic = { path = "../turya-provider-anthropic" }
 turya-provider-gemini = { path = "../turya-provider-gemini" }

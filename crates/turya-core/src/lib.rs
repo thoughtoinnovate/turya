@@ -534,16 +534,27 @@ mod tests {
 
         let seen = provider.seen_history.lock().unwrap();
         let parts: Vec<_> = seen[1].turns.iter().flat_map(|t| t.parts.iter()).collect();
-        assert_eq!(parts.len(), 11, "1 user turn + 5 calls + 5 results");
-        assert!(matches!(parts[0], turya_protocol::Part::UserText { .. }));
+        // The catalog instruction leads: the model has to be told the tool
+        // names before it can call any of them.
+        assert_eq!(
+            parts.len(),
+            12,
+            "1 catalog + 1 user turn + 5 calls + 5 results"
+        );
+        assert!(
+            matches!(&parts[0], turya_protocol::Part::Instruction { text } if text.contains("run_bash")),
+            "the tool catalog must lead the transcript, got {:?}",
+            parts[0]
+        );
+        assert!(matches!(parts[1], turya_protocol::Part::UserText { .. }));
         for i in 0..5 {
-            match parts[1 + i * 2] {
+            match parts[2 + i * 2] {
                 turya_protocol::Part::ToolCall { call_id, .. } => {
                     assert_eq!(call_id.as_str(), format!("k{}", i + 1));
                 }
                 other => panic!("expected ToolCall k{}, got {other:?}", i + 1),
             }
-            match &parts[2 + i * 2] {
+            match &parts[3 + i * 2] {
                 turya_protocol::Part::ToolResult { call_id, .. } => {
                     assert_eq!(call_id.as_str(), format!("k{}", i + 1));
                 }

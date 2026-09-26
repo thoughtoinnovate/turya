@@ -235,6 +235,35 @@ impl TuryaEngine {
     /// instruction ("focus on the auth fix"); `None` is the automatic pass.
     ///
     /// Prunes old tool output first (cheapest win), then asks the model for a
+    /// What the model is told it can call.
+    ///
+    /// Built per turn rather than cached, because the registry can grow at
+    /// runtime — an MCP server connecting mid-session must become callable
+    /// without a restart.
+    fn tool_catalog_instruction(&self) -> String {
+        let mut lines = Vec::new();
+        for name in self.tools.names() {
+            let Some(t) = self.tools.get(&name) else {
+                continue;
+            };
+            let first = t
+                .description()
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            lines.push(format!("- {name}: {first}"));
+        }
+        if lines.is_empty() {
+            return String::new();
+        }
+        format!(
+            "You can call these tools. To use one, emit a tool call with its exact \
+             name and JSON arguments.\n{}",
+            lines.join("\n")
+        )
+    }
+
     /// structured summary with tools structurally dropped, then keeps the last
     /// two turns verbatim so exact values survive. Returns the new transcript
     /// and a short note describing what was kept, or `None` when the
@@ -442,6 +471,14 @@ impl TuryaEngine {
         // Skills are advertised before the prompt, once, as instructions
         // rather than as conversation: the model reads the catalog and loads a
         // body only if a task actually matches.
+        // The tool catalog goes in as an instruction, not as a provider
+        // feature: the model has no other way to learn a name, and an MCP
+        // server's tools are unknowable by guesswork. Names and one-line
+        // summaries only — the schema stays with the tool.
+        let catalog = self.tool_catalog_instruction();
+        if !catalog.is_empty() {
+            transcript.push(Part::Instruction { text: catalog });
+        }
         if let Some(ref hook) = self.skills_hook {
             let catalog = hook.skill_catalog(&self.session_id).await;
             let rendered = crate::skills_catalog(&catalog);

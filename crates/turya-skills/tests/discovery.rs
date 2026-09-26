@@ -100,8 +100,12 @@ async fn the_catalog_reaches_the_model_and_the_body_loads_on_demand() {
         (seen.len(), instructions_in(&seen[0]))
     };
     assert_eq!(call_count, 1, "one model call");
-    assert_eq!(instructions.len(), 1, "{instructions:?}");
-    let catalog = instructions[0].clone();
+    // The tool catalog also leads the transcript; pick out the skills block.
+    let catalog = instructions
+        .iter()
+        .find(|i| i.contains("[skills]"))
+        .unwrap_or_else(|| panic!("no skills catalog in {instructions:?}"))
+        .clone();
     assert!(
         catalog.contains("release-notes"),
         "the skill is advertised: {catalog}"
@@ -152,9 +156,14 @@ async fn a_turn_with_no_skills_injects_nothing() {
     run(&engine, "hello").await;
 
     let seen = recorder.seen.lock().unwrap();
+    // No skills block at all. The tool catalog still leads every turn, so the
+    // check is for absence of skills specifically, not of instructions.
     assert!(
-        instructions_in(&seen[0]).is_empty(),
-        "no skills, no prompt noise"
+        !instructions_in(&seen[0])
+            .iter()
+            .any(|i| i.contains("[skills]")),
+        "no skills, no prompt noise: {:?}",
+        instructions_in(&seen[0])
     );
     let _ = std::fs::remove_dir_all(&root);
 }

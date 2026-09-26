@@ -1,0 +1,14 @@
+[package]
+name = "turya-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+turya-protocol = { path = "../turya-protocol" }
+turya-tools = { path = "../turya-tools" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

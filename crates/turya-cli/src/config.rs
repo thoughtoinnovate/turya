@@ -11,6 +11,16 @@ use std::path::Path;
 /// Current settings schema. Bump freely; old files are rejected, not migrated.
 pub const CONFIG_VERSION: u32 = 1;
 
+/// One MCP server the user configured. A command and its arguments: all the
+/// stdio transport needs, since that is a host path plus how to run it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TuryaConfig {
@@ -35,8 +45,8 @@ pub struct TuryaConfig {
     /// `turya update` / `upgrade` mouse wheel support. `auto` probes the
     /// terminal; `on` forces it; `off` keeps native text selection.
     pub mouse: Option<String>,
-    /// MCP servers enabled by id.
-    pub mcp_enabled: Option<Vec<String>>,
+    /// MCP servers to connect at startup.
+    pub mcp_servers: Option<Vec<McpServerConfig>>,
     /// Extra skill directories.
     pub skills_paths: Option<Vec<String>>,
     /// Optional background tints, hex or `none`. Default: none, because a
@@ -64,7 +74,7 @@ impl Default for TuryaConfig {
             queue_behavior: Some("steer".to_string()),
             show_thinking: Some(true),
             mouse: Some("auto".to_string()),
-            mcp_enabled: None,
+            mcp_servers: None,
             skills_paths: None,
             user_bg: None,
             assistant_bg: None,

@@ -6,8 +6,10 @@ use turya_protocol::{RiskLevel, ToolResult};
 
 #[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+    /// Owned strings, not `&'static str`: a tool discovered at runtime (an
+    /// MCP server's tool) has no static name to return.
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
     fn risk_level(&self, params: &serde_json::Value) -> RiskLevel;
     async fn execute(&self, call_id: &str, params: serde_json::Value) -> ToolResult;
 }
@@ -176,6 +178,21 @@ impl ToolRegistry {
                 Box::new(RunBashTool),
             ],
         }
+    }
+
+    /// Add a tool discovered at runtime. First registration wins, so a
+    /// builtin is never shadowed by a server offering the same name.
+    pub fn register(&mut self, tool: Box<dyn Tool>) -> bool {
+        if self.get(tool.name()).is_some() {
+            return false;
+        }
+        self.tools.push(tool);
+        true
+    }
+
+    /// Tool names, in registration order (drives the MCP listing).
+    pub fn names(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.name().to_string()).collect()
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {

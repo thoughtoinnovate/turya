@@ -129,6 +129,13 @@ impl SlashRegistry {
                 source: CommandSource::Builtin,
             },
             SlashCommand {
+                name: "mcp",
+                description: "List MCP servers and their tools",
+                hint: "",
+                kind: CommandKind::Local,
+                source: CommandSource::Builtin,
+            },
+            SlashCommand {
                 name: "skills",
                 description: "List available Agent Skills",
                 hint: "",
@@ -265,7 +272,7 @@ mod tests {
     #[test]
     fn builtins_registered_once() {
         let reg = registry();
-        assert_eq!(reg.filter("").len(), 14);
+        assert_eq!(reg.filter("").len(), 15);
         let mut dup = registry();
         dup.register(SlashCommand {
             name: "models",
@@ -274,7 +281,7 @@ mod tests {
             kind: CommandKind::Local,
             source: CommandSource::Plugin,
         });
-        assert_eq!(dup.filter("").len(), 14);
+        assert_eq!(dup.filter("").len(), 15);
         assert_eq!(
             dup.get("models").unwrap().description,
             "Browse providers & switch model"
@@ -285,12 +292,13 @@ mod tests {
     fn filter_prefix_first_then_alpha() {
         let reg = registry();
         let names: Vec<_> = reg.filter("mo").iter().map(|c| c.name).collect();
+        // Prefix match, so "mcp" (which starts "mc") is not here.
         assert_eq!(names, vec!["models"]);
         let all: Vec<_> = reg.filter("").iter().map(|c| c.name).collect();
         assert_eq!(
             all,
             vec![
-                "auth", "clear", "compact", "context", "cost", "efforts", "help", "models",
+                "auth", "clear", "compact", "context", "cost", "efforts", "help", "mcp", "models",
                 "queue", "sessions", "settings", "skills", "steps", "thinking"
             ]
         );
@@ -323,7 +331,7 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "auth");
         // Bare slash lists everything.
-        assert_eq!(c.matches("/", &reg).len(), 14);
+        assert_eq!(c.matches("/", &reg).len(), 15);
     }
 
     #[test]

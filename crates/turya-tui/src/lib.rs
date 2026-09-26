@@ -1159,6 +1159,9 @@ impl TuiApp {
                     "skills" => {
                         let _ = cmd_tx.send(TuryaCommand::ListSkills).await;
                     }
+                    "mcp" => {
+                        let _ = cmd_tx.send(TuryaCommand::McpStatus).await;
+                    }
                     "efforts" => {
                         // `/efforts` asks the host, which is the only side that
                         // knows the catalog. We never guess a level list here.
@@ -1683,6 +1686,36 @@ impl TuiApp {
                 request_id, action, ..
             } => {
                 self.pending_permission = Some((request_id.clone(), action.clone()));
+            }
+            TuryaEvent::McpStatus { servers } => {
+                if servers.is_empty() {
+                    self.log_dim(
+                        "ℹ no MCP servers configured (add mcp_servers to config.toml)".to_string(),
+                    );
+                }
+                for s in servers.clone() {
+                    // A server that failed says so here rather than leaving the
+                    // user to wonder why its tools are missing.
+                    match s.error {
+                        Some(e) => {
+                            self.log_line_as(format!("✗ MCP {} — {e}", s.name), Speaker::User)
+                        }
+                        None => {
+                            self.log_line_as(
+                                format!(
+                                    "◆ MCP {} — {} tool(s) via {}",
+                                    s.name,
+                                    s.tools.len(),
+                                    s.command
+                                ),
+                                Speaker::User,
+                            );
+                            for t in s.tools {
+                                self.log_dim(format!("  {t}"));
+                            }
+                        }
+                    }
+                }
             }
             TuryaEvent::SkillsListed { skills, warnings } => {
                 if skills.is_empty() && warnings.is_empty() {
