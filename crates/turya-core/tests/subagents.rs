@@ -724,3 +724,76 @@ async fn a_legitimate_repeat_after_a_different_call_still_runs() {
     );
     let _ = std::fs::remove_file("turya-repeat-probe.txt");
 }
+
+/// Fails a tool and records what the model was actually told.
+struct FailingTool {
+    results: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for FailingTool {
+    async fn generate_turn(
+        &self,
+        transcript: &Transcript,
+        tx: mpsc::Sender<ProviderStep>,
+    ) -> Result<(), String> {
+        if let Some(t) = transcript.turns.last() {
+            for p in &t.parts {
+                if let Part::ToolResult { output, .. } = p {
+                    self.results.lock().unwrap().push(output.clone());
+                }
+            }
+        }
+        if transcript
+            .turns
+            .iter()
+            .flat_map(|t| t.parts.iter())
+            .any(|p| matches!(p, Part::ToolResult { .. }))
+        {
+            let _ = tx.send(ProviderStep::Finish).await;
+            return Ok(());
+        }
+        // `exit 3` fails, and its stderr is the diagnostic worth seeing.
+        let _ = tx
+            .send(ProviderStep::CallTool(ToolCall {
+                call_id: "f1".into(),
+                tool_name: "run_bash".into(),
+                parameters: serde_json::json!({
+                    "command": "echo 'error[E0308]: mismatched types' 1>&2; exit 3"
+                }),
+                signature: None,
+            }))
+            .await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_failed_command_still_shows_the_model_its_output() {
+    // "Exited with code: 3" on its own is useless. The diagnostic is the whole
+    // point of a failing shell command, and it used to be thrown away - which
+    // is how an agent ends up guessing why a build broke.
+    let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine = TuryaEngine::new(
+        Arc::new(FailingTool {
+            results: results.clone(),
+        }),
+        Arc::new(ToolRegistry::standard()),
+        PermissionMode::Open,
+    );
+    run(engine).await;
+
+    let results = results.lock().unwrap();
+    let told = results
+        .iter()
+        .find(|r| r.contains("run_bash"))
+        .expect("the model must be told the command failed");
+    assert!(
+        told.contains("error[E0308]: mismatched types"),
+        "the diagnostic must survive: {told}"
+    );
+    assert!(
+        told.contains("Exited with code"),
+        "and so must the reason it failed: {told}"
+    );
+}

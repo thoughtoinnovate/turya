@@ -946,11 +946,25 @@ impl TuryaEngine {
                     let result = self
                         .execute_tool_call(&call, event_tx, perm_rx, ctx, mode, last_call)
                         .await;
-                    let summary = result
-                        .error
-                        .clone()
-                        .filter(|_| !result.success)
-                        .unwrap_or_else(|| result.output.clone());
+                    // On failure the output is usually the whole point. A
+                    // shell command that fails says "Exited with code: 101",
+                    // which tells the model nothing, while its stderr holds
+                    // the actual compiler errors. Sending only the reason
+                    // leaves the model blind exactly when it needs to see.
+                    let summary = if result.success || result.output.trim().is_empty() {
+                        result
+                            .error
+                            .clone()
+                            .filter(|_| !result.success)
+                            .unwrap_or_else(|| result.output.clone())
+                    } else {
+                        match result.error.clone() {
+                            Some(reason) if !reason.trim().is_empty() => {
+                                format!("{reason}\n{}", result.output)
+                            }
+                            _ => result.output.clone(),
+                        }
+                    };
                     let recorded = truncate_history(&summary, MAX_TOOL_HISTORY_CHARS);
                     parts.push(Part::ToolResult {
                         call_id: call.call_id.clone(),
