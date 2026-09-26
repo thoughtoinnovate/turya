@@ -458,3 +458,269 @@ async fn a_child_that_outfills_the_event_channel_does_not_deadlock() {
         &summary[..summary.len().min(120)]
     );
 }
+
+/// A subagent that needs permission the user has not granted yet.
+struct NeedyChild {
+    seen: Arc<std::sync::Mutex<Vec<Transcript>>>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for NeedyChild {
+    async fn generate_turn(
+        &self,
+        transcript: &Transcript,
+        tx: mpsc::Sender<ProviderStep>,
+    ) -> Result<(), String> {
+        self.seen.lock().unwrap().push(transcript.clone());
+        let is_child = transcript
+            .turns
+            .iter()
+            .flat_map(|t| t.parts.iter())
+            .filter_map(|p| match p {
+                Part::UserText { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .any(|t| t.contains("You are the subagent"));
+        if is_child {
+            let answered = transcript
+                .turns
+                .iter()
+                .flat_map(|t| t.parts.iter())
+                .any(|p| matches!(p, Part::ToolResult { .. }));
+            if !answered {
+                // run_bash is High risk, so Manual mode asks the user first.
+                // This is the call that used to deadlock.
+                let _ = tx
+                    .send(ProviderStep::CallTool(ToolCall {
+                        call_id: "need-1".into(),
+                        tool_name: "run_bash".into(),
+                        parameters: serde_json::json!({ "command": "echo hi" }),
+                        signature: None,
+                    }))
+                    .await;
+            } else {
+                let _ = tx.send(ProviderStep::Token("child finished".into())).await;
+            }
+            return Ok(());
+        }
+        let done = transcript
+            .turns
+            .iter()
+            .flat_map(|t| t.parts.iter())
+            .any(|p| matches!(p, Part::ToolResult { .. }));
+        if !done {
+            let _ = tx
+                .send(ProviderStep::CallTool(ToolCall {
+                    call_id: "n1".into(),
+                    tool_name: SPAWN_AGENT_TOOL.into(),
+                    parameters: serde_json::json!({ "name": "needy", "task": "run a command" }),
+                    signature: None,
+                }))
+                .await;
+        } else {
+            let _ = tx.send(ProviderStep::Token("parent done".into())).await;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_subagents_permission_request_reaches_the_user_instead_of_deadlocking() {
+    // Manual mode plus a subagent that runs a High-risk tool used to hang
+    // forever: the request was dropped on the floor, the child waited for an
+    // answer that could not come, and the parent waited for the child. Bounded
+    // by a timeout so a regression fails the suite instead of stalling CI.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine = TuryaEngine::new(
+        Arc::new(NeedyChild { seen: seen.clone() }),
+        Arc::new(ToolRegistry::standard()),
+        PermissionMode::Manual,
+    );
+
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    // The permission channel the host normally owns. Nothing answers on it,
+    // which is exactly the case that used to hang.
+    let (perm_tx, perm_rx) = mpsc::channel(4);
+    drop(perm_tx);
+
+    let turn = {
+        let engine = Arc::new(engine);
+        tokio::spawn(async move {
+            engine
+                .run_turn(
+                    "perm-1",
+                    "have a subagent run a command",
+                    AgentMode::Build,
+                    &[],
+                    event_tx,
+                    perm_rx,
+                )
+                .await;
+        })
+    };
+
+    let mut asked: Option<String> = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, event_rx.recv()).await {
+            Ok(Some(TuryaEvent::PermissionRequested { action, .. })) => {
+                asked = Some(action);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let _ = turn.await;
+
+    assert_eq!(
+        asked.as_deref(),
+        Some("run_bash"),
+        "the user must be asked before a subagent's High-risk tool runs"
+    );
+    let _ = seen;
+}
+
+/// Calls one tool with one set of arguments, forever.
+struct Looper;
+
+#[async_trait::async_trait]
+impl LlmProvider for Looper {
+    async fn generate_turn(
+        &self,
+        _transcript: &Transcript,
+        tx: mpsc::Sender<ProviderStep>,
+    ) -> Result<(), String> {
+        let _ = tx
+            .send(ProviderStep::CallTool(ToolCall {
+                call_id: "loop".into(),
+                tool_name: "view_file".into(),
+                parameters: serde_json::json!({ "path": "Cargo.toml" }),
+                signature: None,
+            }))
+            .await;
+        let _ = tx.send(ProviderStep::Token("done".into())).await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_model_that_repeats_the_same_call_is_stopped_instead_of_burning_the_budget() {
+    // The exact shape seen in a real session: the same tool, the same
+    // arguments, over and over, each answered with identical filler. Only the
+    // step budget stopped it, so the user watched a frozen screen for the
+    // length of the budget.
+    let engine = TuryaEngine::new(
+        Arc::new(Looper),
+        Arc::new(ToolRegistry::standard()),
+        PermissionMode::Open,
+    );
+    let events = run(engine).await;
+
+    // Counted from the event stream, which is the ground truth: one entry per
+    // completed call, in order.
+    let mut executed = 0usize;
+    let mut refused = 0usize;
+    for e in &events {
+        if let TuryaEvent::ToolCallCompleted(r) = e {
+            if r.success {
+                executed += 1;
+            } else if r
+                .error
+                .as_deref()
+                .is_some_and(|m| m.contains("just called with these exact arguments"))
+            {
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!(
+        executed, 1,
+        "the file is read exactly once however often the model retries \
+         (executed={executed} refused={refused})"
+    );
+    assert!(
+        refused > 1,
+        "every repeat must be refused rather than alternated (refused={refused})"
+    );
+}
+
+#[tokio::test]
+async fn a_legitimate_repeat_after_a_different_call_still_runs() {
+    // The guard must not break real work: re-reading a file after changing
+    // something else is exactly what an agent does.
+    struct Rereader {
+        results: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for Rereader {
+        async fn generate_turn(
+            &self,
+            transcript: &Transcript,
+            tx: mpsc::Sender<ProviderStep>,
+        ) -> Result<(), String> {
+            let n = transcript
+                .turns
+                .iter()
+                .flat_map(|t| t.parts.iter())
+                .filter(|p| matches!(p, Part::ToolResult { .. }))
+                .count();
+            for r in transcript
+                .turns
+                .last()
+                .into_iter()
+                .flat_map(|t| t.parts.iter())
+            {
+                if let Part::ToolResult { output, .. } = r {
+                    self.results.lock().unwrap().push(output.clone());
+                }
+            }
+            // read, write, read again - the same read, not consecutive.
+            let call = match n {
+                0 => ToolCall {
+                    call_id: "a".into(),
+                    tool_name: "view_file".into(),
+                    parameters: serde_json::json!({ "path": "Cargo.toml" }),
+                    signature: None,
+                },
+                1 => ToolCall {
+                    call_id: "b".into(),
+                    tool_name: "write_file".into(),
+                    parameters: serde_json::json!({ "path": "turya-repeat-probe.txt", "content": "x" }),
+                    signature: None,
+                },
+                2 => ToolCall {
+                    call_id: "c".into(),
+                    tool_name: "view_file".into(),
+                    parameters: serde_json::json!({ "path": "Cargo.toml" }),
+                    signature: None,
+                },
+                _ => {
+                    let _ = tx.send(ProviderStep::Finish).await;
+                    return Ok(());
+                }
+            };
+            let _ = tx.send(ProviderStep::CallTool(call)).await;
+            Ok(())
+        }
+    }
+
+    let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine = TuryaEngine::new(
+        Arc::new(Rereader {
+            results: results.clone(),
+        }),
+        Arc::new(ToolRegistry::standard()),
+        PermissionMode::Open,
+    );
+    run(engine).await;
+
+    let results = results.lock().unwrap();
+    assert!(
+        !results
+            .iter()
+            .any(|r| r.contains("just called with these exact arguments")),
+        "a non-consecutive repeat is legitimate and must run: {results:?}"
+    );
+    let _ = std::fs::remove_file("turya-repeat-probe.txt");
+}

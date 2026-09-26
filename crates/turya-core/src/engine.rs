@@ -379,6 +379,7 @@ impl TuryaEngine {
         // `transcript` end before either is used again below.
         // The block ends the drain future's borrows of `child_rx` and
         // `transcript` before either is read again.
+        let parent_events = event_tx;
         {
             let child = Box::pin(self.run_turn_at(
                 &child_turn_id,
@@ -394,8 +395,33 @@ impl TuryaEngine {
             ));
             let drain = async {
                 while let Some(ev) = child_rx.recv().await {
-                    if let TuryaEvent::TokenDelta { chunk } = ev {
-                        transcript.push_str(&chunk);
+                    match ev {
+                        TuryaEvent::TokenDelta { chunk } => transcript.push_str(&chunk),
+                        // A child's permission request must reach the user.
+                        // Discarding it deadlocks the child: it blocks on
+                        // `perm_rx.recv()` waiting for an answer to a question
+                        // nobody was ever shown, and the parent is blocked
+                        // inline waiting for the child. The decision travels
+                        // back through the shared `perm_rx`, so forwarding the
+                        // request is the whole fix.
+                        TuryaEvent::PermissionRequested {
+                            request_id,
+                            action,
+                            risk_level,
+                            details,
+                        } => {
+                            let _ = parent_events
+                                .send(TuryaEvent::PermissionRequested {
+                                    request_id,
+                                    action,
+                                    risk_level,
+                                    details,
+                                })
+                                .await;
+                        }
+                        // Everything else about the child stays private, which
+                        // is the point of delegating.
+                        _ => {}
                     }
                 }
             };
@@ -714,6 +740,8 @@ impl TuryaEngine {
         let mut tools_last_pass = 0u32;
         let mut tool_executions = 0u32;
         let mut tool_cap_hit = false;
+        // The previous tool call's signature, for the repetition guard.
+        let mut last_call: Option<String> = None;
 
         // A subagent is billed against the caller's turn, so it gets its own
         // smaller allowance rather than the session default.
@@ -734,7 +762,15 @@ impl TuryaEngine {
                 execute: true,
             };
             let outcome = self
-                .run_pass(&transcript, &event_tx, perm_rx, gate, &ctx, subagent_mode)
+                .run_pass(
+                    &transcript,
+                    &event_tx,
+                    perm_rx,
+                    gate,
+                    &ctx,
+                    subagent_mode,
+                    &mut last_call,
+                )
                 .await;
             // Appended here, not inside `run_pass`: the provider only ever
             // borrows the transcript, so no pass ever deep-copies the
@@ -777,7 +813,15 @@ impl TuryaEngine {
                 execute: false,
             };
             let outcome = self
-                .run_pass(&transcript, &event_tx, perm_rx, gate, &ctx, subagent_mode)
+                .run_pass(
+                    &transcript,
+                    &event_tx,
+                    perm_rx,
+                    gate,
+                    &ctx,
+                    subagent_mode,
+                    &mut last_call,
+                )
                 .await;
             transcript.extend(outcome.parts);
             if let Some(e) = outcome.provider_err {
@@ -840,6 +884,7 @@ impl TuryaEngine {
         gate: ToolGate<'_>,
         ctx: &TurnCtx,
         mode: AgentMode,
+        last_call: &mut Option<String>,
     ) -> PassOutcome {
         let (step_tx, mut step_rx) = mpsc::channel(32);
         let provider = self.provider.read().unwrap().clone();
@@ -899,7 +944,7 @@ impl TuryaEngine {
                     }
                     *gate.executions += 1;
                     let result = self
-                        .execute_tool_call(&call, event_tx, perm_rx, ctx, mode)
+                        .execute_tool_call(&call, event_tx, perm_rx, ctx, mode, last_call)
                         .await;
                     let summary = result
                         .error
@@ -948,7 +993,43 @@ impl TuryaEngine {
         perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
         ctx: &TurnCtx,
         mode: AgentMode,
+        last_call: &mut Option<String>,
     ) -> turya_protocol::ToolResult {
+        // Repetition guard. A model that calls the same tool with the same
+        // arguments twice in a row is stuck: it will do it until the step
+        // budget runs out, producing an identical result it has already seen.
+        // Observed in the wild - nine identical `view_file` calls, each
+        // followed by byte-identical text, which reads as a frozen UI.
+        //
+        // Only *consecutive* duplicates are refused. Re-reading a file after
+        // writing it is legitimate, and a blanket "never call twice" rule
+        // would break real work.
+        let signature = format!("{}::{}", call.tool_name, call.parameters);
+        if last_call.as_deref() == Some(signature.as_str()) {
+            // Deliberately *not* cleared: a model that alternates refusal and
+            // success would otherwise halve the waste and keep going, which
+            // still reads as a frozen screen. Repeats stay refused until the
+            // model does something genuinely different.
+            let res = turya_protocol::ToolResult {
+                call_id: call.call_id.clone(),
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "'{}' was just called with these exact arguments and you already have \
+                     its result. Repeating it cannot produce anything new: change your \
+                     approach, use different arguments, or answer without it.",
+                    call.tool_name
+                )),
+            };
+            let _ = event_tx
+                .send(TuryaEvent::ToolCallInitiated(call.clone()))
+                .await;
+            let _ = event_tx
+                .send(TuryaEvent::ToolCallCompleted(res.clone()))
+                .await;
+            return res;
+        }
+        *last_call = Some(signature);
         let _ = event_tx
             .send(TuryaEvent::ToolCallInitiated(call.clone()))
             .await;
