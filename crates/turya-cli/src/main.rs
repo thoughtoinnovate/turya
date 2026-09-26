@@ -422,6 +422,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )),
         settings.mouse.as_deref(),
     );
+    // The saved colour mode, resolved the same way the host resolves it, so a
+    // restart keeps a `NO_COLOR` decision the user made with `/settings`.
+    app.apply_color(settings.no_color);
     // `turya resume <id>`: replay the stored conversation so the session looks
     // exactly as it did before the process exited. The engine also loads it
     // for the model; this is the user-visible half.

@@ -30,6 +30,18 @@ pub enum RiskLevel {
     Critical,
 }
 
+/// Everything `/settings` can change, in one shape because it is written as
+/// one file. `None` on a field leaves it alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiSettings {
+    pub user_bg: Option<String>,
+    pub assistant_bg: Option<String>,
+    pub tool_bg: Option<String>,
+    /// `auto` | `on` | `off`.
+    pub mouse: Option<String>,
+    pub no_color: Option<bool>,
+}
+
 /// What `/mcp` shows: a server, its command, and the tools it added.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerStatus {
@@ -422,6 +434,10 @@ pub enum TuryaCommand {
         /// old clients simply never send these.
         max_steps: Option<usize>,
         max_tool_calls: Option<u32>,
+        /// TUI appearance written by `/settings`. The client applies these
+        /// immediately and sends them here to be persisted, so a restart
+        /// keeps what the user just chose.
+        ui: Option<UiSettings>,
     },
     /// List the skills available to this session (drives `/skills`).
     ListSkills,
@@ -671,6 +687,7 @@ mod tests {
                 model: Some("gemini-2.5-pro".to_string()),
                 max_steps: None,
                 max_tool_calls: None,
+                ui: None,
             },
         ];
         for cmd in cmds {

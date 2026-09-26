@@ -490,12 +490,19 @@ impl HostServices {
                 model,
                 max_steps,
                 max_tool_calls,
+                ui,
             } => {
                 // Budgets apply even when no provider/model switch rides
                 // along. Infallible (engine clamps): the client echoes
                 // optimistically, like the model-switch toast.
                 if max_steps.is_some() || max_tool_calls.is_some() {
                     self.engine.set_budgets(*max_steps, *max_tool_calls);
+                }
+                // Appearance settings are persisted here so a restart keeps
+                // what the user just chose. The client already applied them
+                // locally, so this is a write, not a round trip.
+                if let Some(ui) = ui {
+                    self.persist_ui_settings(ui);
                 }
                 // Engine-bound switching; permission_mode passes through to session.
                 if provider.is_none() && model.is_none() {
@@ -623,6 +630,32 @@ impl HostServices {
         let (mut cfg, _) = crate::config::TuryaConfig::load(&self.config_path);
         cfg.effort = effort;
         let _ = cfg.save(&self.config_path);
+    }
+
+    /// Merge `/settings` changes into the config file.
+    ///
+    /// Each field is applied only when present, so one `/settings` command
+    /// never clears the slots the user did not mention.
+    fn persist_ui_settings(&self, ui: &turya_protocol::UiSettings) {
+        let (mut cfg, _) = crate::config::TuryaConfig::load(&self.config_path);
+        if let Some(v) = &ui.user_bg {
+            cfg.user_bg = Some(v.clone());
+        }
+        if let Some(v) = &ui.assistant_bg {
+            cfg.assistant_bg = Some(v.clone());
+        }
+        if let Some(v) = &ui.tool_bg {
+            cfg.tool_bg = Some(v.clone());
+        }
+        if let Some(v) = &ui.mouse {
+            cfg.mouse = Some(v.clone());
+        }
+        if let Some(v) = ui.no_color {
+            cfg.no_color = Some(v);
+        }
+        if let Err(e) = cfg.save(&self.config_path) {
+            eprintln!("Turya: could not save settings: {e}");
+        }
     }
 
     /// Human-readable context breakdown for `/context`. Every number is an
@@ -1197,6 +1230,9 @@ impl HostEventSink {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
     use super::*;
     use turya_auth::MemStore;
 
@@ -1244,7 +1280,7 @@ mod tests {
             catalog,
             engine,
             HostPaths {
-                config: "/tmp/turya-host-router-test-config.toml".to_string(),
+                config: test_path("router-config.toml"),
                 db: "/tmp/turya-host-router-test.db".to_string(),
             },
             Vec::new(),
@@ -1320,6 +1356,7 @@ mod tests {
                     model: None,
                     max_steps: None,
                     max_tool_calls: None,
+                    ui: None,
                 },
                 &sink,
             )
@@ -1345,6 +1382,7 @@ mod tests {
                     model: None,
                     max_steps: Some(12),
                     max_tool_calls: Some(40),
+                    ui: None,
                 },
                 &sink,
             )
@@ -1414,6 +1452,7 @@ mod tests {
                     model: Some("gemini-flash-latest".to_string()),
                     max_steps: None,
                     max_tool_calls: None,
+                    ui: None,
                 },
                 &sink,
             )
@@ -1500,7 +1539,7 @@ mod tests {
     #[tokio::test]
     async fn get_provider_state_reports_defaults_offline() {
         // No config file, no creds: defaults without touching the network.
-        let _ = std::fs::remove_file("/tmp/turya-host-router-test-config.toml");
+        let _ = std::fs::remove_file(test_path("router-config.toml"));
         let (host, tx, mut rx) = harness();
         let sink = HostEventSink::new(tx);
         assert!(host.handle(&TuryaCommand::GetProviderState, &sink).await);
@@ -1524,7 +1563,7 @@ mod tests {
         let _guard = ENV_GUARD.lock().await;
         let saved = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::set_var("ANTHROPIC_API_KEY", "fake-key-for-offline-test");
-        let _ = std::fs::remove_file("/tmp/turya-host-router-test-config.toml");
+        let _ = std::fs::remove_file(test_path("router-config.toml"));
         let (host, tx, mut rx) = harness();
         let sink = HostEventSink::new(tx);
         assert!(
@@ -1535,6 +1574,7 @@ mod tests {
                     model: Some("claude-sonnet-4-5".to_string()),
                     max_steps: None,
                     max_tool_calls: None,
+                    ui: None,
                 },
                 &sink,
             )
@@ -1568,15 +1608,35 @@ mod tests {
     }
 
     #[test]
+    fn a_temp_file_name_is_unique_per_test() {
+        // These tests used to share one hardcoded path, so they raced: one
+        // deleted the file while another was reading it back, and the
+        // failure only ever showed up in a full run.
+        assert_ne!(test_path("x.toml"), test_path("x.toml"));
+    }
+
+    fn test_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "{}-{}-{}",
+                name,
+                std::process::id(),
+                COUNTER.fetch_add(1, Relaxed)
+            ))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[test]
     fn host_config_roundtrip() {
-        let path = "/tmp/turya-host-router-test-config.toml";
-        let _ = std::fs::remove_file(path);
+        let path = test_path("router-config.toml");
+        let _ = std::fs::remove_file(&path);
         HostConfig {
             provider: Some("gemini".to_string()),
             model: Some("gemini-2.5-flash".to_string()),
         }
-        .save(path);
-        let back = HostConfig::load(path);
+        .save(&path);
+        let back = HostConfig::load(&path);
         assert_eq!(back.provider.as_deref(), Some("gemini"));
         assert_eq!(back.model.as_deref(), Some("gemini-2.5-flash"));
         let _ = std::fs::remove_file(path);

@@ -368,6 +368,9 @@ pub struct TuiApp {
     /// What this terminal can render, probed once at startup. Stored rather
     /// than re-probed per attachment so a turn cannot change its mind.
     graphics: turya_image::Capability,
+    /// `NO_COLOR`, or `/settings no_color`. When false the transcript is
+    /// plain text: no tints, no dimming, no escape codes at all.
+    color: bool,
     /// Single chronological transcript: user messages, assistant tokens,
     /// tool activity, and toasts all render here (no separate tool box).
     /// Rows carry their own voice: system toasts and separators render
@@ -450,6 +453,9 @@ impl TuiApp {
     pub fn new() -> Self {
         Self {
             input: String::new(),
+            // `NO_COLOR` is honoured before anything is drawn, so a user with
+            // it set never sees a single escape sequence.
+            color: std::env::var_os("NO_COLOR").is_none(),
             graphics: turya_image::detect(
                 turya_image::Mode::parse(&std::env::var("TURYA_IMAGES").unwrap_or_default())
                     .unwrap_or_default(),
@@ -498,6 +504,17 @@ impl TuiApp {
         self.transcript.push(TLine::new(line, false, role));
     }
 
+    /// Tints, or none at all when colour is off. Every styling decision goes
+    /// through here so `NO_COLOR` cannot be honoured in one place and ignored
+    /// in another.
+    fn tints(&self) -> Tints {
+        if self.color {
+            self.tints
+        } else {
+            Tints::default()
+        }
+    }
+
     /// Append a dimmed system toast (routing notices, usage hints).
     /// Warnings, errors, and confirmations stay full-bright.
     fn log_dim(&mut self, line: String) {
@@ -536,7 +553,7 @@ impl TuiApp {
         // Only assistant prose is markdown. Prompts, tool output and system
         // rows are literal: a user pasting `**stars**` must see the stars.
         if !dim && role == Speaker::Assistant && self.render_markdown {
-            for line in render_markdown(text, &self.tints) {
+            for line in render_markdown(text, &self.tints()) {
                 self.transcript.push(TLine::new(line, false, role));
             }
             return;
@@ -598,6 +615,12 @@ impl TuiApp {
             .iter()
             .map(|l| {
                 let mut style = Style::default();
+                // `NO_COLOR` means no escapes at all, so this is the one place
+                // that decides: tints, dimming and role colours all live under
+                // this check rather than each honouring it separately.
+                if !self.color {
+                    return Line::raw(l.text.clone());
+                }
                 // A tint is an *addition* to the gutter, never the carrier of
                 // identity: with tints off the roles are still distinct.
                 if let Some(bg) = self.tints.for_role(l.role) {
@@ -894,6 +917,9 @@ impl TuiApp {
     }
 
     /// Apply persisted presentation settings from the host.
+    /// Colour is deliberately not touched here: the host applies it
+    /// separately from the saved value, so changing a tint cannot quietly
+    /// undo a `NO_COLOR` decision.
     pub fn apply_settings(&mut self, tints: Option<(&str, &str, &str)>, mouse: Option<&str>) {
         if let Some((user, assistant, tool)) = tints {
             self.tints = Tints::from_settings(Some(user), Some(assistant), Some(tool));
@@ -901,6 +927,18 @@ impl TuiApp {
         if let Some(m) = mouse {
             self.mouse = Some(m.to_string());
         }
+    }
+
+    /// Effective colour mode. `NO_COLOR` in the environment wins over the
+    /// saved setting, the same way the host resolves it.
+    pub fn apply_color(&mut self, no_color: Option<bool>) {
+        self.color = std::env::var_os("NO_COLOR").is_none() && !no_color.unwrap_or(false);
+    }
+
+    /// Whether colour is on. Exposed so the host and tests can ask the same
+    /// question the renderer answers.
+    pub fn color_enabled(&self) -> bool {
+        self.color
     }
 
     /// Lift the transcript viewport up (read back history).
@@ -1248,6 +1286,10 @@ impl TuiApp {
                             (None, _) => {
                                 let t = self.tints;
                                 self.log_dim(format!(
+                                    "colour: {} (NO_COLOR or /settings no_color off)",
+                                    if self.color_enabled() { "on" } else { "off" }
+                                ));
+                                self.log_dim(format!(
                                     "tints: user={} assistant={} tool={} (none = terminal default)",
                                     tint_name(t.user),
                                     tint_name(t.assistant),
@@ -1280,6 +1322,19 @@ impl TuiApp {
                                     match mode {
                                         Some(m) => {
                                             self.mouse = Some(m.to_string());
+                                            let _ = cmd_tx
+                                                .send(TuryaCommand::UpdateConfig {
+                                                    permission_mode: None,
+                                                    provider: None,
+                                                    model: None,
+                                                    max_steps: None,
+                                                    max_tool_calls: None,
+                                                    ui: Some(turya_protocol::UiSettings {
+                                                        mouse: Some(m.to_string()),
+                                                        ..Default::default()
+                                                    }),
+                                                })
+                                                .await;
                                             self.log_dim(format!(
                                                 "→ mouse = {m} ({})",
                                                 if self.mouse_enabled() {
@@ -1294,6 +1349,47 @@ impl TuiApp {
                                     }
                                     return;
                                 }
+                                // Colour is a real setting, not just a tint:
+                                // it is the one that makes the terminal usable
+                                // for people who cannot use colour at all.
+                                if key == "no_color" {
+                                    let on = match value.to_ascii_lowercase().as_str() {
+                                        "on" | "true" | "yes" | "1" => Some(true),
+                                        "off" | "false" | "no" | "0" => Some(false),
+                                        _ => None,
+                                    };
+                                    match on {
+                                        Some(v) => {
+                                            self.apply_color(Some(v));
+                                            self.log_dim(format!(
+                                                "→ no_color = {v} ({} for the rest of this \
+                                                 session; also saved)",
+                                                if self.color_enabled() {
+                                                    "colour on"
+                                                } else {
+                                                    "plain text"
+                                                }
+                                            ));
+                                            let _ = cmd_tx
+                                                .send(TuryaCommand::UpdateConfig {
+                                                    permission_mode: None,
+                                                    provider: None,
+                                                    model: None,
+                                                    max_steps: None,
+                                                    max_tool_calls: None,
+                                                    ui: Some(turya_protocol::UiSettings {
+                                                        no_color: Some(v),
+                                                        ..Default::default()
+                                                    }),
+                                                })
+                                                .await;
+                                        }
+                                        None => {
+                                            self.log_dim("ℹ no_color takes on | off".to_string())
+                                        }
+                                    }
+                                    return;
+                                }
                                 let parsed = Tints::parse(value);
                                 let slot = match key {
                                     "user_bg" => &mut self.tints.user,
@@ -1301,13 +1397,31 @@ impl TuiApp {
                                     "tool_bg" => &mut self.tints.tool,
                                     _ => {
                                         self.log_dim(format!(
-                                        "ℹ unknown setting '{key}'; try user_bg, assistant_bg, tool_bg"
+                                        "ℹ unknown setting '{key}'; try no_color, user_bg, assistant_bg, tool_bg"
                                     ));
                                         return;
                                     }
                                 };
                                 *slot = parsed;
                                 self.log_dim(format!("→ {key} = {}", tint_name(parsed)));
+                                // Applied here, saved there: the user sees the
+                                // change now and keeps it after a restart.
+                                let _ = cmd_tx
+                                    .send(TuryaCommand::UpdateConfig {
+                                        permission_mode: None,
+                                        provider: None,
+                                        model: None,
+                                        max_steps: None,
+                                        max_tool_calls: None,
+                                        ui: Some(turya_protocol::UiSettings {
+                                            user_bg: (key == "user_bg").then(|| value.to_string()),
+                                            assistant_bg: (key == "assistant_bg")
+                                                .then(|| value.to_string()),
+                                            tool_bg: (key == "tool_bg").then(|| value.to_string()),
+                                            ..Default::default()
+                                        }),
+                                    })
+                                    .await;
                             }
                             (Some(key), None) => self
                                 .log_dim(format!("ℹ {key} needs a value (e.g. #1b2735 or none)")),
@@ -1350,6 +1464,7 @@ impl TuiApp {
                                         model: None,
                                         max_steps: Some(mc),
                                         max_tool_calls: None,
+                ui: None,
                                     })
                                     .await;
                             }
@@ -1370,6 +1485,7 @@ impl TuiApp {
                                         model: None,
                                         max_steps: Some(mc),
                                         max_tool_calls: Some(tc),
+                                        ui: None,
                                     })
                                     .await;
                             }
@@ -1502,6 +1618,7 @@ impl TuiApp {
                                             model: Some(mid),
                                             max_steps: None,
                                             max_tool_calls: None,
+                                            ui: None,
                                         })
                                         .await;
                                     return;
@@ -3687,6 +3804,41 @@ mod tests {
             app.transcript_text().contains("does not reason"),
             "{}",
             app.transcript_text()
+        );
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn colour_is_on_by_default_when_the_environment_is_silent() {
+        let app = TuiApp::new();
+        // `NO_COLOR` may be set in a developer shell; the assertion is about
+        // the precedence rule, not about this process's environment.
+        if std::env::var_os("NO_COLOR").is_none() {
+            assert!(app.color_enabled());
+        }
+    }
+
+    #[test]
+    fn no_color_from_the_command_wins_over_a_saved_on() {
+        let mut app = TuiApp::new();
+        app.apply_color(Some(true));
+        assert!(!app.color_enabled());
+    }
+
+    #[test]
+    fn a_saved_off_setting_cannot_be_overridden_by_a_later_on() {
+        // Once the user turned colour off, nothing in the config file should
+        // turn it back on behind their back.
+        let mut app = TuiApp::new();
+        app.apply_color(Some(true));
+        app.apply_settings(Some(("none", "none", "none")), Some("auto"));
+        assert!(
+            !app.color_enabled(),
+            "applying other settings must not silently re-enable colour"
         );
     }
 }
