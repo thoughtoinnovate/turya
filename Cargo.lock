@@ -3252,6 +3252,7 @@ dependencies = [
  "turya-protocol",
  "turya-provider-anthropic",
  "turya-provider-gemini",
+ "turya-provider-ollama",
  "turya-server",
  "turya-skills",
  "turya-tools",
@@ -3351,6 +3352,20 @@ dependencies = [
 
 [[package]]
 name = "turya-provider-gemini"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "turya-core",
+ "turya-protocol",
+]
+
+[[package]]
+name = "turya-provider-ollama"
 version = "0.1.0"
 dependencies = [
  "async-trait",

@@ -19,6 +19,13 @@ pub enum SlotState {
     Missing,
     /// The provider does not offer this method at all.
     Unsupported,
+    /// The provider needs no credential: a server the user already runs.
+    ///
+    /// Distinct from `Missing`, which means "you need one and do not have
+    /// it" and renders as a locked badge. Reporting a local server as
+    /// `Missing` is what makes turya print a misleading "run turya auth
+    /// login" for something with no login.
+    NotRequired,
 }
 
 impl SlotState {
@@ -26,6 +33,8 @@ impl SlotState {
     pub fn badge(&self) -> &'static str {
         match self {
             SlotState::Env | SlotState::Stored | SlotState::Connected { .. } => "●",
+            // Filled, deliberately: there is nothing to unlock.
+            SlotState::NotRequired => "●",
             SlotState::Missing | SlotState::Unsupported => "○",
         }
     }
@@ -33,7 +42,10 @@ impl SlotState {
     pub fn is_filled(&self) -> bool {
         matches!(
             self,
-            SlotState::Env | SlotState::Stored | SlotState::Connected { .. }
+            SlotState::Env
+                | SlotState::Stored
+                | SlotState::Connected { .. }
+                | SlotState::NotRequired
         )
     }
 }
@@ -53,6 +65,13 @@ impl ProviderAuthStatus {
 
     /// Which credential backs requests (see resolver precedence).
     pub fn active_method(&self) -> Option<&'static str> {
+        // `NotRequired` is filled, so the `is_filled()` test below would claim
+        // an api key is in play. Report the truth — a local server is reached
+        // with no credential — and keep the label in step with the `via`
+        // provenance the resolver mints for it.
+        if matches!(self.api_key, SlotState::NotRequired) {
+            return Some("local");
+        }
         if self.api_key.is_filled() {
             Some("api-key")
         } else if self.oauth.is_filled() {
@@ -68,6 +87,10 @@ impl ProviderAuthStatus {
 pub struct ProviderAuthMethods {
     pub env_var: Option<&'static str>,
     pub has_oauth: bool,
+    /// False when the provider can be used with no credential at all. The
+    /// env var is then *optional*: set it for a proxied or remote server,
+    /// leave it unset for a local one.
+    pub needs_credential: bool,
 }
 
 /// Well-known method sets (mirrored by provider plugin manifests in STEP 8).
@@ -76,14 +99,27 @@ pub fn methods_for(provider: &str) -> ProviderAuthMethods {
         "gemini" => ProviderAuthMethods {
             env_var: Some("GEMINI_API_KEY"),
             has_oauth: true,
+            needs_credential: true,
         },
         "anthropic" => ProviderAuthMethods {
             env_var: Some("ANTHROPIC_API_KEY"),
             has_oauth: false,
+            needs_credential: true,
         },
+        "ollama" => ProviderAuthMethods {
+            env_var: Some("OLLAMA_API_KEY"),
+            has_oauth: false,
+            // A local Ollama needs nothing. The key is for a reverse proxy
+            // or ollama.com, so it is offered but not demanded.
+            needs_credential: false,
+        },
+        // Unknown providers are assumed to need a key: demanding a credential
+        // we cannot obtain fails loudly, silently trusting an unknown endpoint
+        // would not.
         _ => ProviderAuthMethods {
             env_var: None,
             has_oauth: false,
+            needs_credential: true,
         },
     }
 }
@@ -94,32 +130,28 @@ pub fn auth_status(
     methods: &ProviderAuthMethods,
     store: &dyn CredentialStore,
 ) -> ProviderAuthStatus {
-    let api_key = match methods.env_var {
-        None => {
-            if store
-                .get(&crate::store::api_key_account(provider))
-                .is_some()
-            {
-                SlotState::Stored
-            } else {
-                SlotState::Missing
-            }
-        }
-        Some(env) => {
-            if std::env::var(env)
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false)
-            {
-                SlotState::Env
-            } else if store
-                .get(&crate::store::api_key_account(provider))
-                .is_some()
-            {
-                SlotState::Stored
-            } else {
-                SlotState::Missing
-            }
-        }
+    // env > stored > (nothing needed) > missing. Kept flat instead of nested on
+    // `env_var`: a provider may offer an *optional* env var, so "no env var
+    // configured" and "env var configured but unset" must reach the same verdict.
+    let env_set = methods
+        .env_var
+        .and_then(|env| std::env::var(env).ok())
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let stored = store
+        .get(&crate::store::api_key_account(provider))
+        .is_some();
+    let api_key = if env_set {
+        SlotState::Env
+    } else if stored {
+        SlotState::Stored
+    } else if !methods.needs_credential {
+        // "Needs nothing" is not "missing": reporting a local server as Missing
+        // renders a locked badge and tells the user to run a login flow that
+        // does not exist. An optional env var that *is* set still wins above.
+        SlotState::NotRequired
+    } else {
+        SlotState::Missing
     };
     let oauth = if !methods.has_oauth {
         SlotState::Unsupported
@@ -160,6 +192,69 @@ mod tests {
     }
 
     #[test]
+    fn not_required_is_filled_and_never_locked() {
+        // A provider that needs no credential must not look like one awaiting
+        // a login: filled badge, filled semantics, and a truthful active
+        // method (never "api-key", which would claim a key exists).
+        let nr = SlotState::NotRequired;
+        assert!(nr.is_filled());
+        assert_eq!(nr.badge(), "●");
+        assert_ne!(nr.badge(), "○");
+        let s = ProviderAuthStatus {
+            provider: "ollama".into(),
+            api_key: SlotState::NotRequired,
+            oauth: SlotState::Unsupported,
+        };
+        assert!(s.is_authenticated());
+        assert_eq!(s.active_method(), Some("local"));
+    }
+
+    #[test]
+    fn local_provider_needs_no_credential() {
+        assert!(!methods_for("ollama").needs_credential);
+        assert!(methods_for("anthropic").needs_credential);
+        assert!(methods_for("gemini").needs_credential);
+    }
+
+    #[test]
+    fn no_credential_provider_is_not_reported_missing() {
+        let store = MemStore::new();
+        let m = ProviderAuthMethods {
+            env_var: None,
+            has_oauth: false,
+            needs_credential: false,
+        };
+        let s = auth_status("local-x", &m, &store);
+        assert_eq!(s.api_key, SlotState::NotRequired);
+        // No OAuth flow on such a provider: still "n/a", not "missing".
+        assert_eq!(s.oauth, SlotState::Unsupported);
+
+        // A stored key, if the user has one, is still honoured.
+        store.set("local-x-api-key", "k").unwrap();
+        let s = auth_status("local-x", &m, &store);
+        assert_eq!(s.api_key, SlotState::Stored);
+    }
+
+    #[test]
+    fn optional_env_var_upgrades_not_required_to_env() {
+        let store = MemStore::new();
+        let m = ProviderAuthMethods {
+            env_var: Some("TURYA_TEST_OPTIONAL_KEY"),
+            has_oauth: false,
+            needs_credential: false,
+        };
+        // Unset optional var: still nothing required.
+        let s = auth_status("local-x", &m, &store);
+        assert_eq!(s.api_key, SlotState::NotRequired);
+
+        // Set (proxy / ollama.com case): reported as an ordinary env key.
+        std::env::set_var("TURYA_TEST_OPTIONAL_KEY", "env");
+        let s = auth_status("local-x", &m, &store);
+        assert_eq!(s.api_key, SlotState::Env);
+        std::env::remove_var("TURYA_TEST_OPTIONAL_KEY");
+    }
+
+    #[test]
     fn status_matrix() {
         let store = MemStore::new();
         // Nothing configured.
@@ -189,6 +284,7 @@ mod tests {
         let methods = ProviderAuthMethods {
             env_var: Some("TURYA_TEST_GEMINI_KEY"),
             has_oauth: false,
+            needs_credential: true,
         };
         let s = auth_status("gemini", &methods, &store);
         assert_eq!(s.api_key, SlotState::Env);

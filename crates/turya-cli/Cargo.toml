@@ -21,6 +21,7 @@ turya-mcp = { path = "../turya-mcp" }
 turya-skills = { path = "../turya-skills" }
 turya-provider-anthropic = { path = "../turya-provider-anthropic" }
 turya-provider-gemini = { path = "../turya-provider-gemini" }
+turya-provider-ollama = { path = "../turya-provider-ollama" }
 tokio = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 serde = { workspace = true }

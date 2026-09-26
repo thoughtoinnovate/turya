@@ -47,6 +47,10 @@ pub struct TuryaConfig {
     pub mouse: Option<String>,
     /// MCP servers to connect at startup.
     pub mcp_servers: Option<Vec<McpServerConfig>>,
+    /// Base URL of a local Ollama daemon. The plugin reads `OLLAMA_HOST`;
+    /// this bridges the saved value into it, and an explicit environment
+    /// variable takes precedence.
+    pub ollama_host: Option<String>,
     /// Extra skill directories.
     pub skills_paths: Option<Vec<String>>,
     /// Optional background tints, hex or `none`. Default: none, because a
@@ -74,6 +78,7 @@ impl Default for TuryaConfig {
             queue_behavior: Some("steer".to_string()),
             show_thinking: Some(true),
             mouse: Some("auto".to_string()),
+            ollama_host: None,
             mcp_servers: None,
             skills_paths: None,
             user_bg: None,

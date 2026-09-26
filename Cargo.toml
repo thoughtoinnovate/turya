@@ -16,6 +16,7 @@ members = [
     "crates/turya-auth",
     "crates/turya-provider-anthropic",
     "crates/turya-provider-gemini",
+    "crates/turya-provider-ollama",
     "crates/turya-catalog",
 ]
 

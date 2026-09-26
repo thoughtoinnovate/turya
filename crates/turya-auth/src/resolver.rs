@@ -26,6 +26,11 @@ pub enum CredSource {
     Env,
     StoredKey,
     OAuth,
+    /// No credential was consulted: the provider is a server the user already
+    /// runs. Modelled as a source rather than a bare `"local"` string so the
+    /// "nothing was resolved" case stays in the same typed vocabulary as the
+    /// real ones and shows up in diagnostics instead of reading as a bug.
+    Local,
 }
 
 impl CredSource {
@@ -34,6 +39,7 @@ impl CredSource {
             CredSource::Env => "env",
             CredSource::StoredKey => "stored-key",
             CredSource::OAuth => "oauth",
+            CredSource::Local => "local",
         }
     }
 }
@@ -43,10 +49,22 @@ impl CredSource {
 pub enum MethodChoice {
     ApiKey,
     OAuth,
+    /// The provider needs no credential; proceed with an empty token.
+    NoAuth,
     None,
 }
 
 pub fn pick_method(api_key: &SlotState, oauth: &SlotState, prefer: Option<&str>) -> MethodChoice {
+    // ORDER IS LOAD-BEARING: `NotRequired` is checked before every
+    // `is_filled()` test on purpose. It is deliberately "filled" (there is
+    // nothing to unlock), so if it fell through to the api-key branch below,
+    // `resolve` would go looking for a token that does not exist and the
+    // no-auth provider would end up back in the same `Missing` error it was
+    // meant to escape. Such a provider also declares no OAuth slot, so an
+    // `oauth` preference cannot apply to it.
+    if matches!(api_key, SlotState::NotRequired) {
+        return MethodChoice::NoAuth;
+    }
     if let Some("oauth") = prefer {
         if oauth.is_filled() {
             return MethodChoice::OAuth;
@@ -114,6 +132,14 @@ pub async fn resolve(
                 via: CredSource::OAuth.label(),
             })
         }
+        // No credential is a success, not a failure: the caller gets an empty
+        // token tagged `local` so a provider that demands no secret is
+        // selectable at all.
+        MethodChoice::NoAuth => Ok(ResolvedCreds {
+            token: String::new(),
+            expires_at: None,
+            via: CredSource::Local.label(),
+        }),
         MethodChoice::None => Err(ResolveError::Missing(provider.to_string())),
     }
 }
@@ -186,6 +212,43 @@ mod tests {
         assert_eq!(c.token, "env-key");
         assert_eq!(c.via, "env");
         std::env::remove_var("GEMINI_API_KEY");
+    }
+
+    #[test]
+    fn no_auth_slot_is_not_routed_through_the_api_key_path() {
+        use MethodChoice::{ApiKey, NoAuth};
+        // The regression this guards: `NotRequired` is "filled", so ordering it
+        // after the `is_filled()` branch would return ApiKey here.
+        assert_eq!(
+            pick_method(&SlotState::NotRequired, &SlotState::Unsupported, None),
+            NoAuth
+        );
+        // An optional env key, once set, is a real api key again.
+        assert_eq!(
+            pick_method(&SlotState::Env, &SlotState::Unsupported, None),
+            ApiKey
+        );
+        // The error path is unchanged: still needed a credential, still got none.
+        assert_eq!(
+            pick_method(&SlotState::Missing, &SlotState::Unsupported, None),
+            MethodChoice::None
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_local_provider_without_credential() {
+        // The optional key must be absent for this path to be exercised, so
+        // mask (and restore) any ambient value from the developer's shell.
+        let ambient = std::env::var("OLLAMA_API_KEY").ok();
+        std::env::remove_var("OLLAMA_API_KEY");
+        let store = MemStore::new();
+        let c = resolve("ollama", None, None, &store).await.unwrap();
+        assert!(c.token.is_empty());
+        assert_eq!(c.via, "local");
+        assert!(c.expires_at.is_none());
+        if let Some(v) = ambient {
+            std::env::set_var("OLLAMA_API_KEY", v);
+        }
     }
 
     #[tokio::test]

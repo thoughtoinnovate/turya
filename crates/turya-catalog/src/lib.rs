@@ -8,7 +8,13 @@
 //! 4. **Static** per-provider curated lists (always available).
 //!
 //! Auth gate (hard rule): `ensure_loaded` performs ZERO network I/O for
-//! providers without credentials — locked providers never phone home.
+//! providers without credentials — locked providers never phone home. The
+//! gate is a caller-supplied `CatalogNetwork`, never inferred here: the host
+//! owns credential state, so the host decides what this plugin may reach for.
+//! A provider that needs no credential (a server the user already runs) is
+//! the one exception, and it gets live discovery only — the `models.dev`
+//! fetch is a third-party call and stays gated on the user having some
+//! credential configured.
 //!
 //! Pricing: `models.dev` exposes no scoped pricing endpoint (only the 5 MB
 //! full catalog), so `price_estimate` reports `Unknown` until one exists.
@@ -302,6 +308,13 @@ pub fn static_models(provider: &str) -> Vec<ResolvedModel> {
             mk("gemini-2.5-flash", None),
             mk("gemini-2.0-flash", None),
         ],
+        // Unknown ids fall through to an empty list, and that is CORRECT for
+        // a local provider (`ollama`): the only models that exist are the ones
+        // on the user's own disk, discoverable through
+        // `ProviderPlugin::list_models`. Never add a hardcoded list of local
+        // model names here — a stale list shadows live detection, so the
+        // browser would offer models the server does not have and hide the
+        // ones it does.
         _ => vec![],
     }
 }
@@ -311,6 +324,9 @@ pub fn lab_hint_for(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("anthropic"),
         "gemini" => Some("google"),
+        // `None` for a local provider (`ollama`) is right, not an oversight:
+        // models.dev publishes nothing for a server the user runs, so there
+        // is no lab to hint at. Do not "fix" this by inventing one.
         _ => None,
     }
 }
@@ -381,6 +397,53 @@ struct CacheFile {
     models: Vec<ResolvedModel>,
 }
 
+/// What `ensure_loaded` is allowed to reach for on one provider's behalf.
+///
+/// The catalog never resolves credentials and must not infer auth policy
+/// (Rule 3.1: no auth logic in the kernel, and none invented in a plugin).
+/// The caller holds the credential state and passes the decision in, so the
+/// two reachability questions stay separate:
+///
+/// * `live` — the provider's own `list_models` call. Allowed for a
+///   credentialed provider and for a provider that needs no credential at
+///   all (a server the user already runs), blocked for a locked one.
+/// * `metadata` — the third-party `models.dev` document fetch. Keyed to the
+///   user having *some* credential configured: a user who has authenticated
+///   nothing does not start phoning a third party, so a keyless setup stays
+///   silent even though its local provider is discoverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogNetwork {
+    pub live: bool,
+    pub metadata: bool,
+}
+
+impl CatalogNetwork {
+    /// Nothing leaves the machine: a provider that needs a credential the
+    /// user has not configured.
+    pub const fn none() -> Self {
+        Self {
+            live: false,
+            metadata: false,
+        }
+    }
+
+    /// Live discovery only: a provider that needs no credential.
+    pub const fn live_only() -> Self {
+        Self {
+            live: true,
+            metadata: false,
+        }
+    }
+
+    /// Both: a provider with a credential in hand.
+    pub const fn full() -> Self {
+        Self {
+            live: true,
+            metadata: true,
+        }
+    }
+}
+
 impl Catalog {
     pub fn new(cache_dir: PathBuf) -> Self {
         Self {
@@ -438,18 +501,21 @@ impl Catalog {
 
     /// Load models for a provider.
     ///
-    /// * `is_authenticated` — HARD GATE: false means snapshot/static only,
-    ///   zero network I/O (locked providers never phone home).
-    /// * `fetch_live` — closure returning live ids (vendor API, authed).
+    /// * `net` — what this load may reach for (see `CatalogNetwork`). The
+    ///   caller decides: `live: false` means zero fetcher calls at all (a
+    ///   locked provider never phones home), while `live: true,
+    ///   metadata: false` still runs live discovery — the only way a
+    ///   no-credential local provider's models are ever known.
+    /// * `fetch_live` — closure returning live ids (the provider's own API).
     /// * `fetch_meta` — closure returning the metadata doc text.
     pub fn ensure_loaded(
         &self,
         provider: &str,
-        is_authenticated: bool,
+        net: CatalogNetwork,
         fetch_live: impl FnOnce() -> Vec<String>,
         fetch_meta: impl FnOnce(&str) -> Result<String, String>,
     ) -> Vec<ResolvedModel> {
-        if !is_authenticated {
+        if !net.live {
             return static_models(provider)
                 .into_iter()
                 .map(|mut m| {
@@ -459,9 +525,13 @@ impl Catalog {
                 .collect();
         }
         let live = fetch_live();
-        let meta = fetch_meta(&self.base_url)
-            .ok()
-            .and_then(|text| MetadataDb::parse(&text).ok());
+        let meta = if net.metadata {
+            fetch_meta(&self.base_url)
+                .ok()
+                .and_then(|text| MetadataDb::parse(&text).ok())
+        } else {
+            None
+        };
         if meta.is_some() || !live.is_empty() {
             let merged = merge(provider, &live, meta.as_ref(), true);
             self.write_cache(provider, &merged);
@@ -483,10 +553,12 @@ impl Catalog {
     }
 
     /// Host-function surface for other plugins: JSON model list.
-    pub fn query_models_json(&self, provider: &str, is_authenticated: bool) -> String {
-        let models = self.ensure_loaded(provider, is_authenticated, Vec::new, |_| {
-            Err("offline".to_string())
-        });
+    ///
+    /// Facts only — this surface has no live fetcher, so `net.live` is not
+    /// used here; only `net.metadata` decides whether the document is read.
+    /// Callers that own a provider plugin drive discovery themselves.
+    pub fn query_models_json(&self, provider: &str, net: CatalogNetwork) -> String {
+        let models = self.ensure_loaded(provider, net, Vec::new, |_| Err("offline".to_string()));
         serde_json::to_string(&models).unwrap_or_else(|_| "[]".to_string())
     }
 
@@ -556,7 +628,7 @@ mod tests {
         let meta_calls = Rc::new(Cell::new(0));
         let models = cat.ensure_loaded(
             "gemini",
-            false, // locked
+            CatalogNetwork::none(), // locked
             || {
                 live_calls.set(live_calls.get() + 1);
                 vec!["x".to_string()]
@@ -573,6 +645,47 @@ mod tests {
     }
 
     #[test]
+    fn no_credential_provider_gets_live_discovery_but_no_metadata() {
+        // A local server (ollama) needs no credential. Its models exist only
+        // on the user's disk, so live discovery is the ONLY way they are ever
+        // known — gating it on "authenticated" showed an empty list forever.
+        // The models.dev fetch is a third party, so it stays blocked.
+        let dir = std::env::temp_dir().join("turya-catalog-noauth-live-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cat = Catalog::new(dir);
+        let live_calls = Rc::new(Cell::new(0));
+        let meta_calls = Rc::new(Cell::new(0));
+        let models = cat.ensure_loaded(
+            "ollama",
+            CatalogNetwork::live_only(),
+            || {
+                live_calls.set(live_calls.get() + 1);
+                vec![
+                    "llama3.2:latest".to_string(),
+                    "qwen2.5-coder:7b".to_string(),
+                ]
+            },
+            |_| {
+                meta_calls.set(meta_calls.get() + 1);
+                Ok(MINI_META.to_string())
+            },
+        );
+        assert_eq!(live_calls.get(), 1, "live discovery must still run");
+        assert_eq!(meta_calls.get(), 0, "models.dev must not be phoned home to");
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["llama3.2:latest", "qwen2.5-coder:7b"]);
+        assert!(models.iter().all(|m| m.source == ModelSource::Live));
+    }
+
+    #[test]
+    fn local_provider_has_no_static_models_to_shadow_discovery() {
+        // Guard for the comment in `static_models`: the only source of truth
+        // for a local provider is the server itself.
+        assert!(static_models("ollama").is_empty());
+        assert_eq!(lab_hint_for("ollama"), None);
+    }
+
+    #[test]
     fn offline_uses_cache_then_snapshot() {
         let dir = std::env::temp_dir().join("turya-catalog-cache-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -580,13 +693,15 @@ mod tests {
         // Seed via a successful load with injected fetchers.
         let seeded = cat.ensure_loaded(
             "anthropic",
-            true,
+            CatalogNetwork::full(),
             || vec!["claude-sonnet-4-5".to_string()],
             |_| Ok(MINI_META.to_string()),
         );
         assert!(seeded.iter().any(|m| m.source == ModelSource::Live));
         // Now offline: fetchers fail -> fresh cache served as Cached.
-        let offline = cat.ensure_loaded("anthropic", true, Vec::new, |_| Err("down".to_string()));
+        let offline = cat.ensure_loaded("anthropic", CatalogNetwork::full(), Vec::new, |_| {
+            Err("down".to_string())
+        });
         assert!(offline.iter().all(|m| m.source == ModelSource::Cached));
         assert!(offline.iter().any(|m| m.id == "claude-sonnet-4-5"));
     }
@@ -596,7 +711,7 @@ mod tests {
         let dir = std::env::temp_dir().join("turya-catalog-price-test");
         let cat = Catalog::new(dir);
         assert!(cat.price_estimate("gemini-2.5-pro", 1000).is_none());
-        let json = cat.query_models_json("anthropic", false);
+        let json = cat.query_models_json("anthropic", CatalogNetwork::none());
         let models: Vec<ResolvedModel> = serde_json::from_str(&json).unwrap();
         assert!(!models.is_empty());
     }
@@ -611,7 +726,7 @@ mod tests {
         // Seed via injected fetchers (no network), then read back offline.
         let _ = cat.ensure_loaded(
             "gemini",
-            true,
+            CatalogNetwork::full(),
             || vec!["gemini-flash-latest".to_string()],
             |_| Ok(MINI_META.to_string()),
         );

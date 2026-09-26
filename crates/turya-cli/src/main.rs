@@ -279,6 +279,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::set_var("TURYA_MODEL", m);
         }
     }
+    // A local daemon is often not on the default port, or on another host.
+    // The plugin reads OLLAMA_HOST itself; an explicit environment variable
+    // still wins, exactly as for provider and model above.
+    if let Some(h) = &settings.ollama_host {
+        if std::env::var_os("OLLAMA_HOST").is_none() {
+            std::env::set_var("OLLAMA_HOST", h);
+        }
+    }
     if let Some(model) = args.model.clone() {
         // Export for provider defaults; CLI flag wins over env.
         std::env::set_var("TURYA_MODEL", model);
@@ -474,6 +482,9 @@ fn build_provider_registry() -> turya_core::ProviderRegistry {
     let registry = turya_core::ProviderRegistry::new();
     registry.register(Arc::new(turya_provider_anthropic::AnthropicPlugin));
     registry.register(Arc::new(turya_provider_gemini::GeminiPlugin));
+    // A local server the user already runs: no credential, model list read
+    // off the running daemon rather than a static table.
+    registry.register(Arc::new(turya_provider_ollama::OllamaPlugin));
     registry
 }
 
@@ -514,21 +525,6 @@ async fn select_provider(
             return mock();
         }
     };
-    let model = std::env::var("TURYA_MODEL").ok().and_then(|m| {
-        if plugin.models().iter().any(|known| known.id == m) {
-            Some(m)
-        } else {
-            eprintln!("Turya: unknown model '{m}' for {id}, using default");
-            None
-        }
-    });
-    let model = model.unwrap_or_else(|| {
-        plugin
-            .models()
-            .first()
-            .map(|m| m.id.clone())
-            .unwrap_or_default()
-    });
     // OAuth needs the user's client id for refresh; keychain holds it post-login.
     let oauth_cfg = || {
         let client_id = std::env::var("TURYA_OAUTH_CLIENT_ID")
@@ -536,19 +532,59 @@ async fn select_provider(
             .or_else(|| store.get(&turya_auth::oauth_client_id_account(&id)))?;
         Some(turya_auth::OAuthConfig::google(&client_id))
     };
-    match turya_auth::resolver::resolve(&id, None, oauth_cfg().as_ref(), store).await {
-        Ok(creds) => match plugin.connect(creds, &model) {
-            Ok(p) => {
-                eprintln!("Turya: using {id} model '{model}'");
-                p
-            }
-            Err(e) => {
-                eprintln!("Turya: cannot connect {id} ({e}), using mock");
-                mock()
-            }
-        },
+    let creds = match turya_auth::resolver::resolve(&id, None, oauth_cfg().as_ref(), store).await {
+        Ok(creds) => creds,
         Err(e) => {
             eprintln!("Turya: {e}; using mock (offline/sim mode)");
+            return mock();
+        }
+    };
+
+    // The model is chosen AFTER credentials, because a provider may have no
+    // static list at all: a local server is the authority on which models
+    // exist, and asking it is the only way to learn a default.
+    //
+    // A configured model is validated only when there is a list to validate
+    // against. Rejecting it against an empty list is what made a
+    // discovery-backed provider boot as `model ''` and then fail every turn.
+    let statics = plugin.models();
+    let model = match std::env::var("TURYA_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+    {
+        Some(m) if statics.iter().any(|known| known.id == m) => Some(m),
+        Some(m) if statics.is_empty() => Some(m),
+        Some(m) => {
+            eprintln!("Turya: unknown model '{m}' for {id}, using default");
+            None
+        }
+        None => None,
+    };
+    let model = match model {
+        Some(m) => m,
+        None => match statics.first() {
+            Some(m) => m.id.clone(),
+            // No static list: ask the server, and say so rather than booting
+            // with an empty model that fails on the first request.
+            None => match plugin.list_models(&creds).await.first() {
+                Some(m) => {
+                    eprintln!("Turya: discovered {id} model '{m}'");
+                    m.clone()
+                }
+                None => {
+                    eprintln!("Turya: no models available from {id} (is the server running?)");
+                    String::new()
+                }
+            },
+        },
+    };
+    match plugin.connect(creds, &model) {
+        Ok(p) => {
+            eprintln!("Turya: using {id} model '{model}'");
+            p
+        }
+        Err(e) => {
+            eprintln!("Turya: cannot connect {id} ({e}), using mock");
             mock()
         }
     }

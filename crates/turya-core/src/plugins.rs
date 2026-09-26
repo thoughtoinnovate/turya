@@ -39,8 +39,20 @@ pub struct ModelInfo {
 /// live in `turya-auth` and the host).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthMethodKind {
-    ApiKey { env_var: &'static str },
+    ApiKey {
+        env_var: &'static str,
+    },
     OAuth,
+    /// The provider needs no credential at all — a server the user already
+    /// runs, reachable without a token.
+    ///
+    /// This is a declaration, not a flow: the kernel records that a provider
+    /// can be used unauthenticated and nothing more. Which providers say so,
+    /// and what they then do without a token, stays in the plugin and in
+    /// `turya-auth`. Without this variant a local provider registers and then
+    /// can never be selected, because resolution treats "no credential" as an
+    /// error.
+    None,
 }
 
 /// A language-model provider as a plugin (Rule 3.2: built-ins implement

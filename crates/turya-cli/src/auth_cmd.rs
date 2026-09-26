@@ -27,18 +27,23 @@ fn slot_label(state: &SlotState) -> String {
         SlotState::Connected { account } => format!("● {account}"),
         SlotState::Missing => "○ missing".to_string(),
         SlotState::Unsupported => "— n/a".to_string(),
+        // Filled on purpose (the badge is ●, like env/stored/connected): a
+        // server the user already runs asks for no secret, so there is
+        // nothing to log into. "n/a" would read as a missing capability and
+        // "missing" as something the user failed to do.
+        SlotState::NotRequired => "● not required".to_string(),
     }
 }
 
 /// `turya auth status`: one table, dual slots per provider.
 pub fn status(registry: &ProviderRegistry, store: &dyn CredentialStore) -> Result<(), String> {
-    println!("{:<12} {:<12} oauth", "provider", "api-key");
+    println!("{:<16} {:<16} oauth", "provider", "api-key");
     let mut any_filled = false;
     for id in registry_ids(registry) {
         let st = auth_status(&id, &methods_for(&id), store);
         any_filled |= st.is_authenticated();
         println!(
-            "{:<12} {:<12} {}",
+            "{:<16} {:<16} {}",
             id,
             slot_label(&st.api_key),
             slot_label(&st.oauth)
@@ -358,6 +363,20 @@ mod tests {
         let silent = WriteOnlyStore;
         silent.set("gemini-api-key", "k").unwrap();
         assert!(confirm_persisted(&silent, "gemini-api-key", "k").is_err());
+    }
+
+    #[test]
+    fn a_slot_that_needs_no_credential_reads_as_satisfied() {
+        // The wording matters: "missing" is a failure the user can fix,
+        // "n/a" is a capability the provider lacks. Neither is true here.
+        assert_eq!(slot_label(&SlotState::NotRequired), "● not required");
+        assert_ne!(slot_label(&SlotState::Missing), "● not required");
+        assert_ne!(slot_label(&SlotState::Unsupported), "● not required");
+        // Whole path: a local provider in the table renders as satisfied with
+        // an empty store and no env var set.
+        let st = auth_status("ollama", &methods_for("ollama"), &MemStore::new());
+        assert_eq!(st.api_key, SlotState::NotRequired);
+        assert_eq!(slot_label(&st.api_key), "● not required");
     }
 
     #[test]

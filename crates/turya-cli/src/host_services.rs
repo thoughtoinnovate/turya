@@ -23,6 +23,12 @@ struct PendingFlow {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// The word `ProviderSummary.api_key` carries when a provider needs no
+/// credential at all (a server the user already runs). `turya-tui`'s
+/// `ProviderView::badge()` matches this exact string to decide filled vs.
+/// locked, so the two change together.
+pub const SLOT_NOT_REQUIRED: &str = "not required";
+
 /// Minimal `~/.turya/config.toml` (`provider = "…"`, `model = "…"`, line-based).
 #[derive(Debug, Default, Clone)]
 pub struct HostConfig {
@@ -126,11 +132,20 @@ impl HostServices {
             SlotState::Connected { .. } => "connected",
             SlotState::Missing => "missing",
             SlotState::Unsupported => "unsupported",
+            // Satisfied, not absent: there is no key to unlock, so this must
+            // not read as "missing" (you need one and lack it) or
+            // "unsupported" (this provider has no such method).
+            SlotState::NotRequired => SLOT_NOT_REQUIRED,
         }
     }
 
     fn auth_status_words(&self, provider: &str) -> (String, String) {
         let plugin = self.registry.get(provider);
+        // The auth table, not the plugin's declaration: this must agree with
+        // what the resolver will do, or the row promises a credential the
+        // resolver never hands over. `tests/provider_auth_parity.rs` is what
+        // keeps the two from drifting.
+        let needs_credential = turya_auth::status::methods_for(provider).needs_credential;
         let (has_env, has_oauth) = match plugin.as_ref() {
             Some(p) => {
                 let methods = p.auth_methods();
@@ -145,7 +160,11 @@ impl HostServices {
             }
             None => (false, false),
         };
-        let api_key = if !has_env {
+        let api_key = if !needs_credential {
+            // A server the user already runs: the slot is satisfied because
+            // nothing is asked of them.
+            SlotState::NotRequired
+        } else if !has_env {
             SlotState::Unsupported
         } else {
             let env = plugin
@@ -190,9 +209,24 @@ impl HostServices {
         )
     }
 
+    /// Whether a credential is in hand for this provider.
+    ///
+    /// A provider that needs no credential is deliberately NOT counted as
+    /// authenticated here: it authenticated nothing, and claiming otherwise
+    /// would let a keyless setup trigger the third-party `models.dev` fetch.
     fn is_authenticated(&self, provider: &str) -> bool {
         let (a, o) = self.auth_status_words(provider);
         a == "env" || a == "stored" || a == "connected" || o == "connected"
+    }
+
+    /// Whether live model discovery may run for this provider.
+    ///
+    /// A provider that needs no credential is discoverable with nothing
+    /// configured — asking the server what it has is the only way its models
+    /// are ever known — while a locked one stays on static lists.
+    fn allows_live_discovery(&self, provider: &str) -> bool {
+        self.is_authenticated(provider)
+            || !turya_auth::status::methods_for(provider).needs_credential
     }
 
     /// Resolve credentials for a provider (env → stored → OAuth refresh).
@@ -394,7 +428,9 @@ impl HostServices {
             }
             TuryaCommand::ListProviders => {
                 // Auth gate: metadata refresh only when at least one provider
-                // is authenticated — locked setups never phone home.
+                // holds a credential — locked setups never phone home, and a
+                // local-only setup is still a locked setup: the models.dev
+                // fetch is a third-party call, not the provider's own.
                 let any_authed = self
                     .registry
                     .ids()
@@ -412,15 +448,25 @@ impl HostServices {
                         Some(p) => p,
                         None => continue,
                     };
+                    // Two questions, two answers: live discovery follows
+                    // whether a credential is in hand OR none is needed;
+                    // metadata follows whether one is in hand at all, because
+                    // it is a third party rather than the provider.
                     let authed = self.is_authenticated(&id);
-                    let live = if authed {
+                    let live_allowed = self.allows_live_discovery(&id);
+                    let net = match (authed, live_allowed) {
+                        (true, _) => turya_catalog::CatalogNetwork::full(),
+                        (false, true) => turya_catalog::CatalogNetwork::live_only(),
+                        (false, false) => turya_catalog::CatalogNetwork::none(),
+                    };
+                    let live = if live_allowed {
                         self.live_ids(&id).await
                     } else {
                         vec![]
                     };
                     let models = self.catalog.ensure_loaded(
                         &id,
-                        authed,
+                        net,
                         || live,
                         |_| meta_doc.clone().ok_or_else(|| "no metadata".to_string()),
                     );
@@ -814,6 +860,13 @@ impl HostServices {
             .is_some()
         {
             return "oauth".to_string();
+        }
+        // Nothing configured, yet the provider needs nothing: a server the
+        // user already runs. "mock" would be a lie here (nothing is stubbed),
+        // so report the same provenance the resolver mints — `local` — and
+        // keep it in step with `ProviderAuthStatus::active_method`.
+        if !turya_auth::status::methods_for(provider).needs_credential {
+            return "local".to_string();
         }
         "mock".to_string()
     }
@@ -1244,6 +1297,34 @@ mod tests {
         harness_with(&["anthropic"])
     }
 
+    /// Stand-in for a local server that needs no credential. The host's
+    /// decisions read the id (that is what the auth table keys on) and the
+    /// declared methods, so that is all this has to be — it is not the real
+    /// Ollama plugin and never talks to a server.
+    struct NoCredentialLocalStub;
+
+    impl turya_core::ProviderPlugin for NoCredentialLocalStub {
+        fn id(&self) -> &str {
+            "ollama"
+        }
+        fn display_name(&self) -> &str {
+            "Ollama"
+        }
+        fn models(&self) -> Vec<turya_core::ModelInfo> {
+            Vec::new()
+        }
+        fn auth_methods(&self) -> Vec<turya_core::AuthMethodKind> {
+            vec![turya_core::AuthMethodKind::None]
+        }
+        fn connect(
+            &self,
+            _creds: turya_core::ResolvedCreds,
+            _model: &str,
+        ) -> Result<Arc<dyn turya_core::LlmProvider>, String> {
+            Err("not a real provider".to_string())
+        }
+    }
+
     /// Harness with explicit providers, isolated catalog dir + config file.
     fn harness_with(
         providers: &[&str],
@@ -1259,6 +1340,7 @@ mod tests {
                     registry.register(Arc::new(turya_provider_anthropic::AnthropicPlugin))
                 }
                 "gemini" => registry.register(Arc::new(turya_provider_gemini::GeminiPlugin)),
+                "ollama" => registry.register(Arc::new(NoCredentialLocalStub)),
                 _ => {}
             }
         }
@@ -1321,6 +1403,37 @@ mod tests {
         assert_eq!(providers[0].id, "anthropic");
         assert_eq!(providers[0].api_key, "missing");
         assert!(!providers[0].models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_no_credential_provider_is_discoverable_without_a_key() {
+        let _guard = ENV_GUARD.lock().await;
+        let saved = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        let (host, _tx, _rx) = harness_with(&["ollama", "anthropic"]);
+        // A server the user already runs: authenticated nothing, and that is
+        // not a problem to report.
+        assert!(!host.is_authenticated("ollama"), "no key was configured");
+        assert!(
+            host.allows_live_discovery("ollama"),
+            "a server the user already runs must be listable with nothing configured"
+        );
+        assert_eq!(
+            host.auth_status_words("ollama"),
+            (SLOT_NOT_REQUIRED.to_string(), "unsupported".to_string())
+        );
+        // Provenance for a provider nothing is configured for is the server
+        // itself, not a stub.
+        assert_eq!(host.credential_via("ollama"), "local");
+        // A credentialed-but-locked provider is the opposite on both counts:
+        // no live discovery (it would be refused anyway) and the third-party
+        // metadata fetch stays gated on a credential being in hand.
+        assert!(!host.is_authenticated("anthropic"));
+        assert!(!host.allows_live_discovery("anthropic"));
+        match saved {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
     }
 
     #[tokio::test]
@@ -1415,7 +1528,7 @@ mod tests {
         // Seed the disk cache with a live-only model (no network below).
         let _ = catalog.ensure_loaded(
             "gemini",
-            true,
+            turya_catalog::CatalogNetwork::full(),
             || vec!["gemini-flash-latest".to_string()],
             |_| Ok("{}".to_string()),
         );

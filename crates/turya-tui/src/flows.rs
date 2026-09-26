@@ -15,13 +15,22 @@ pub struct ProviderView {
     pub models: Vec<ModelView>,
 }
 
+/// The word the host sends for a slot that needs no credential — a server the
+/// user already runs. It is `turya_cli::host_services::SLOT_NOT_REQUIRED`
+/// crossing the protocol as a plain string; matched, not re-derived, because
+/// the host owns auth policy and this crate only renders it.
+const SLOT_NOT_REQUIRED: &str = "not required";
+
 impl ProviderView {
+    /// Whether a slot word means "usable", i.e. there is nothing to unlock.
+    /// `"unsupported"` is absent on purpose: the provider genuinely has no
+    /// such method, which is a locked provider, not a satisfied one.
+    fn slot_filled(word: &str) -> bool {
+        matches!(word, "env" | "stored" | "connected" | SLOT_NOT_REQUIRED)
+    }
+
     pub fn badge(&self) -> &'static str {
-        if self.api_key == "env"
-            || self.api_key == "stored"
-            || self.api_key == "connected"
-            || self.oauth == "connected"
-        {
+        if Self::slot_filled(&self.api_key) || self.oauth == "connected" {
             "●"
         } else {
             "○"
@@ -405,6 +414,60 @@ mod tests {
         assert!(!f.providers[0].is_locked());
         assert_eq!(f.providers[1].badge(), "○");
         assert!(f.providers[1].is_locked());
+    }
+
+    /// A local server needs no credential: no lock, and its models (only
+    /// ever known by asking it) are selectable without a login detour.
+    #[test]
+    fn a_provider_that_needs_no_credential_is_not_locked() {
+        let local = ProviderView {
+            id: "ollama".into(),
+            display_name: "Ollama".into(),
+            api_key: SLOT_NOT_REQUIRED.into(),
+            oauth: "unsupported".into(),
+            models: vec![ModelView {
+                id: "llama3.2:latest".into(),
+                display_name: "Llama 3.2".into(),
+                source: "live".into(),
+            }],
+        };
+        assert_eq!(local.badge(), "●");
+        assert!(!local.is_locked());
+        // And the browser offers the model, without the "log in" pane.
+        let mut f = BrowserFlow::new(BrowserMode::Models);
+        f.set_providers(vec![local]);
+        assert_eq!(
+            f.selected_model(),
+            Some(("ollama".to_string(), "llama3.2:latest".to_string()))
+        );
+        let (left, right) = render_browser(&f);
+        assert!(!left.iter().any(|l| l.contains("(locked)")));
+        assert!(right.iter().any(|l| l.contains("Llama 3.2 [live]")));
+    }
+
+    /// The counterpart: a provider that genuinely offers no such method is
+    /// still locked, and keeps the login detour.
+    #[test]
+    fn an_unsupported_slot_is_still_locked() {
+        let p = ProviderView {
+            id: "openai".into(),
+            display_name: "OpenAI".into(),
+            api_key: "unsupported".into(),
+            oauth: "unsupported".into(),
+            models: vec![ModelView {
+                id: "gpt-x".into(),
+                display_name: "GPT X".into(),
+                source: "static".into(),
+            }],
+        };
+        assert_eq!(p.badge(), "○");
+        assert!(p.is_locked());
+        let mut f = BrowserFlow::new(BrowserMode::Models);
+        f.set_providers(vec![p]);
+        assert!(f.selected_model().is_none());
+        let (left, right) = render_browser(&f);
+        assert!(left.iter().any(|l| l.contains("(locked)")));
+        assert!(right.iter().any(|l| l.contains("log in")));
     }
 
     #[test]
