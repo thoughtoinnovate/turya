@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 turya-protocol = { path = "../turya-protocol" }
+turya-image = { path = "../turya-image" }
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { workspace = true }

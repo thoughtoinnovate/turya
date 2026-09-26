@@ -63,7 +63,13 @@ jobs:
             exit 1
           fi
           echo "--- turya-tui: protocol + UI libs only ---"
-          if grep -rhn '^use turya' crates/turya-tui/src/ | grep -v 'turya_protocol'; then
+          # turya_image is allowed deliberately: it is a terminal rendering
+          # utility (escape sequences, capability detection) with no domain
+          # knowledge, the same category as a markdown renderer. The rule
+          # being enforced is that the TUI cannot reach into state or vendor
+          # crates. Anything added to this list needs the same argument.
+          if grep -rhn '^use turya' crates/turya-tui/src/ \
+             | grep -vE 'turya_protocol|turya_image'; then
             echo "::error::turya-tui violates Rule 3.2 (see AGENTS.md)"
             exit 1
           fi

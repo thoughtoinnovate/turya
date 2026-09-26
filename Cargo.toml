@@ -10,6 +10,7 @@ members = [
     "crates/turya-memory",
     "crates/turya-lsp",
     "crates/turya-plugins",
+    "crates/turya-image",
     "crates/turya-mcp",
     "crates/turya-skills",
     "crates/turya-auth",

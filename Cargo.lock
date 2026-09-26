@@ -3271,6 +3271,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "turya-image"
+version = "0.1.0"
+
+[[package]]
 name = "turya-lsp"
 version = "0.1.0"
 dependencies = [
@@ -3403,6 +3407,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tui-markdown",
+ "turya-image",
  "turya-protocol",
 ]
 

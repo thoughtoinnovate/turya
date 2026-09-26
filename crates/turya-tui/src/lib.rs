@@ -365,6 +365,9 @@ fn format_tool_result_timed(
 
 pub struct TuiApp {
     input: String,
+    /// What this terminal can render, probed once at startup. Stored rather
+    /// than re-probed per attachment so a turn cannot change its mind.
+    graphics: turya_image::Capability,
     /// Single chronological transcript: user messages, assistant tokens,
     /// tool activity, and toasts all render here (no separate tool box).
     /// Rows carry their own voice: system toasts and separators render
@@ -447,6 +450,12 @@ impl TuiApp {
     pub fn new() -> Self {
         Self {
             input: String::new(),
+            graphics: turya_image::detect(
+                turya_image::Mode::parse(&std::env::var("TURYA_IMAGES").unwrap_or_default())
+                    .unwrap_or_default(),
+                |k| std::env::var(k).ok(),
+                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            ),
             transcript: Vec::new(),
             pending_permission: None,
             pending_tools: std::collections::HashMap::new(),
@@ -500,6 +509,27 @@ impl TuiApp {
     /// rendering matches the old plain-string transcript exactly.
     fn push_block(&mut self, text: &str, dim: bool) {
         self.push_block_as(text, dim, Speaker::Assistant)
+    }
+
+    /// Show an image inline when the terminal can, and say plainly when it
+    /// cannot. A silent drop would leave the user thinking the attachment
+    /// worked.
+    fn render_attachment(&mut self, a: &turya_protocol::Attachment) {
+        match turya_image::render(&self.graphics, &a.path) {
+            Ok(sequence) => {
+                // Raw, unstyled: escape sequences inside a styled cell are
+                // how terminals end up printing them.
+                self.push_block(&sequence, false);
+            }
+            Err(why) => {
+                let name = a
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| a.path.to_string_lossy().to_string());
+                self.log_dim(format!("🖼 {name} — {why}"));
+            }
+        }
     }
 
     fn push_block_as(&mut self, text: &str, dim: bool, role: Speaker) {
@@ -968,6 +998,11 @@ impl TuiApp {
         self.push_block(&format_user_message(&format!("{prompt}{chips}")), false);
         self.push_block_as(&chips, false, Speaker::User);
         let attachments = std::mem::take(&mut self.attachments);
+        // Images render where they were attached, so the picture sits next to
+        // the words that mention it.
+        for a in &attachments {
+            self.render_attachment(a);
+        }
         let _ = cmd_tx
             .send(TuryaCommand::SubmitPrompt {
                 prompt,
