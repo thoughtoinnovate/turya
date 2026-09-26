@@ -8,5 +8,6 @@ turya-protocol = { path = "../turya-protocol" }
 turya-tools = { path = "../turya-tools" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

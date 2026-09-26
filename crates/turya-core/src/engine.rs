@@ -68,6 +68,18 @@ const MAX_SUBAGENT_DEPTH: u8 = 1;
 /// delegated side quest should not be able to spend the caller's turn.
 const SUBAGENT_MODEL_CALLS: usize = 12;
 const SUBAGENT_TOOL_CALLS: u32 = 24;
+/// A started-but-unfinished subagent: the future that runs it, yielding the
+/// call id it answers and the result to record.
+type ChildTask<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (String, turya_protocol::ToolResult)> + Send + 'a>,
+>;
+
+/// How many subagents may run at once for one prompt.
+///
+/// A subagent is not free: this many is this many times the model calls. The
+/// cap is enforced with a message that names the number, so hitting it is
+/// information rather than a silent truncation.
+pub const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 /// Longest child transcript kept for the expanded view.
 const MAX_SUBAGENT_TRANSCRIPT_CHARS: usize = 4000;
 
@@ -316,29 +328,57 @@ impl TuryaEngine {
         specs
     }
 
-    /// Run a delegated side task and return only its conclusion.
+    /// Start a delegated side task without waiting for it.
     ///
-    /// The child gets its own transcript and its own budget, and its internal
-    /// tool calls are not streamed to the user: the point of delegating is
-    /// that the parent reasons over a summary, not over forty tool rows.
-    async fn run_subagent(
-        &self,
-        call: &turya_protocol::ToolCall,
-        event_tx: &mpsc::Sender<TuryaEvent>,
-        perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
-        ctx: &TurnCtx,
+    /// The returned future is polled alongside its siblings, so several
+    /// delegations in one model response run at the same time. It is a
+    /// future in the caller's task rather than a spawned task: concurrency
+    /// does not need threads for work that is waiting on a network, and
+    /// keeping the children here means aborting the turn takes every one of
+    /// them with it instead of orphaning work nobody supervises.
+    ///
+    /// Validation failures come back as an already-complete result, so the
+    /// caller has one shape to handle.
+    fn start_subagent<'a>(
+        &'a self,
+        call: turya_protocol::ToolCall,
+        event_tx: &'a mpsc::Sender<TuryaEvent>,
+        router: std::sync::Arc<crate::permissions::PermissionRouter>,
+        ctx: &'a TurnCtx,
         mode: AgentMode,
-    ) -> turya_protocol::ToolResult {
-        if ctx.depth >= MAX_SUBAGENT_DEPTH {
-            return turya_protocol::ToolResult {
-                call_id: call.call_id.clone(),
+        siblings: usize,
+    ) -> ChildTask<'a> {
+        let call_id = call.call_id.clone();
+        // Clones out of the capture rather than moving it: the closure is
+        // called from several validation branches, so it must stay `Fn`.
+        let fail = |error: String| {
+            let id = call_id.clone();
+            let result = turya_protocol::ToolResult {
+                call_id: id.clone(),
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "{SPAWN_AGENT_TOOL} is not available inside a subagent: nesting is \
-                     capped at one level."
-                )),
+                error: Some(error),
             };
+            Box::pin(async move { (id, result) }) as ChildTask<'a>
+        };
+
+        // A depth cap the model cannot see is not a cap, so this is enforced
+        // here and also left out of the declarations it is offered.
+        if ctx.depth >= MAX_SUBAGENT_DEPTH {
+            return fail(format!(
+                "{SPAWN_AGENT_TOOL} is not available inside a subagent: nesting is \
+                 capped at one level."
+            ));
+        }
+        // Fan-out is capped because a subagent is not free: N children is N
+        // times the model calls for one prompt. Refusing with the number is
+        // better than letting the bill arrive as a surprise.
+        if siblings >= MAX_CONCURRENT_SUBAGENTS {
+            return fail(format!(
+                "at most {MAX_CONCURRENT_SUBAGENTS} subagents may run at once, and \
+                 {siblings} are already running. Wait for them to finish, or \
+                 delegate fewer at a time."
+            ));
         }
         let name = call
             .parameters
@@ -349,78 +389,56 @@ impl TuryaEngine {
         let task = match call.parameters.get("task").and_then(|v| v.as_str()) {
             Some(t) if !t.trim().is_empty() => t.to_string(),
             _ => {
-                return turya_protocol::ToolResult {
-                    call_id: call.call_id.clone(),
-                    success: false,
-                    output: String::new(),
-                    error: Some(
-                        "spawn_agent needs a non-empty `task` string describing the work"
-                            .to_string(),
-                    ),
-                };
+                return fail(
+                    "spawn_agent needs a non-empty `task` string describing the work".to_string(),
+                )
             }
         };
-        let task_id = format!("{}/{}", call.call_id, name);
-        let _ = event_tx
-            .send(TuryaEvent::SubagentStarted {
-                task_id: task_id.clone(),
-                name: name.clone(),
-                task: task.clone(),
-            })
-            .await;
-
-        // The child's events go to a private channel drained into a
-        // transcript, so the user sees one row instead of the child's innards.
-        // Inline, not spawned: the permission channel below is shared state
-        // and a nested call keeps exactly one owner of it.
-        let (child_tx, mut child_rx) = mpsc::channel::<TuryaEvent>(256);
-        let mut transcript = String::new();
+        let task_id = format!("{call_id}/{name}");
         let child_turn_id = format!("{task_id}#1");
-        // The child and the drain run concurrently in one task. Draining only
-        // after the child returns would deadlock the moment a child emitted
-        // more events than the channel holds: it would block on a send that
-        // nobody was reading, forever, with no error to show for it.
-        //
-        // Boxed because the call graph is cyclic: a turn dispatches a tool,
-        // which can start another turn. Without a type erasure here the
-        // future's own type is infinitely large and the borrow checker is
-        // within its rights to refuse.
-        // Scoped so the drain future's borrows of `child_rx` and
-        // `transcript` end before either is used again below.
-        // The block ends the drain future's borrows of `child_rx` and
-        // `transcript` before either is read again.
-        let parent_events = event_tx;
-        {
-            let child = Box::pin(self.run_turn_at(
+        let first = task.lines().next().unwrap_or("").trim().to_string();
+
+        Box::pin(async move {
+            let _ = event_tx
+                .send(TuryaEvent::SubagentStarted {
+                    task_id: task_id.clone(),
+                    name: name.clone(),
+                    task: first,
+                })
+                .await;
+
+            // The child's events go to a private channel. They are not shown
+            // wholesale - the point of delegating is that the parent reasons
+            // over a summary - but a permission request must reach the user
+            // and progress must be visible, or a long child looks like a hang.
+            let (child_tx, mut child_rx) = mpsc::channel::<TuryaEvent>(256);
+            let child = self.run_turn_at(
                 &child_turn_id,
                 &task,
                 mode,
                 &[],
                 child_tx,
-                perm_rx,
+                router,
                 TurnCtx {
                     depth: ctx.depth + 1,
                     subagent: Some((task_id.clone(), name.clone())),
                 },
-            ));
+            );
             let drain = async {
+                let mut transcript = String::new();
                 while let Some(ev) = child_rx.recv().await {
                     match ev {
                         TuryaEvent::TokenDelta { chunk } => transcript.push_str(&chunk),
-                        // A child's permission request must reach the user.
-                        // Discarding it deadlocks the child: it blocks on
-                        // `perm_rx.recv()` waiting for an answer to a question
-                        // nobody was ever shown, and the parent is blocked
-                        // inline waiting for the child. The decision travels
-                        // back through the shared `perm_rx`, so forwarding the
-                        // request is the whole fix.
+                        // Must reach the user: the decision comes back through
+                        // the shared router, so forwarding the request is the
+                        // whole fix. Discarding it deadlocks the child.
                         TuryaEvent::PermissionRequested {
                             request_id,
                             action,
                             risk_level,
                             details,
                         } => {
-                            let _ = parent_events
+                            let _ = event_tx
                                 .send(TuryaEvent::PermissionRequested {
                                     request_id,
                                     action,
@@ -429,47 +447,65 @@ impl TuryaEngine {
                                 })
                                 .await;
                         }
-                        // Everything else about the child stays private, which
-                        // is the point of delegating.
+                        TuryaEvent::ToolCallInitiated(c) => {
+                            let _ = event_tx
+                                .send(TuryaEvent::SubagentActivity {
+                                    task_id: task_id.clone(),
+                                    name: name.clone(),
+                                    detail: c.tool_name,
+                                })
+                                .await;
+                        }
                         _ => {}
                     }
                 }
+                transcript
             };
-            let (_, ()) = tokio::join!(child, drain);
-        }
-        drop(child_rx);
-        let summary = transcript.trim().to_string();
-        let clipped: String = transcript
-            .chars()
-            .take(MAX_SUBAGENT_TRANSCRIPT_CHARS)
-            .collect();
-        let _ = event_tx
-            .send(TuryaEvent::SubagentFinished {
-                task_id: task_id.clone(),
-                name: name.clone(),
-                summary: summary.clone(),
-                transcript: clipped,
-            })
-            .await;
+            // The child and the drain run together. Draining only afterwards
+            // would deadlock the moment a child emitted more events than the
+            // channel holds.
+            let ((), transcript) = futures::future::join(child, drain).await;
+            drop(child_rx);
 
-        // An empty child transcript is a failure the parent must see, not an
-        // empty success it will try to interpret.
-        if summary.is_empty() {
-            return turya_protocol::ToolResult {
-                call_id: call.call_id.clone(),
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "subagent '{name}' returned nothing; treat the task as unfulfilled"
-                )),
-            };
-        }
-        turya_protocol::ToolResult {
-            call_id: call.call_id.clone(),
-            success: true,
-            output: format!("Subagent '{name}' reported:\n{summary}"),
-            error: None,
-        }
+            let summary = transcript.trim().to_string();
+            let clipped: String = transcript
+                .chars()
+                .take(MAX_SUBAGENT_TRANSCRIPT_CHARS)
+                .collect();
+            let _ = event_tx
+                .send(TuryaEvent::SubagentFinished {
+                    task_id,
+                    name: name.clone(),
+                    summary: summary.clone(),
+                    transcript: clipped,
+                })
+                .await;
+
+            // An empty summary is a failure the parent must see: handed back
+            // as an empty success, it reads as "the work is done".
+            if summary.is_empty() {
+                return (
+                    call_id.clone(),
+                    turya_protocol::ToolResult {
+                        call_id: call_id.clone(),
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "subagent '{name}' returned nothing; treat the task as unfulfilled"
+                        )),
+                    },
+                );
+            }
+            (
+                call_id.clone(),
+                turya_protocol::ToolResult {
+                    call_id: call_id.clone(),
+                    success: true,
+                    output: format!("Subagent '{name}' reported:\n{summary}"),
+                    error: None,
+                },
+            )
+        })
     }
 
     /// structured summary with tools structurally dropped, then keeps the last
@@ -633,18 +669,25 @@ impl TuryaEngine {
         mode: AgentMode,
         attachments: &[turya_protocol::Attachment],
         event_tx: mpsc::Sender<TuryaEvent>,
-        mut perm_rx: mpsc::Receiver<(String, PermissionDecision)>,
+        perm_rx: mpsc::Receiver<(String, PermissionDecision)>,
     ) {
+        // The decision channel is per-turn, so a dispatcher can own it and
+        // route answers by request id. Everything in the turn - the parent
+        // and any number of concurrent subagents - awaits its own slot.
+        let router = std::sync::Arc::new(crate::permissions::PermissionRouter::new());
+        let dispatcher = crate::permissions::spawn_permission_dispatcher(perm_rx, router.clone());
         self.run_turn_at(
             turn_id,
             prompt,
             mode,
             attachments,
             event_tx,
-            &mut perm_rx,
+            router,
             TurnCtx::root(),
         )
-        .await
+        .await;
+        // One task per turn must not become one leaked task per turn.
+        dispatcher.abort();
     }
 
     /// One turn, at a known place in the subagent tree.
@@ -659,7 +702,7 @@ impl TuryaEngine {
         mode: AgentMode,
         attachments: &[turya_protocol::Attachment],
         event_tx: mpsc::Sender<TuryaEvent>,
-        perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
+        router: std::sync::Arc<crate::permissions::PermissionRouter>,
         ctx: TurnCtx,
     ) {
         // `pre_turn` memory hook: surface learned rules before generation.
@@ -771,7 +814,7 @@ impl TuryaEngine {
                 .run_pass(
                     &transcript,
                     &event_tx,
-                    perm_rx,
+                    router.clone(),
                     gate,
                     &ctx,
                     subagent_mode,
@@ -822,7 +865,7 @@ impl TuryaEngine {
                 .run_pass(
                     &transcript,
                     &event_tx,
-                    perm_rx,
+                    router.clone(),
                     gate,
                     &ctx,
                     subagent_mode,
@@ -886,7 +929,7 @@ impl TuryaEngine {
         &self,
         transcript: &Transcript,
         event_tx: &mpsc::Sender<TuryaEvent>,
-        perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
+        router: std::sync::Arc<crate::permissions::PermissionRouter>,
         gate: ToolGate<'_>,
         ctx: &TurnCtx,
         mode: AgentMode,
@@ -902,6 +945,10 @@ impl TuryaEngine {
 
         let mut assistant_text = String::new();
         let mut parts: Vec<Part> = Vec::new();
+        // Delegations started in this pass, and the call ids whose results
+        // will arrive when they finish.
+        let mut children: Vec<ChildTask<'_>> = Vec::new();
+        let mut deferred: Vec<String> = Vec::new();
         let mut outcome = PassOutcome {
             tool_calls: 0,
             tool_cap_hit: false,
@@ -951,28 +998,40 @@ impl TuryaEngine {
                         continue;
                     }
                     *gate.executions += 1;
+                    // A delegation is not awaited here. Several `spawn_agent`
+                    // calls in one model response are the whole point of the
+                    // feature - asking for five subagents and running them one
+                    // after another is the same as doing the work inline, only
+                    // slower - so children are started now and awaited
+                    // together once the response has been read in full.
+                    //
+                    // They are futures in *this* task rather than spawned
+                    // tasks: concurrency does not need threads for work that
+                    // is waiting on a network, and keeping them here means
+                    // aborting the turn aborts every child with it, instead
+                    // of orphaning work nobody supervises.
+                    if call.tool_name == SPAWN_AGENT_TOOL && ctx.depth < MAX_SUBAGENT_DEPTH {
+                        let fut = self.start_subagent(
+                            call.clone(),
+                            event_tx,
+                            router.clone(),
+                            ctx,
+                            mode,
+                            children.len(),
+                        );
+                        children.push(Box::pin(fut));
+                        deferred.push(call.call_id.clone());
+                        continue;
+                    }
                     let result = self
-                        .execute_tool_call(&call, event_tx, perm_rx, ctx, mode, last_call)
+                        .execute_tool_call(&call, event_tx, router.clone(), ctx, mode, last_call)
                         .await;
                     // On failure the output is usually the whole point. A
                     // shell command that fails says "Exited with code: 101",
                     // which tells the model nothing, while its stderr holds
                     // the actual compiler errors. Sending only the reason
                     // leaves the model blind exactly when it needs to see.
-                    let summary = if result.success || result.output.trim().is_empty() {
-                        result
-                            .error
-                            .clone()
-                            .filter(|_| !result.success)
-                            .unwrap_or_else(|| result.output.clone())
-                    } else {
-                        match result.error.clone() {
-                            Some(reason) if !reason.trim().is_empty() => {
-                                format!("{reason}\n{}", result.output)
-                            }
-                            _ => result.output.clone(),
-                        }
-                    };
+                    let summary = summarise_tool_result(&result);
                     let recorded = truncate_history(&summary, MAX_TOOL_HISTORY_CHARS);
                     parts.push(Part::ToolResult {
                         call_id: call.call_id.clone(),
@@ -995,6 +1054,22 @@ impl TuryaEngine {
             }
         }
 
+        // Every child this pass started, in the order the model asked for
+        // them, so the transcript reads the same however long they took.
+        if !children.is_empty() {
+            for (call_id, result) in futures::future::join_all(children).await {
+                let _ = event_tx
+                    .send(TuryaEvent::ToolCallCompleted(result.clone()))
+                    .await;
+                parts.push(Part::ToolResult {
+                    call_id,
+                    output: summarise_tool_result(&result),
+                    truncated: false,
+                });
+            }
+        }
+        let _ = &mut deferred;
+
         if !assistant_text.is_empty() {
             parts.push(Part::Text {
                 text: assistant_text,
@@ -1012,7 +1087,7 @@ impl TuryaEngine {
         &self,
         call: &turya_protocol::ToolCall,
         event_tx: &mpsc::Sender<TuryaEvent>,
-        perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
+        router: std::sync::Arc<crate::permissions::PermissionRouter>,
         ctx: &TurnCtx,
         mode: AgentMode,
         last_call: &mut Option<String>,
@@ -1060,7 +1135,14 @@ impl TuryaEngine {
         // owns the registry is a cycle. Dispatching here also keeps the
         // capability gate in one place.
         if call.tool_name == SPAWN_AGENT_TOOL {
-            return self.run_subagent(call, event_tx, perm_rx, ctx, mode).await;
+            // Reached only for a delegation inside a subagent, which the depth
+            // cap refuses. The parent path is intercepted in `run_pass` so its
+            // children can run concurrently.
+            let (call_id, result) = self
+                .start_subagent(call.clone(), event_tx, router.clone(), ctx, mode, 0)
+                .await;
+            debug_assert_eq!(call_id, result.call_id);
+            return result;
         }
         let tool = match self.tools.get(&call.tool_name) {
             Some(t) => t,
@@ -1093,15 +1175,25 @@ impl TuryaEngine {
                     })
                     .await;
 
-                // Wait for UI to resolve
-                let mut approved = false;
-                while let Some((id, dec)) = perm_rx.recv().await {
-                    if id == req_id {
+                // Wait for the UI, by request id rather than by position.
+                //
+                // The old code drained the shared channel and discarded any
+                // answer that was not its own. That is fine for one
+                // outstanding request and fatal for five: each concurrent
+                // subagent would swallow the others' answers and block
+                // forever. The router delivers each answer to the one waiter
+                // that asked for it, in whatever order the user answers.
+                let (wait, _) = router.register(&req_id);
+                let approved = match wait.await {
+                    Ok(dec) => {
                         self.permissions.record_decision(&call.tool_name, dec);
-                        approved = dec != PermissionDecision::Deny;
-                        break;
+                        dec != PermissionDecision::Deny
                     }
-                }
+                    // The dispatcher is gone, or the waiter was cancelled:
+                    // deny rather than hang.
+                    Err(_) => false,
+                };
+                router.forget(&req_id);
                 approved
             }
         };
@@ -1200,6 +1292,26 @@ struct PassOutcome {
     provider_err: Option<String>,
     /// Parts this pass produced; the caller appends them to the transcript.
     parts: Vec<Part>,
+}
+
+/// What the model is told about a finished tool call.
+///
+/// On failure the output is usually the whole point. A shell command that
+/// fails says "Exited with code: 101", which tells the model nothing, while
+/// its stderr holds the actual compiler errors. Sending only the reason
+/// leaves the model blind exactly when it needs to see.
+fn summarise_tool_result(result: &turya_protocol::ToolResult) -> String {
+    if result.success || result.output.trim().is_empty() {
+        return result
+            .error
+            .clone()
+            .filter(|_| !result.success)
+            .unwrap_or_else(|| result.output.clone());
+    }
+    match result.error.clone() {
+        Some(reason) if !reason.trim().is_empty() => format!("{reason}\n{}", result.output),
+        _ => result.output.clone(),
+    }
 }
 
 /// Mutable per-pass tool state: execution counter, cap, and whether this

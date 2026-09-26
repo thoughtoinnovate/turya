@@ -755,3 +755,155 @@ async fn a_failed_command_still_shows_the_model_its_output() {
         "and so must the reason it failed: {told}"
     );
 }
+
+/// Delegates N times in one response, and each child waits on a gate so the
+/// test can prove they were in flight at the same time.
+struct Parallel {
+    n: usize,
+    /// Held by each child until every child has arrived.
+    gate: Arc<tokio::sync::Barrier>,
+    arrived: Arc<std::sync::atomic::AtomicUsize>,
+    /// Wall-clock overlap witness: the max children seen alive at once.
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for Parallel {
+    async fn generate_turn(
+        &self,
+        transcript: &Transcript,
+        _offered: &[turya_protocol::ToolSpec],
+        tx: mpsc::Sender<ProviderStep>,
+    ) -> Result<(), String> {
+        let is_child = transcript
+            .turns
+            .iter()
+            .flat_map(|t| t.parts.iter())
+            .filter_map(|p| match p {
+                Part::UserText { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .any(|t| t.contains("You are the subagent"));
+        if is_child {
+            let live = self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            self.peak
+                .fetch_max(live, std::sync::atomic::Ordering::SeqCst);
+            self.arrived
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Deadlocks unless every child really is running concurrently:
+            // a barrier of n only releases once n tasks have reached it.
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(10), self.gate.wait()).await;
+            self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx.send(ProviderStep::Token("child done".into())).await;
+            return Ok(());
+        }
+        if transcript
+            .turns
+            .iter()
+            .flat_map(|t| t.parts.iter())
+            .any(|p| matches!(p, Part::ToolResult { .. }))
+        {
+            let _ = tx.send(ProviderStep::Token("parent done".into())).await;
+            return Ok(());
+        }
+        for i in 0..self.n {
+            let _ = tx
+                .send(ProviderStep::CallTool(ToolCall {
+                    call_id: format!("p{i}"),
+                    tool_name: SPAWN_AGENT_TOOL.into(),
+                    parameters: serde_json::json!({ "name": format!("worker{i}"), "task": "wait" }),
+                    signature: None,
+                }))
+                .await;
+        }
+        let _ = tx.send(ProviderStep::Finish).await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn subagents_requested_together_actually_run_together() {
+    // The feature's whole point. Serial execution cannot pass this: the
+    // barrier only releases when all four children are inside it at once, so
+    // a run-and-await-one-at-a-time implementation deadlocks and fails.
+    const N: usize = 4;
+    let gate = Arc::new(tokio::sync::Barrier::new(N));
+    let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let engine = TuryaEngine::new(
+        Arc::new(Parallel {
+            n: N,
+            gate: gate.clone(),
+            arrived: arrived.clone(),
+            peak: peak.clone(),
+            live: live.clone(),
+        }),
+        Arc::new(ToolRegistry::standard()),
+        PermissionMode::Open,
+    );
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(20), run(engine))
+        .await
+        .expect("the children deadlocked: they are not running concurrently");
+
+    assert_eq!(
+        arrived.load(std::sync::atomic::Ordering::SeqCst),
+        N,
+        "every child must have run"
+    );
+    assert_eq!(
+        peak.load(std::sync::atomic::Ordering::SeqCst),
+        N,
+        "all {N} children must have been alive at the same moment"
+    );
+    let finished = events
+        .iter()
+        .filter(|e| matches!(e, TuryaEvent::SubagentFinished { .. }))
+        .count();
+    assert_eq!(finished, N, "each child reports its own result");
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn fan_out_is_capped_with_a_message_naming_the_limit() {
+    // Concurrency that silently multiplies the bill is a trap, so the cap has
+    // to be visible rather than a quiet truncation.
+    let n = turya_core::MAX_CONCURRENT_SUBAGENTS + 3;
+    let gate = Arc::new(tokio::sync::Barrier::new(2));
+    let engine = TuryaEngine::new(
+        Arc::new(Parallel {
+            n,
+            gate,
+            arrived: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }),
+        Arc::new(ToolRegistry::standard()),
+        PermissionMode::Open,
+    );
+    let events = tokio::time::timeout(std::time::Duration::from_secs(20), run(engine))
+        .await
+        .expect("capped children deadlocked");
+
+    let refusals = events
+        .iter()
+        .filter_map(|e| match e {
+            TuryaEvent::ToolCallCompleted(r) if !r.success => {
+                Some(r.error.clone().unwrap_or_else(|| r.output.clone()))
+            }
+            _ => None,
+        })
+        .filter(|m| m.contains("at most"))
+        .count();
+    assert!(
+        refusals >= 1,
+        "the over-limit delegations must be refused, not silently dropped: {events:?}"
+    );
+    assert!(
+        refusals <= n - turya_core::MAX_CONCURRENT_SUBAGENTS + 1,
+        "only the ones over the cap are refused: {refusals}"
+    );
+}

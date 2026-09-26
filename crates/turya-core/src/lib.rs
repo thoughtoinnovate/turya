@@ -7,7 +7,9 @@ pub mod provider;
 pub mod tasks;
 
 pub use context::{compacted, compaction_prompt, prune_transcript, tail_turns};
-pub use engine::{TurnCtx, TuryaEngine, SPAWN_AGENT_TOOL};
+pub use engine::{
+    spawn_agent_spec, TurnCtx, TuryaEngine, MAX_CONCURRENT_SUBAGENTS, SPAWN_AGENT_TOOL,
+};
 pub use hooks::{
     render_catalog as skills_catalog, DiagnosticsHook, FileDiagnostic, MemoryHook, SkillHook,
     SkillRef,

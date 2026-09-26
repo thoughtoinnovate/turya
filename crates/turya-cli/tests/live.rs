@@ -127,12 +127,11 @@ async fn live_streams_text_and_renders_in_the_tui() {
     .await;
 
     if !success {
-        assert!(
-            !is_quota_failure(&text),
-            "live turn must complete cleanly; rendered:\n{text}"
-        );
-        eprintln!("skip: provider quota exhausted, not a product failure");
-        return;
+        if is_quota_failure(&text) {
+            eprintln!("skip: provider quota exhausted, not a product failure");
+            return;
+        }
+        panic!("live turn must complete cleanly; rendered:\n{text}");
     }
     assert!(
         text.to_lowercase().contains("turya-live-ok"),
@@ -224,12 +223,11 @@ async fn live_reads_a_real_file_and_writes_one_back() {
     let (text, success) = run_turn(engine, &prompt, &mut app).await;
 
     if !success {
-        assert!(
-            !is_quota_failure(&text),
-            "tool turn must complete cleanly; rendered:\n{text}"
-        );
-        eprintln!("skip: provider quota exhausted, not a product failure");
-        return;
+        if is_quota_failure(&text) {
+            eprintln!("skip: provider quota exhausted, not a product failure");
+            return;
+        }
+        panic!("tool turn must complete cleanly; rendered:\n{text}");
     }
     let written = std::fs::read_to_string(&dst)
         .unwrap_or_else(|e| panic!("model must write {}: {e}", dst.display()));
@@ -244,11 +242,11 @@ async fn live_reads_a_real_file_and_writes_one_back() {
     // Tool rows are part of what the user sees. A throttled generation never
     // gets as far as calling a tool, so that is a skip, not a failure.
     if !(text.contains("view_file") || text.contains("write_file")) {
-        assert!(
-            !is_quota_failure(&text),
-            "tool calls must render in the transcript:\n{text}"
-        );
-        eprintln!("skip: provider quota exhausted, not a product failure");
+        if is_quota_failure(&text) {
+            eprintln!("skip: provider quota exhausted, not a product failure");
+            return;
+        }
+        panic!("tool calls must render in the transcript:\n{text}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -296,9 +294,11 @@ async fn live_compaction_preserves_a_fact_from_earlier() {
             // This test makes the most calls of any in the suite, so it is
             // the first to hit an exhausted free-tier quota. A throttle is
             // not a compaction bug and must not be reported as one.
-            assert!(!is_quota_failure(&text), "turn {i} failed:\n{text}");
-            eprintln!("skip: provider quota exhausted, not a product failure");
-            return;
+            if is_quota_failure(&text) {
+                eprintln!("skip: provider quota exhausted, not a product failure");
+                return;
+            }
+            panic!("turn {i} failed:\n{text}");
         }
     }
 
@@ -480,11 +480,8 @@ async fn live_model_calls_a_tool_over_real_mcp_stdio() {
         text.contains("BANANA-COLOUR-IS-YELLOW"),
         "the model must have called the MCP tool and used its answer:\n{text}"
     );
-    if !ok {
-        assert!(
-            !is_quota_failure(&text),
-            "turn failed for a reason that is not quota:\n{text}"
-        );
+    if !ok && !is_quota_failure(&text) {
+        panic!("turn failed for a reason that is not quota:\n{text}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1847,6 +1847,12 @@ impl TuiApp {
                 let first = task.lines().next().unwrap_or("").trim();
                 self.log_dim(format!("▷ subagent {name}: {first}"));
             }
+            TuryaEvent::SubagentActivity { name, detail, .. } => {
+                // The child's own rows stay hidden, but silence during a long
+                // child is indistinguishable from a hang. One dim line per
+                // tool keeps it visibly moving.
+                self.log_dim(format!("  · {name} using {detail}"));
+            }
             TuryaEvent::SubagentFinished { name, summary, .. } => {
                 let first = summary.lines().next().unwrap_or("").trim();
                 self.log_line_as(format!("▹ subagent {name}: {first}"), Speaker::User);

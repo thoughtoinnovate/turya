@@ -546,6 +546,14 @@ pub enum TuryaEvent {
         name: String,
         task: String,
     },
+    /// A subagent used a tool. Emitted so a long child is visibly working
+    /// rather than a silent wait - the child's own rows stay hidden, but the
+    /// fact that it is moving is not hidden.
+    SubagentActivity {
+        task_id: String,
+        name: String,
+        detail: String,
+    },
     /// A subagent finished. `summary` is what the parent was given, so the
     /// user can see exactly what came back.
     SubagentFinished {
