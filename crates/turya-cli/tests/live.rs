@@ -342,9 +342,9 @@ async fn live_advertises_a_skill_and_the_model_loads_it() {
             Arc::new(ToolRegistry::standard()),
             PermissionMode::Open,
         )
-        .with_skills_hook(Arc::new(turya_skills::FileSkillProvider::new(&[
-            root.to_string_lossy().to_string(),
-        ])))
+        .with_skills_hook(Arc::new(turya_skills::FileSkillProvider::new(&[root
+            .to_string_lossy()
+            .to_string()])))
         .with_session_id("live-skills"),
     );
     let mut app = TuiApp::new();
