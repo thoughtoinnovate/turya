@@ -191,8 +191,9 @@ mod tests {
         assert_eq!(SlotState::Env.badge(), "●");
     }
 
-    #[test]
-    fn not_required_is_filled_and_never_locked() {
+    #[tokio::test]
+    async fn not_required_is_filled_and_never_locked() {
+        let _env = crate::ENV_LOCK.lock().await;
         // A provider that needs no credential must not look like one awaiting
         // a login: filled badge, filled semantics, and a truthful active
         // method (never "api-key", which would claim a key exists).
@@ -216,8 +217,9 @@ mod tests {
         assert!(methods_for("gemini").needs_credential);
     }
 
-    #[test]
-    fn no_credential_provider_is_not_reported_missing() {
+    #[tokio::test]
+    async fn no_credential_provider_is_not_reported_missing() {
+        let _env = crate::ENV_LOCK.lock().await;
         let store = MemStore::new();
         let m = ProviderAuthMethods {
             env_var: None,
@@ -235,8 +237,9 @@ mod tests {
         assert_eq!(s.api_key, SlotState::Stored);
     }
 
-    #[test]
-    fn optional_env_var_upgrades_not_required_to_env() {
+    #[tokio::test]
+    async fn optional_env_var_upgrades_not_required_to_env() {
+        let _env = crate::ENV_LOCK.lock().await;
         let store = MemStore::new();
         let m = ProviderAuthMethods {
             env_var: Some("TURYA_TEST_OPTIONAL_KEY"),
@@ -276,8 +279,12 @@ mod tests {
         assert!(s.is_authenticated());
     }
 
-    #[test]
-    fn env_beats_stored() {
+    // Async so it shares the one env lock with every other env-touching test
+    // in this crate. A second, sync-only mutex would not exclude the async
+    // ones, which is the whole point of having it.
+    #[tokio::test]
+    async fn env_beats_stored() {
+        let _env = crate::ENV_LOCK.lock().await;
         let store = MemStore::new();
         store.set("gemini-api-key", "stored").unwrap();
         std::env::set_var("TURYA_TEST_GEMINI_KEY", "env");

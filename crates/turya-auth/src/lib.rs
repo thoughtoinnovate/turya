@@ -17,3 +17,11 @@ pub use store::{
     FileStore, KeychainStore, MemStore, StoreError,
 };
 pub use turya_core::ResolvedCreds;
+
+/// Serialises every test in this crate that mutates process environment.
+///
+/// Environment is global, so two tests setting and clearing the same var
+/// interleave and produce failures that look like logic bugs and are not. A
+/// fast workstation hides this; a 2-core CI runner surfaces it.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

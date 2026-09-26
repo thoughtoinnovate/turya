@@ -237,6 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_local_provider_without_credential() {
+        let _env = crate::ENV_LOCK.lock().await;
         // The optional key must be absent for this path to be exercised, so
         // mask (and restore) any ambient value from the developer's shell.
         let ambient = std::env::var("OLLAMA_API_KEY").ok();
