@@ -31,13 +31,38 @@ test:
 	cargo test --workspace
 
 # NOTE: relies on the CARGO_HOME pin above: the image-wide
-# CARGO_HOME=/opt/cargo is an empty root-owned skeleton, and `cargo install`
-# needs registry + `.crates.toml` writes that only succeed under ~/.cargo.
+# CARGO_HOME=/opt/cargo is an empty root-owned skeleton that is not writable,
+# so resolving dependencies into it fails with os error 13.
+#
+# Installed from the workspace build rather than with `cargo install`.
+#
+# `cargo install --path` re-resolves against the registry index even with
+# `--locked`, so it needs network on a machine whose DNS is broken, and it
+# compiles a second copy of everything into its own target dir. It was also
+# free to pick versions the tests had never verified.
+#
+# Building in-workspace and copying the binary:
+#   - uses the committed Cargo.lock, so the installed binary is the exact
+#     dependency set `make test` passed against,
+#   - never contacts the registry once the cache is warm, so it works offline,
+#   - reuses ./target, so it is incremental instead of a second full build.
+#
+# It still fails if a dependency is genuinely absent from the local cache,
+# which is the honest failure: the bytes needed to build were never here.
+INSTALL_DIR ?= $(HOME)/.cargo/bin
+INSTALL_FLAGS = --locked
+
 install:
-	cargo install --path crates/turya-cli --force
+	cargo build -p turya-cli $(INSTALL_FLAGS)
+	install -d $(INSTALL_DIR)
+	install -m 0755 target/debug/turya $(INSTALL_DIR)/turya
+	@$(INSTALL_DIR)/turya --version
 
 install-release:
-	cargo install --path crates/turya-cli --release --force
+	cargo build --release -p turya-cli $(INSTALL_FLAGS)
+	install -d $(INSTALL_DIR)
+	install -m 0755 target/release/turya $(INSTALL_DIR)/turya
+	@$(INSTALL_DIR)/turya --version
 
 clean:
 	cargo clean
