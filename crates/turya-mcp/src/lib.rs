@@ -128,6 +128,7 @@ struct Connection {
     stdin: Mutex<Option<ChildStdin>>,
     next_id: Mutex<u64>,
     server_info: Mutex<Option<Value>>,
+    timeout: Duration,
 }
 
 impl Connection {
@@ -167,6 +168,7 @@ impl Connection {
             stdin: Mutex::new(stdin),
             next_id: Mutex::new(1),
             server_info: Mutex::new(None),
+            timeout: REQUEST_TIMEOUT,
         })
     }
 
@@ -198,13 +200,13 @@ impl Connection {
         loop {
             let line = {
                 let rx = self.rx.lock().unwrap();
-                match rx.recv_timeout(REQUEST_TIMEOUT) {
+                match rx.recv_timeout(self.timeout) {
                     // The server exited: no reply is coming, ever.
                     Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                         return Err(format!("{method}: server exited without responding"));
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        return Err(format!("{method}: timed out after {REQUEST_TIMEOUT:?}"));
+                        return Err(format!("{method}: timed out after {:?}", self.timeout));
                     }
                     Ok(Some(l)) => l,
                 }
@@ -293,6 +295,8 @@ pub struct McpServer {
 pub struct McpRegistry {
     servers: Vec<McpServer>,
     conns: HashMap<String, Arc<Connection>>,
+    /// Deadline applied to every server this registry connects.
+    timeout: Duration,
 }
 
 /// A connection kills its server on drop: a failed `connect` must not leave
@@ -311,7 +315,16 @@ impl McpRegistry {
         Self {
             servers: Vec::new(),
             conns: HashMap::new(),
+            timeout: REQUEST_TIMEOUT,
         }
+    }
+
+    /// Override the request deadline. A wedged server should not hold a turn
+    /// open for longer than the user is willing to wait, and a test should
+    /// not have to sit through the production bound to prove it gives up.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Connect to one server and list its tools. Returns the tool names on
@@ -322,8 +335,9 @@ impl McpRegistry {
         command: &str,
         args: &[String],
     ) -> Result<Vec<String>, String> {
-        let conn = Connection::spawn(command, args, None)
+        let mut conn = Connection::spawn(command, args, None)
             .map_err(|e| format!("cannot start '{command}': {e}"))?;
+        conn.timeout = self.timeout;
         let conn = Arc::new(conn);
 
         let init = conn

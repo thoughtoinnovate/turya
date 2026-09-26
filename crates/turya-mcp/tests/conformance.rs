@@ -6,6 +6,7 @@
 //! stub out the pipe.
 
 use serde_json::json;
+use std::time::Duration;
 use turya_tools::Tool;
 
 const MOCK: &str = r#"#!/bin/sh
@@ -39,17 +40,45 @@ while IFS= read -r line; do
 done
 "#;
 
+/// The mock script is written exactly once per test process.
+///
+/// Every test in this file uses the same path, and tests run in parallel: a
+/// second `fs::write` would truncate a script another thread is currently
+/// executing. `OnceLock` makes the first write the only one.
 fn write_mock() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("turya-mcp-mock");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("mock-server.sh");
-    std::fs::write(&path, MOCK).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    path
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::temp_dir().join("turya-mcp-mock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mock-server.sh");
+        std::fs::write(&path, MOCK).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    })
+    .clone()
+}
+
+/// Same one-write rule as `write_mock`; a second write would race the
+/// exec of the first.
+fn write_silent() -> std::path::PathBuf {
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::temp_dir().join("turya-mcp-mock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("silent-server.sh");
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 3600\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    })
+    .clone()
 }
 
 fn registry() -> turya_mcp::McpRegistry {
@@ -138,22 +167,17 @@ async fn mcp_tools_are_high_risk_so_the_broker_asks() {
 fn a_server_that_says_nothing_times_out_instead_of_hanging_forever() {
     // A real regression guard for the no-timeout bug this client was written
     // to avoid: `BufRead::read_line` would block here indefinitely.
-    let dir = std::env::temp_dir().join("turya-mcp-mock");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("silent-server.sh");
-    std::fs::write(&path, "#!/bin/sh\nexec sleep 3600\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let mut r = turya_mcp::McpRegistry::empty();
+    let path = write_silent();
+    // A short deadline proves the same thing as the 30s production bound
+    // without making the suite sleep for half a minute on every CI run.
+    let mut r = turya_mcp::McpRegistry::empty().with_request_timeout(Duration::from_secs(2));
     let started = std::time::Instant::now();
     let res = r.connect("silent", path.to_str().unwrap(), &[]);
     let elapsed = started.elapsed();
-    assert!(res.is_err(), "a silent server must not look like success");
-    // The bound is 30s per request; allow slack for a loaded CI box.
-    assert!(elapsed < std::time::Duration::from_secs(60), "{elapsed:?}");
+    let err = res.unwrap_err();
+    assert!(err.contains("timed out"), "{err}");
+    // Generous upper bound: the point is "gives up", not "gives up fast".
+    assert!(elapsed < Duration::from_secs(60), "{elapsed:?}");
 }
 
 #[test]
