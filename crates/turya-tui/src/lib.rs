@@ -1687,6 +1687,18 @@ impl TuiApp {
             } => {
                 self.pending_permission = Some((request_id.clone(), action.clone()));
             }
+            TuryaEvent::SubagentStarted { name, task, .. } => {
+                // One dim line, then the tool row for `spawn_agent` stays in
+                // its running state until the child answers. The child's own
+                // tool calls are deliberately not shown: the parent reads a
+                // summary, and so should the user.
+                let first = task.lines().next().unwrap_or("").trim();
+                self.log_dim(format!("▷ subagent {name}: {first}"));
+            }
+            TuryaEvent::SubagentFinished { name, summary, .. } => {
+                let first = summary.lines().next().unwrap_or("").trim();
+                self.log_line_as(format!("▹ subagent {name}: {first}"), Speaker::User);
+            }
             TuryaEvent::McpStatus { servers } => {
                 if servers.is_empty() {
                     self.log_dim(

@@ -492,6 +492,22 @@ pub enum TuryaEvent {
         session: Box<SessionMeta>,
         transcript: Transcript,
     },
+    /// A subagent began. The parent sees this as one collapsed row; the
+    /// child's own tool calls stay inside it.
+    SubagentStarted {
+        task_id: String,
+        name: String,
+        task: String,
+    },
+    /// A subagent finished. `summary` is what the parent was given, so the
+    /// user can see exactly what came back.
+    SubagentFinished {
+        task_id: String,
+        name: String,
+        summary: String,
+        /// The child's whole transcript, bounded, for the expanded view.
+        transcript: String,
+    },
     /// Answer to `McpStatus`: one row per server, plus its tools.
     McpStatus {
         servers: Vec<McpServerStatus>,

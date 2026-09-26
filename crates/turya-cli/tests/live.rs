@@ -443,3 +443,83 @@ async fn live_model_calls_a_tool_over_real_mcp_stdio() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn live_model_delegates_a_side_task_to_a_subagent() {
+    require_live!();
+    let creds = match live_credentials().await {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no live credential available");
+            return;
+        }
+    };
+
+    let engine = Arc::new(
+        TuryaEngine::new(
+            LiveProvider::build(&creds),
+            Arc::new(ToolRegistry::standard()),
+            PermissionMode::Open,
+        )
+        .with_session_id("live-subagent"),
+    );
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+    let (_perm_tx, perm_rx) = tokio::sync::mpsc::channel(1);
+
+    // A token only the subagent can know: it must read the file, so the
+    // parent cannot answer this from its own knowledge.
+    let dir = std::env::temp_dir().join("turya-live-subagent");
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = dir.join("secret.txt");
+    std::fs::write(&secret, "DELEGATION-WORKS-7731\n").unwrap();
+    let prompt = format!(
+        "Delegate to a subagent: ask it to read {} and report the exact line it contains. \
+         Then tell me the line.",
+        secret.to_string_lossy()
+    );
+
+    let turn = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .run_turn(
+                    "sub1",
+                    &prompt,
+                    turya_protocol::AgentMode::Build,
+                    &[],
+                    event_tx,
+                    perm_rx,
+                )
+                .await;
+        })
+    };
+
+    let mut answered = String::new();
+    let mut delegated = false;
+    let mut refusals = Vec::new();
+    while let Some(ev) = event_rx.recv().await {
+        match ev {
+            turya_protocol::TuryaEvent::SubagentStarted { .. } => delegated = true,
+            turya_protocol::TuryaEvent::TokenDelta { chunk } => {
+                answered.push_str(&chunk);
+                if answered.contains("DELEGATION-WORKS-7731") {
+                    break;
+                }
+            }
+            turya_protocol::TuryaEvent::Error { message } => refusals.push(message),
+            _ => {}
+        }
+    }
+    let _ = turn.await;
+
+    assert!(
+        delegated,
+        "a real model given a side task must actually delegate: {answered}"
+    );
+    assert!(
+        answered.contains("DELEGATION-WORKS-7731"),
+        "the parent's answer must carry what the subagent found: {answered}"
+    );
+    assert!(refusals.is_empty(), "unexpected errors: {refusals:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -23,6 +23,20 @@ const MAX_TOOL_HISTORY_CHARS: usize = 2000;
 const COMPACT_AT_PERCENT: u32 = 85;
 /// Give up auto-compacting after this many consecutive failures.
 const MAX_COMPACT_FAILURES: u32 = 3;
+/// The kernel-owned delegation tool. Not in the `ToolRegistry`: it needs the
+/// engine, and a tool holding an `Arc` back to the engine that owns the
+/// registry is a reference cycle.
+pub const SPAWN_AGENT_TOOL: &str = "spawn_agent";
+/// How deep subagents may nest. One level, deliberately: a subagent that can
+/// spawn subagents can spawn a fork bomb, and every extra level multiplies
+/// cost with no added capability. Depth is a hard cap, not a budget knob.
+const MAX_SUBAGENT_DEPTH: u8 = 1;
+/// A subagent's own budgets. Smaller than the parent's on purpose: a
+/// delegated side quest should not be able to spend the caller's turn.
+const SUBAGENT_MODEL_CALLS: usize = 12;
+const SUBAGENT_TOOL_CALLS: u32 = 24;
+/// Longest child transcript kept for the expanded view.
+const MAX_SUBAGENT_TRANSCRIPT_CHARS: usize = 4000;
 
 /// Per-turn step budgets: model generations (cost/latency) and tool
 /// executions (side effects). One model response can emit many `CallTool`
@@ -38,6 +52,24 @@ impl Default for TurnBudgets {
         Self {
             model_calls: DEFAULT_MODEL_CALLS,
             tool_calls: DEFAULT_TOOL_CALLS,
+        }
+    }
+}
+
+/// Where a turn sits in the subagent tree. Carried by value, not stored on
+/// the engine: the engine is shared, the tree is not.
+#[derive(Debug, Clone)]
+pub struct TurnCtx {
+    depth: u8,
+    /// Set on a subagent turn; drives the tool catalog and the depth cap.
+    subagent: Option<(String, String)>,
+}
+
+impl TurnCtx {
+    pub fn root() -> Self {
+        Self {
+            depth: 0,
+            subagent: None,
         }
     }
 }
@@ -240,7 +272,7 @@ impl TuryaEngine {
     /// Built per turn rather than cached, because the registry can grow at
     /// runtime — an MCP server connecting mid-session must become callable
     /// without a restart.
-    fn tool_catalog_instruction(&self) -> String {
+    fn tool_catalog_instruction(&self, depth: u8) -> String {
         let mut lines = Vec::new();
         for name in self.tools.names() {
             let Some(t) = self.tools.get(&name) else {
@@ -257,11 +289,138 @@ impl TuryaEngine {
         if lines.is_empty() {
             return String::new();
         }
+        // Advertised only where it is callable. A subagent that could spawn
+        // another subagent would be a depth cap the model cannot see.
+        if depth < MAX_SUBAGENT_DEPTH {
+            lines.push(format!(
+                "- {SPAWN_AGENT_TOOL}: delegate a self-contained side task to a \
+                 subagent with its own context and budget. Arguments: \
+                 name: string — a short label; task: string — full instructions, \
+                 including what to return."
+            ));
+        }
         format!(
             "You can call these tools. To use one, emit a tool call with its exact \
              name and JSON arguments.\n{}",
             lines.join("\n")
         )
+    }
+
+    /// Run a delegated side task and return only its conclusion.
+    ///
+    /// The child gets its own transcript and its own budget, and its internal
+    /// tool calls are not streamed to the user: the point of delegating is
+    /// that the parent reasons over a summary, not over forty tool rows.
+    async fn run_subagent(
+        &self,
+        call: &turya_protocol::ToolCall,
+        event_tx: &mpsc::Sender<TuryaEvent>,
+        perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
+        ctx: &TurnCtx,
+        mode: AgentMode,
+    ) -> turya_protocol::ToolResult {
+        if ctx.depth >= MAX_SUBAGENT_DEPTH {
+            return turya_protocol::ToolResult {
+                call_id: call.call_id.clone(),
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "{SPAWN_AGENT_TOOL} is not available inside a subagent: nesting is \
+                     capped at one level."
+                )),
+            };
+        }
+        let name = call
+            .parameters
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("subagent")
+            .to_string();
+        let task = match call.parameters.get("task").and_then(|v| v.as_str()) {
+            Some(t) if !t.trim().is_empty() => t.to_string(),
+            _ => {
+                return turya_protocol::ToolResult {
+                    call_id: call.call_id.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "spawn_agent needs a non-empty `task` string describing the work"
+                            .to_string(),
+                    ),
+                };
+            }
+        };
+        let task_id = format!("{}/{}", call.call_id, name);
+        let _ = event_tx
+            .send(TuryaEvent::SubagentStarted {
+                task_id: task_id.clone(),
+                name: name.clone(),
+                task: task.clone(),
+            })
+            .await;
+
+        // The child's events go to a private channel drained into a
+        // transcript, so the user sees one row instead of the child's innards.
+        // Inline, not spawned: the permission channel below is shared state
+        // and a nested call keeps exactly one owner of it.
+        let (child_tx, mut child_rx) = mpsc::channel::<TuryaEvent>(256);
+        // Boxed because the call graph is cyclic: a turn dispatches a tool,
+        // which can start another turn. Without a type erasure here the
+        // future's own type is infinitely large and the borrow checker is
+        // within its rights to refuse.
+        Box::pin(self.run_turn_at(
+            &format!("{task_id}#1"),
+            &task,
+            mode,
+            &[],
+            child_tx,
+            perm_rx,
+            TurnCtx {
+                depth: ctx.depth + 1,
+                subagent: Some((task_id.clone(), name.clone())),
+            },
+        ))
+        .await;
+
+        let mut transcript = String::new();
+        while let Ok(ev) = child_rx.try_recv() {
+            if let TuryaEvent::TokenDelta { chunk } = ev {
+                transcript.push_str(&chunk);
+            }
+        }
+        drop(child_rx);
+        let summary = transcript.trim().to_string();
+        let clipped: String = transcript
+            .chars()
+            .take(MAX_SUBAGENT_TRANSCRIPT_CHARS)
+            .collect();
+        let _ = event_tx
+            .send(TuryaEvent::SubagentFinished {
+                task_id: task_id.clone(),
+                name: name.clone(),
+                summary: summary.clone(),
+                transcript: clipped,
+            })
+            .await;
+
+        // An empty child transcript is a failure the parent must see, not an
+        // empty success it will try to interpret.
+        if summary.is_empty() {
+            return turya_protocol::ToolResult {
+                call_id: call.call_id.clone(),
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "subagent '{name}' returned nothing; treat the task as unfulfilled"
+                )),
+            };
+        }
+        turya_protocol::ToolResult {
+            call_id: call.call_id.clone(),
+            success: true,
+            output: format!("Subagent '{name}' reported:\n{summary}"),
+            error: None,
+        }
     }
 
     /// structured summary with tools structurally dropped, then keeps the last
@@ -423,6 +582,33 @@ impl TuryaEngine {
         event_tx: mpsc::Sender<TuryaEvent>,
         mut perm_rx: mpsc::Receiver<(String, PermissionDecision)>,
     ) {
+        self.run_turn_at(
+            turn_id,
+            prompt,
+            mode,
+            attachments,
+            event_tx,
+            &mut perm_rx,
+            TurnCtx::root(),
+        )
+        .await
+    }
+
+    /// One turn, at a known place in the subagent tree.
+    ///
+    /// Depth is threaded here rather than held on the engine because the
+    /// engine is shared across concurrent turns; a field would be a race.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_turn_at(
+        &self,
+        turn_id: &str,
+        prompt: &str,
+        mode: AgentMode,
+        attachments: &[turya_protocol::Attachment],
+        event_tx: mpsc::Sender<TuryaEvent>,
+        perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
+        ctx: TurnCtx,
+    ) {
         // `pre_turn` memory hook: surface learned rules before generation.
         if let Some(ref hook) = self.memory_hook {
             let rules = hook.recall_rules(&self.session_id, prompt, 3).await;
@@ -446,6 +632,9 @@ impl TuryaEngine {
         // everything so far. Tool results re-enter as history, so the model
         // always gets the last word (a summary, an explanation, a follow-up).
         let budgets = *self.budgets.read().unwrap();
+        // Kept for the subagent dispatch below, which happens inside
+        // `run_pass` after the original was consumed by `TurnStarted`.
+        let subagent_mode = mode;
         // Continue the stored conversation when a memory seam is present, so
         // the model actually remembers earlier turns. Without it the turn
         // starts from nothing, which is correct for a first turn and wrong
@@ -475,7 +664,7 @@ impl TuryaEngine {
         // feature: the model has no other way to learn a name, and an MCP
         // server's tools are unknowable by guesswork. Names and one-line
         // summaries only — the schema stays with the tool.
-        let catalog = self.tool_catalog_instruction();
+        let catalog = self.tool_catalog_instruction(ctx.depth);
         if !catalog.is_empty() {
             transcript.push(Part::Instruction { text: catalog });
         }
@@ -486,8 +675,19 @@ impl TuryaEngine {
                 transcript.push(Part::Instruction { text: rendered });
             }
         }
+        // A delegated turn is told who asked and what to hand back, so it
+        // writes its answer for the parent instead of addressing the user.
+        let framed_prompt = match &ctx.subagent {
+            Some((task_id, name)) => format!(
+                "You are the subagent '{name}' (task {task_id}), working on a delegated \
+                 side task. The agent that delegated to you will read only your final \
+                 message, so make it a complete answer: state the result, not the \
+                 steps you took.\n\nTask:\n{prompt}"
+            ),
+            None => prompt.to_string(),
+        };
         transcript.push(Part::UserText {
-            text: prompt.to_string(),
+            text: framed_prompt,
         });
         for attachment in attachments {
             transcript.push(if attachment.mime.starts_with("image/") {
@@ -502,6 +702,17 @@ impl TuryaEngine {
         let mut tool_executions = 0u32;
         let mut tool_cap_hit = false;
 
+        // A subagent is billed against the caller's turn, so it gets its own
+        // smaller allowance rather than the session default.
+        let budgets = if ctx.depth > 0 {
+            TurnBudgets {
+                model_calls: SUBAGENT_MODEL_CALLS,
+                tool_calls: SUBAGENT_TOOL_CALLS,
+            }
+        } else {
+            budgets
+        };
+
         for _pass in 0..budgets.model_calls {
             passes += 1;
             let gate = ToolGate {
@@ -510,7 +721,7 @@ impl TuryaEngine {
                 execute: true,
             };
             let outcome = self
-                .run_pass(&transcript, &event_tx, &mut perm_rx, gate)
+                .run_pass(&transcript, &event_tx, perm_rx, gate, &ctx, subagent_mode)
                 .await;
             // Appended here, not inside `run_pass`: the provider only ever
             // borrows the transcript, so no pass ever deep-copies the
@@ -553,7 +764,7 @@ impl TuryaEngine {
                 execute: false,
             };
             let outcome = self
-                .run_pass(&transcript, &event_tx, &mut perm_rx, gate)
+                .run_pass(&transcript, &event_tx, perm_rx, gate, &ctx, subagent_mode)
                 .await;
             transcript.extend(outcome.parts);
             if let Some(e) = outcome.provider_err {
@@ -607,12 +818,15 @@ impl TuryaEngine {
     ///
     /// Takes the transcript by shared borrow and never mutates it, so no
     /// pass copies the history; the caller appends the returned parts.
+    #[allow(clippy::too_many_arguments)]
     async fn run_pass(
         &self,
         transcript: &Transcript,
         event_tx: &mpsc::Sender<TuryaEvent>,
         perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
         gate: ToolGate<'_>,
+        ctx: &TurnCtx,
+        mode: AgentMode,
     ) -> PassOutcome {
         let (step_tx, mut step_rx) = mpsc::channel(32);
         let provider = self.provider.read().unwrap().clone();
@@ -671,7 +885,9 @@ impl TuryaEngine {
                         continue;
                     }
                     *gate.executions += 1;
-                    let result = self.execute_tool_call(&call, event_tx, perm_rx).await;
+                    let result = self
+                        .execute_tool_call(&call, event_tx, perm_rx, ctx, mode)
+                        .await;
                     let summary = result
                         .error
                         .clone()
@@ -711,15 +927,25 @@ impl TuryaEngine {
     /// Execute one tool call: announce, permission-gate, run, announce the
     /// result. Extracted from `run_turn` so the agentic loop stays readable;
     /// behavior matches the old inline block exactly.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_tool_call(
         &self,
         call: &turya_protocol::ToolCall,
         event_tx: &mpsc::Sender<TuryaEvent>,
         perm_rx: &mut mpsc::Receiver<(String, PermissionDecision)>,
+        ctx: &TurnCtx,
+        mode: AgentMode,
     ) -> turya_protocol::ToolResult {
         let _ = event_tx
             .send(TuryaEvent::ToolCallInitiated(call.clone()))
             .await;
+        // `spawn_agent` is answered by the kernel, not the registry: it needs
+        // this engine, and a tool holding an `Arc` back to the engine that
+        // owns the registry is a cycle. Dispatching here also keeps the
+        // capability gate in one place.
+        if call.tool_name == SPAWN_AGENT_TOOL {
+            return self.run_subagent(call, event_tx, perm_rx, ctx, mode).await;
+        }
         let tool = match self.tools.get(&call.tool_name) {
             Some(t) => t,
             None => {
