@@ -364,29 +364,42 @@ impl TuryaEngine {
         // Inline, not spawned: the permission channel below is shared state
         // and a nested call keeps exactly one owner of it.
         let (child_tx, mut child_rx) = mpsc::channel::<TuryaEvent>(256);
+        let mut transcript = String::new();
+        let child_turn_id = format!("{task_id}#1");
+        // The child and the drain run concurrently in one task. Draining only
+        // after the child returns would deadlock the moment a child emitted
+        // more events than the channel holds: it would block on a send that
+        // nobody was reading, forever, with no error to show for it.
+        //
         // Boxed because the call graph is cyclic: a turn dispatches a tool,
         // which can start another turn. Without a type erasure here the
         // future's own type is infinitely large and the borrow checker is
         // within its rights to refuse.
-        Box::pin(self.run_turn_at(
-            &format!("{task_id}#1"),
-            &task,
-            mode,
-            &[],
-            child_tx,
-            perm_rx,
-            TurnCtx {
-                depth: ctx.depth + 1,
-                subagent: Some((task_id.clone(), name.clone())),
-            },
-        ))
-        .await;
-
-        let mut transcript = String::new();
-        while let Ok(ev) = child_rx.try_recv() {
-            if let TuryaEvent::TokenDelta { chunk } = ev {
-                transcript.push_str(&chunk);
-            }
+        // Scoped so the drain future's borrows of `child_rx` and
+        // `transcript` end before either is used again below.
+        // The block ends the drain future's borrows of `child_rx` and
+        // `transcript` before either is read again.
+        {
+            let child = Box::pin(self.run_turn_at(
+                &child_turn_id,
+                &task,
+                mode,
+                &[],
+                child_tx,
+                perm_rx,
+                TurnCtx {
+                    depth: ctx.depth + 1,
+                    subagent: Some((task_id.clone(), name.clone())),
+                },
+            ));
+            let drain = async {
+                while let Some(ev) = child_rx.recv().await {
+                    if let TuryaEvent::TokenDelta { chunk } = ev {
+                        transcript.push_str(&chunk);
+                    }
+                }
+            };
+            let (_, ()) = tokio::join!(child, drain);
         }
         drop(child_rx);
         let summary = transcript.trim().to_string();

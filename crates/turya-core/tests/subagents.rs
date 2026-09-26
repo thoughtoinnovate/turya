@@ -368,3 +368,93 @@ async fn the_child_cannot_delegate_further_and_is_told_why() {
         refusals[0]
     );
 }
+
+/// A child that emits far more events than its channel can hold.
+struct Chatty {
+    /// Tokens the child will produce, each one a `TokenDelta` event.
+    tokens: usize,
+    seen: Arc<std::sync::Mutex<Vec<Transcript>>>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for Chatty {
+    async fn generate_turn(
+        &self,
+        transcript: &Transcript,
+        tx: mpsc::Sender<ProviderStep>,
+    ) -> Result<(), String> {
+        self.seen.lock().unwrap().push(transcript.clone());
+        let is_child = transcript
+            .turns
+            .iter()
+            .flat_map(|t| t.parts.iter())
+            .filter_map(|p| match p {
+                Part::UserText { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .any(|t| t.contains("You are the subagent"));
+        if is_child {
+            for i in 0..self.tokens {
+                let _ = tx
+                    .send(ProviderStep::Token(format!("child-token-{i} ")))
+                    .await;
+            }
+            let _ = tx.send(ProviderStep::Finish).await;
+            return Ok(());
+        }
+        let already = transcript
+            .turns
+            .iter()
+            .flat_map(|t| t.parts.iter())
+            .any(|p| matches!(p, Part::ToolResult { .. }));
+        if !already {
+            let _ = tx
+                .send(ProviderStep::CallTool(ToolCall {
+                    call_id: "c1".into(),
+                    tool_name: SPAWN_AGENT_TOOL.into(),
+                    parameters: serde_json::json!({ "name": "chatty", "task": "say a lot" }),
+                    signature: None,
+                }))
+                .await;
+        } else {
+            let _ = tx.send(ProviderStep::Token("parent done".into())).await;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_child_that_outfills_the_event_channel_does_not_deadlock() {
+    // The channel between a subagent and its parent holds 256 events. Draining
+    // it only after the child returned meant a chatty child blocked forever on
+    // a send nobody was reading - a hang with no error, which is the worst
+    // failure mode a test suite can have. This is the regression guard.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine = TuryaEngine::new(
+        Arc::new(Chatty {
+            tokens: 2000,
+            seen: seen.clone(),
+        }),
+        Arc::new(ToolRegistry::standard()),
+        PermissionMode::Open,
+    );
+
+    // Bounded: a deadlock shows up as this timing out, not as a hung CI job.
+    let events = tokio::time::timeout(std::time::Duration::from_secs(20), run(engine))
+        .await
+        .expect("the subagent turn deadlocked on its own event channel");
+
+    let summary = events
+        .iter()
+        .find_map(|e| match e {
+            TuryaEvent::SubagentFinished { summary, .. } => Some(summary.clone()),
+            _ => None,
+        })
+        .expect("the child must have finished");
+    assert!(
+        summary.contains("child-token-1999"),
+        "every token must reach the parent, not just the first {}: {}",
+        summary.len(),
+        &summary[..summary.len().min(120)]
+    );
+}
