@@ -21,6 +21,10 @@ impl PermissionBroker {
         *mode = new_mode;
     }
 
+    pub fn mode(&self) -> PermissionMode {
+        *self.mode.read().unwrap()
+    }
+
     /// Evaluates if an action is pre-authorized or requires user challenge
     pub fn check(&self, tool_name: &str, risk: RiskLevel) -> Option<PermissionDecision> {
         let mode = *self.mode.read().unwrap();

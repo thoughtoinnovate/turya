@@ -61,6 +61,8 @@ pub struct TuryaConfig {
     pub tool_bg: Option<String>,
     /// Set when the user asks for no colour at all (`NO_COLOR`).
     pub no_color: Option<bool>,
+    /// Follow new output to the bottom of the transcript.
+    pub auto_scroll: Option<bool>,
 }
 
 impl Default for TuryaConfig {
@@ -85,6 +87,7 @@ impl Default for TuryaConfig {
             assistant_bg: None,
             tool_bg: None,
             no_color: Some(false),
+            auto_scroll: Some(true),
         }
     }
 }

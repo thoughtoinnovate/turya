@@ -18,7 +18,8 @@ use ratatui::{
 use std::io::stdout;
 use tokio::sync::mpsc;
 use turya_protocol::{
-    AgentMode, Attachment, Part, PermissionDecision, Transcript, TuryaCommand, TuryaEvent,
+    AgentMode, Attachment, Part, PermissionDecision, PermissionMode, Transcript, TuryaCommand,
+    TuryaEvent,
 };
 
 pub mod slash;
@@ -439,6 +440,10 @@ pub struct TuiApp {
     at_completer: Option<(usize, Vec<String>, usize)>,
     /// `auto` (default) | `on` | `off`, from `/settings mouse`.
     mouse: Option<String>,
+    /// Follow new output to the bottom of the transcript.
+    auto_scroll: bool,
+    /// Current approval mode, from the host.
+    permission_mode: PermissionMode,
     /// Render assistant prose as markdown. On by default; the stored
     /// transcript keeps the raw text either way, so this is presentation
     /// only and reversible.
@@ -469,6 +474,16 @@ pub struct TuiApp {
     /// Manual scroll-back: lines the transcript is lifted above the bottom.
     /// `0` = follow live output. PageUp/PageDown adjust, End/new prompt resets.
     scroll_lines_up: usize,
+    /// Current animated viewport top row while auto-following.
+    scroll_offset: usize,
+    /// Desired viewport top row while auto-following.
+    scroll_target: usize,
+    /// Wrapped-row start offsets for each transcript line, cached by width.
+    row_offsets: Vec<usize>,
+    /// Width the cached row offsets were computed for.
+    row_offsets_width: usize,
+    /// Whether row offsets need recomputation.
+    row_offsets_dirty: bool,
 }
 
 impl Default for TuiApp {
@@ -509,6 +524,8 @@ impl TuiApp {
             persist_history: false,
             tints: Tints::default(),
             mouse: Some("auto".to_string()),
+            auto_scroll: true,
+            permission_mode: PermissionMode::ReviewForMe,
             queued: 0,
             attachments: Vec::new(),
             at_completer: None,
@@ -523,6 +540,11 @@ impl TuiApp {
             turn_active: false,
             spin_tick: 0,
             scroll_lines_up: 0,
+            scroll_offset: 0,
+            scroll_target: 0,
+            row_offsets: Vec::new(),
+            row_offsets_width: 0,
+            row_offsets_dirty: true,
         }
     }
 
@@ -534,6 +556,7 @@ impl TuiApp {
 
     fn log_line_as(&mut self, line: String, role: Speaker) {
         self.transcript.push(TLine::new(line, false, role));
+        self.row_offsets_dirty = true;
     }
 
     /// Tints, or none at all when colour is off. Every styling decision goes
@@ -552,6 +575,7 @@ impl TuiApp {
     fn log_dim(&mut self, line: String) {
         self.transcript
             .push(TLine::new(line, true, Speaker::System));
+        self.row_offsets_dirty = true;
     }
 
     /// Append a (possibly multi-line) block, preserving blank lines so
@@ -582,6 +606,7 @@ impl TuiApp {
     }
 
     fn push_block_as(&mut self, text: &str, dim: bool, role: Speaker) {
+        self.row_offsets_dirty = true;
         // Only assistant prose is markdown. Prompts, tool output and system
         // rows are literal: a user pasting `**stars**` must see the stars.
         if !dim && role == Speaker::Assistant && self.render_markdown {
@@ -604,15 +629,31 @@ impl TuiApp {
     /// Stream one token chunk: extend the current content line, or start a
     /// new one when the transcript is empty or ends in a dimmed row.
     fn push_text(&mut self, chunk: &str) {
+        self.row_offsets_dirty = true;
+        // Only extend an existing *assistant* line. A trailing blank line
+        // from the user's prompt (or a dimmed/system row) must start a new
+        // assistant line, otherwise the first token lands on the wrong row
+        // and the later markdown swap leaves a duplicate behind.
+        let append = self
+            .transcript
+            .last()
+            .map(|l| !l.dim && l.role == Speaker::Assistant)
+            .unwrap_or(false);
         if self.stream_start.is_none() {
-            self.stream_start = Some(self.transcript.len());
+            self.stream_start = Some(if append {
+                self.transcript.len().saturating_sub(1)
+            } else {
+                self.transcript.len()
+            });
         }
         self.streaming.push_str(chunk);
-        match self.transcript.last_mut() {
-            Some(last) if !last.dim => last.text.push_str(chunk),
-            _ => self
-                .transcript
-                .push(TLine::new(chunk.to_string(), false, Speaker::Assistant)),
+        if append {
+            if let Some(last) = self.transcript.last_mut() {
+                last.text.push_str(chunk);
+            }
+        } else {
+            self.transcript
+                .push(TLine::new(chunk.to_string(), false, Speaker::Assistant));
         }
     }
 
@@ -627,6 +668,7 @@ impl TuiApp {
             return;
         }
         self.transcript.truncate(start);
+        self.row_offsets_dirty = true;
         let text = std::mem::take(&mut self.streaming);
         self.push_block_as(&text, false, Speaker::Assistant);
     }
@@ -642,6 +684,7 @@ impl TuiApp {
     }
 
     /// Styled rows for the chat widget.
+    #[allow(dead_code)]
     fn transcript_lines(&self) -> Vec<Line<'_>> {
         self.transcript
             .iter()
@@ -673,6 +716,7 @@ impl TuiApp {
     /// Clear all transcript rows (`/clear`).
     fn clear_transcript(&mut self) {
         self.transcript.clear();
+        self.row_offsets_dirty = true;
     }
 
     // ---- prompt history (readline semantics) ----
@@ -759,6 +803,8 @@ impl TuiApp {
     /// `Ctrl+E` exactly like live ones.
     pub fn load_transcript(&mut self, transcript: &Transcript) {
         self.clear_transcript();
+        self.scroll_offset = 0;
+        self.scroll_target = 0;
         for turn in &transcript.turns {
             for part in &turn.parts {
                 match part {
@@ -885,6 +931,7 @@ impl TuiApp {
             // Matching on the tag rather than a remembered range is what makes
             // this safe after scrolling or other rows landing in between.
             self.transcript.retain(|l| l.owner != Some(id));
+            self.row_offsets_dirty = true;
             self.subagents[idx].expanded = false;
             self.log_dim(format!(
                 "── collapsed subagent {} ──",
@@ -910,22 +957,24 @@ impl TuiApp {
         self.scroll_to_bottom();
     }
 
-    /// Approximate wrapped line count for scroll math (no new deps):
-    /// each logical line occupies ceil(chars/width) rows, minimum 1.
-    /// Close enough to `Wrap { trim: false }` that the tail-stays-visible
-    /// test holds; exactness is not required, clamping is.
-    fn wrapped_lines(text: &str, width: usize) -> usize {
-        let w = width.max(1);
-        text.split('\n')
-            .map(|l| {
-                let n = l.chars().count();
-                if n == 0 {
-                    1
-                } else {
-                    n.div_ceil(w)
-                }
-            })
-            .sum()
+    fn ensure_row_offsets(&mut self, width: usize) {
+        if self.row_offsets.len() != self.transcript.len() + 1 {
+            self.row_offsets_dirty = true;
+        }
+        if !self.row_offsets_dirty && self.row_offsets_width == width {
+            return;
+        }
+        self.row_offsets.clear();
+        self.row_offsets.push(0);
+        let mut acc = 0usize;
+        for line in &self.transcript {
+            let n = line.text.chars().count();
+            let h = if n == 0 { 1 } else { n.div_ceil(width.max(1)) };
+            acc += h;
+            self.row_offsets.push(acc);
+        }
+        self.row_offsets_width = width;
+        self.row_offsets_dirty = false;
     }
 
     /// Should we capture the mouse? `auto` (the default) enables it only
@@ -1011,6 +1060,12 @@ impl TuiApp {
         }
     }
 
+    pub fn apply_auto_scroll(&mut self, value: Option<bool>) {
+        if let Some(v) = value {
+            self.auto_scroll = v;
+        }
+    }
+
     /// Effective colour mode. `NO_COLOR` in the environment wins over the
     /// saved setting, the same way the host resolves it.
     pub fn apply_color(&mut self, no_color: Option<bool>) {
@@ -1045,6 +1100,8 @@ impl TuiApp {
     /// Pin the viewport back to the live bottom.
     fn scroll_to_bottom(&mut self) {
         self.scroll_lines_up = 0;
+        self.scroll_offset = 0;
+        self.scroll_target = 0;
     }
 
     /// Format a character count as estimated tokens (≈ chars/4).
@@ -1067,8 +1124,7 @@ impl TuiApp {
             .map(|(p, m, via)| format!("{p}/{m} ({via})"))
             .unwrap_or_else(|| "no provider".to_string());
         if self.turn_active {
-            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            let f = frames[(self.spin_tick as usize) % frames.len()];
+            let f = self.spinner_frame();
             // Deterministic pick (lowest tool name) so the line is stable
             // when several tools run at once.
             let mut tools: Vec<&String> = self.pending_tools.values().collect();
@@ -1079,6 +1135,25 @@ impl TuiApp {
             }
         } else {
             format!(" Turya v{} │ {sel}", env!("CARGO_PKG_VERSION"))
+        }
+    }
+
+    /// Current braille spinner frame, shared by the top bar and the input
+    /// box title so the two never disagree.
+    fn spinner_frame(&self) -> char {
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        FRAMES[(self.spin_tick as usize) % FRAMES.len()]
+    }
+
+    /// Title of the input box: prompt help when idle, an unmistakable
+    /// loading indicator while a turn runs (the top bar carries the same
+    /// spinner, but it is easy to miss on a narrow terminal).
+    fn input_title(&self) -> String {
+        if self.turn_active {
+            "Esc stop  ·  Enter to replace".to_string()
+        } else {
+            "Prompt (Enter send · Alt+Enter newline · @ file · Ctrl+E expand · Esc stop)"
+                .to_string()
         }
     }
 
@@ -1097,10 +1172,11 @@ impl TuiApp {
             format!(" ⏳{}", self.queued)
         };
         format!(
-            " ↑{} ↓{}≈tok{queue} │ think:{} │ Build · Review-for-me",
+            " ↑{} ↓{}≈tok{queue} │ think:{} │ Build · {}",
             Self::fmt_tokens(self.sent_chars),
             Self::fmt_tokens(self.recv_chars),
             if self.show_thinking { "on" } else { "off" },
+            self.permission_mode.as_str(),
         )
     }
 
@@ -1115,14 +1191,25 @@ impl TuiApp {
         // The chips are echoed with the prompt, so what was attached is
         // visible in the scrollback afterwards.
         let chips = self.attachment_summary();
-        self.push_block(&format_user_message(&format!("{prompt}{chips}")), false);
-        self.push_block_as(&chips, false, Speaker::User);
+        // The user's own prompt is user-coloured (cyan) and is pushed once;
+        // the old code pushed it as assistant text and then echoed the chips
+        // again as a separate cyan line, which read as a duplicate.
+        self.push_block_as(
+            &format_user_message(&format!("{prompt}{chips}")),
+            false,
+            Speaker::User,
+        );
         let attachments = std::mem::take(&mut self.attachments);
         // Images render where they were attached, so the picture sits next to
         // the words that mention it.
         for a in &attachments {
             self.render_attachment(a);
         }
+        // Feedback is shown the instant Enter is pressed, not after the
+        // engine emits TurnStarted (which waits on memory recall). Otherwise
+        // a prompt can look like it vanished into a silent terminal.
+        self.turn_active = true;
+        self.spin_tick = 0;
         let _ = cmd_tx
             .send(TuryaCommand::SubmitPrompt {
                 prompt,
@@ -1386,6 +1473,10 @@ impl TuiApp {
                                         "not captured"
                                     }
                                 ));
+                                self.log_dim(format!(
+                                    "auto_scroll: {}",
+                                    if self.auto_scroll { "on" } else { "off" }
+                                ));
                                 self.log_dim(
                                     "set one with: /settings user_bg #1b2735  \
                                  (/settings user_bg none to clear)"
@@ -1472,6 +1563,41 @@ impl TuiApp {
                                     }
                                     return;
                                 }
+                                if key == "auto_scroll" {
+                                    let on = match value.to_ascii_lowercase().as_str() {
+                                        "on" | "true" | "yes" | "1" => Some(true),
+                                        "off" | "false" | "no" | "0" => Some(false),
+                                        _ => None,
+                                    };
+                                    match on {
+                                        Some(v) => {
+                                            self.auto_scroll = v;
+                                            if v {
+                                                self.scroll_lines_up = 0;
+                                                self.scroll_offset = 0;
+                                                self.scroll_target = 0;
+                                            }
+                                            let _ = cmd_tx
+                                                .send(TuryaCommand::UpdateConfig {
+                                                    permission_mode: None,
+                                                    provider: None,
+                                                    model: None,
+                                                    max_steps: None,
+                                                    max_tool_calls: None,
+                                                    ui: Some(turya_protocol::UiSettings {
+                                                        auto_scroll: Some(v),
+                                                        ..Default::default()
+                                                    }),
+                                                })
+                                                .await;
+                                            self.log_dim(format!("→ auto_scroll = {v}"));
+                                        }
+                                        None => {
+                                            self.log_dim("ℹ auto_scroll takes on | off".to_string())
+                                        }
+                                    }
+                                    return;
+                                }
                                 let parsed = Tints::parse(value);
                                 let slot = match key {
                                     "user_bg" => &mut self.tints.user,
@@ -1523,6 +1649,51 @@ impl TuiApp {
                                 .send(TuryaCommand::ResumeSession { id: id.to_string() })
                                 .await;
                         }
+                    }
+                    "approvals" => {
+                        let arg = args.trim();
+                        if arg.is_empty() {
+                            self.log_dim(format!(
+                                "approvals: {}  (open | review-for-me | manual)",
+                                self.permission_mode.as_str()
+                            ));
+                            self.log_dim(
+                                "set with: /approvals open | review-for-me | manual".to_string(),
+                            );
+                            return;
+                        }
+                        let normalized = arg.to_ascii_lowercase().replace(['_', ' '], "-");
+                        if !matches!(
+                            normalized.as_str(),
+                            "open" | "review-for-me" | "review" | "manual"
+                        ) {
+                            self.log_dim(
+                                "ℹ /approvals takes open | review-for-me | manual".to_string(),
+                            );
+                            return;
+                        }
+                        let (mode, pm) = match normalized.as_str() {
+                            "open" => (PermissionMode::Open, "open"),
+                            "review" | "review-for-me" => {
+                                (PermissionMode::ReviewForMe, "review-for-me")
+                            }
+                            "manual" => (PermissionMode::Manual, "manual"),
+                            _ => unreachable!(),
+                        };
+                        // Optimistic local update; the host's
+                        // PermissionModeChanged event corrects if needed.
+                        self.permission_mode = mode;
+                        let _ = cmd_tx
+                            .send(TuryaCommand::UpdateConfig {
+                                permission_mode: Some(mode),
+                                provider: None,
+                                model: None,
+                                max_steps: None,
+                                max_tool_calls: None,
+                                ui: None,
+                            })
+                            .await;
+                        self.log_dim(format!("→ approvals = {pm}"));
                     }
                     "steps" => {
                         // `/steps [model_calls] [tool_calls]`: per-turn budgets.
@@ -1892,6 +2063,16 @@ impl TuiApp {
                 // here (not in the run loop) so headless tests drive it.
                 self.provider = Some((provider.clone(), model.clone(), via.clone()));
             }
+            TuryaEvent::PermissionModeChanged { mode } => {
+                if let Some(m) = match mode.as_str() {
+                    "open" => Some(PermissionMode::Open),
+                    "review-for-me" => Some(PermissionMode::ReviewForMe),
+                    "manual" => Some(PermissionMode::Manual),
+                    _ => None,
+                } {
+                    self.permission_mode = m;
+                }
+            }
             TuryaEvent::TokenDelta { chunk } => {
                 self.recv_chars += chunk.len();
                 self.push_text(chunk);
@@ -2097,6 +2278,8 @@ impl TuiApp {
                 self.turn_active = true;
                 self.spin_tick = 0;
                 self.scroll_lines_up = 0;
+                self.scroll_offset = 0;
+                self.scroll_target = 0;
             }
             TuryaEvent::TurnCompleted { .. } => {
                 self.turn_active = false;
@@ -2148,40 +2331,121 @@ impl TuiApp {
 
     /// Render one full frame. Split out of `run()` so headless tests can
     /// drive the REAL draw path with ratatui's `TestBackend`.
-    fn render(&self, f: &mut Frame) {
+    fn render(&mut self, f: &mut Frame) {
         let input_h = self.input_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),       // Top bar: identity + live spinner
                 Constraint::Min(5),          // Chat transcript (tools inline)
+                Constraint::Length(1),       // Identity + live spinner, just above the prompt
                 Constraint::Length(input_h), // Input Box / Permission Prompt
                 Constraint::Length(1),       // Status bar (no borders: 1 row)
             ])
             .split(f.area());
 
-        // 1. Top bar (borderless): static identity when idle, spinner plus
-        // live state while a turn runs.
-        f.render_widget(
-            Paragraph::new(self.top_line()).style(Style::default().fg(Color::Cyan)),
-            chunks[0],
-        );
-
-        // 2. Chat transcript (user messages, assistant tokens, tool
+        // 1. Chat transcript (user messages, assistant tokens, tool
         // activity, and toasts share one chronological stream), pinned to
         // the bottom unless the user scrolled back (see scroll_lines_up).
-        let inner_w = chunks[1].width.saturating_sub(2).max(1) as usize;
-        let inner_h = chunks[1].height.saturating_sub(2) as usize;
-        let total = Self::wrapped_lines(&self.transcript_text(), inner_w);
-        let max_off = total.saturating_sub(inner_h).min(u16::MAX as usize);
-        // Follow-bottom by default: the viewport sits max_off down, lifted
-        // toward the top by the scroll-back lock.
-        let off = max_off.saturating_sub(self.scroll_lines_up) as u16;
-        let chat = Paragraph::new(self.transcript_lines())
+        let inner_w = chunks[0].width.saturating_sub(2).max(1) as usize;
+        let inner_h = chunks[0].height.saturating_sub(2) as usize;
+        self.ensure_row_offsets(inner_w);
+        let total = self.row_offsets.last().copied().unwrap_or(0).max(1);
+        let max_off = total.saturating_sub(inner_h);
+        let auto_follow = self.auto_scroll && self.scroll_lines_up == 0;
+        let target = if auto_follow {
+            max_off
+        } else {
+            max_off.saturating_sub(self.scroll_lines_up)
+        };
+        if auto_follow {
+            const SCROLL_STEP: usize = 3;
+            const SCROLL_SNAP: usize = 12;
+            let diff = target.saturating_sub(self.scroll_offset);
+            if diff > SCROLL_SNAP {
+                // Initial load or a big jump: land on the bottom immediately.
+                self.scroll_offset = target;
+            } else if diff > 0 {
+                // Streaming growth: advance a few rows per frame for a
+                // gradual, non-jarring scroll.
+                self.scroll_offset = (self.scroll_offset + SCROLL_STEP.min(diff)).min(target);
+            } else if self.scroll_offset > target {
+                self.scroll_offset = target;
+            }
+        } else {
+            self.scroll_offset = target;
+        }
+        let off = self.scroll_offset.min(max_off);
+        // Bottom-align short output so it sits just above the prompt box
+        // instead of floating at the top of a tall pane. Only while following.
+        let padding = if auto_follow && off == 0 && total < inner_h {
+            inner_h - total
+        } else {
+            0
+        };
+        // Render only the visible window instead of the whole transcript.
+        let mut chat_lines: Vec<Line<'_>> = Vec::with_capacity(inner_h + 2);
+        let mut top_partial = 0usize;
+        if !self.transcript.is_empty() {
+            let mut start = 0;
+            if off > 0 {
+                // first logical line whose row range contains `off`
+                let pos = self.row_offsets.partition_point(|&x| x <= off);
+                start = pos
+                    .saturating_sub(1)
+                    .min(self.transcript.len().saturating_sub(1));
+            }
+            top_partial = off.saturating_sub(self.row_offsets[start]);
+            let mut rows = 0usize;
+            for i in start..self.transcript.len() {
+                let tline = &self.transcript[i];
+                let mut style = Style::default();
+                if self.color {
+                    if let Some(bg) = self.tints.for_role(tline.role) {
+                        style = style.bg(bg);
+                    }
+                    if tline.dim {
+                        style = style.fg(Color::DarkGray);
+                    } else if tline.role == Speaker::User {
+                        style = style.fg(Color::Cyan);
+                    } else if tline.role == Speaker::Tool {
+                        style = style.fg(Color::Gray);
+                    }
+                }
+                chat_lines.push(Line::styled(tline.text.as_str(), style));
+                let h = if i + 1 < self.row_offsets.len() {
+                    self.row_offsets[i + 1] - self.row_offsets[i]
+                } else {
+                    1
+                };
+                rows += h;
+                if rows >= inner_h.saturating_add(top_partial) {
+                    break;
+                }
+            }
+        }
+        let scroll_off = if padding > 0 {
+            0u16
+        } else {
+            top_partial as u16
+        };
+        if padding > 0 {
+            let mut padded = vec![Line::default(); padding];
+            padded.append(&mut chat_lines);
+            chat_lines = padded;
+        }
+        let chat = Paragraph::new(chat_lines)
             .wrap(Wrap { trim: false })
-            .scroll((off, 0))
+            .scroll((scroll_off, 0))
             .block(Block::default().borders(Borders::ALL).title("Assistant"));
-        f.render_widget(chat, chunks[1]);
+        f.render_widget(chat, chunks[0]);
+
+        // 2. Identity bar (borderless): static identity when idle, spinner plus
+        // live state while a turn runs. Sits just above the prompt so the
+        // loading indicator is in the user's line of sight.
+        f.render_widget(
+            Paragraph::new(self.top_line()).style(Style::default().fg(Color::Cyan)),
+            chunks[1],
+        );
 
         // 3b. Staged attachments + the @ picker, between transcript and
         // input, so the user can see what they are about to send.
@@ -2229,11 +2493,11 @@ impl TuiApp {
             );
             f.render_widget(prompt, input_area);
         } else {
-            let input_widget =
-                Paragraph::new(self.input.as_str())
-                    .block(Block::default().borders(Borders::ALL).title(
-                    "Prompt (Enter send · Alt+Enter newline · @ file · Ctrl+E expand · Esc stop)",
-                ));
+            let input_widget = Paragraph::new(self.input.as_str()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(self.input_title()),
+            );
             f.render_widget(input_widget, input_area);
         }
 
@@ -2941,7 +3205,7 @@ mod tests {
 
     /// Render headlessly at any size and read the pixels back as one string.
     /// The mock screen: no pty, no server, no network.
-    fn rendered(app: &TuiApp, width: u16, height: u16) -> String {
+    fn rendered(app: &mut TuiApp, width: u16, height: u16) -> String {
         use ratatui::{backend::TestBackend, Terminal};
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3005,6 +3269,24 @@ mod tests {
         assert!(app.top_line().contains("working"));
     }
 
+    #[tokio::test]
+    async fn submit_prompt_sets_turn_active_immediately() {
+        let mut app = TuiApp::new();
+        let (tx, _rx) = mpsc::channel(32);
+        app.submit_prompt("hi".to_string(), &tx).await;
+        assert!(app.turn_active);
+        assert!(app.top_line().contains("working"));
+    }
+
+    #[test]
+    fn input_title_reflects_turn_state() {
+        let mut app = TuiApp::new();
+        assert!(app.input_title().contains("Prompt"));
+        app.turn_active = true;
+        assert!(app.input_title().contains("Esc stop"));
+        assert!(!app.input_title().contains("working"));
+    }
+
     #[test]
     fn top_line_shows_identity_when_idle() {
         let app = TuiApp::new();
@@ -3029,7 +3311,7 @@ mod tests {
         }
         // 80x10 forces every pane to its minimum: the exact shape class
         // that panicked on chunk indices before.
-        let text = rendered(&app, 80, 10);
+        let text = rendered(&mut app, 80, 10);
         assert!(text.contains("gemini"), "top/status lost:\n{text}");
         assert!(text.contains("transcript line 49"), "tail clipped:\n{text}");
     }
@@ -3040,7 +3322,7 @@ mod tests {
         for i in 0..200 {
             app.log_line(format!("line {i:03}"));
         }
-        let text = rendered(&app, 80, 15);
+        let text = rendered(&mut app, 80, 15);
         assert!(text.contains("line 199"), "newest line hidden:\n{text}");
         assert!(!text.contains("line 000"), "viewport stuck at top:\n{text}");
     }
@@ -3056,6 +3338,12 @@ mod tests {
         app.scroll_up();
         app.scroll_to_bottom();
         assert_eq!(app.scroll_lines_up, 0);
+    }
+
+    #[test]
+    fn auto_scroll_defaults_on() {
+        let app = TuiApp::new();
+        assert!(app.auto_scroll);
     }
 
     #[tokio::test]
@@ -3112,7 +3400,7 @@ mod tests {
     fn multiline_draft_renders_all_lines() {
         let mut app = TuiApp::new();
         app.input = "first\nsecond".to_string();
-        let text = rendered(&app, 80, 20);
+        let text = rendered(&mut app, 80, 20);
         assert!(text.contains("first"), "line 1 lost:\n{text}");
         assert!(text.contains("second"), "line 2 lost:\n{text}");
     }

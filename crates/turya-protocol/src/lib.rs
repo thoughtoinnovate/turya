@@ -15,6 +15,16 @@ pub enum PermissionMode {
     Manual,
 }
 
+impl PermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::ReviewForMe => "review-for-me",
+            Self::Manual => "manual",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionDecision {
     AllowOnce,
@@ -40,6 +50,9 @@ pub struct UiSettings {
     /// `auto` | `on` | `off`.
     pub mouse: Option<String>,
     pub no_color: Option<bool>,
+    /// Follow new output to the bottom of the transcript. `None` means "keep
+    /// the current value" (default: on).
+    pub auto_scroll: Option<bool>,
 }
 
 /// What `/mcp` shows: a server, its command, and the tools it added.
@@ -660,6 +673,10 @@ pub enum TuryaEvent {
         model: String,
         /// Credential source: `env | stored-key | oauth | mock`.
         via: String,
+    },
+    /// Current approval mode (pushed on change and at startup).
+    PermissionModeChanged {
+        mode: String,
     },
 }
 

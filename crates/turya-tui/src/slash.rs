@@ -156,6 +156,13 @@ impl SlashRegistry {
                 kind: CommandKind::Local,
                 source: CommandSource::Builtin,
             },
+            SlashCommand {
+                name: "approvals",
+                description: "Show or set approval mode: /approvals [open|review-for-me|manual]",
+                hint: "review-for-me",
+                kind: CommandKind::Local,
+                source: CommandSource::Builtin,
+            },
         ] {
             reg.register(cmd);
         }
@@ -272,7 +279,7 @@ mod tests {
     #[test]
     fn builtins_registered_once() {
         let reg = registry();
-        assert_eq!(reg.filter("").len(), 15);
+        assert_eq!(reg.filter("").len(), 16);
         let mut dup = registry();
         dup.register(SlashCommand {
             name: "models",
@@ -281,7 +288,7 @@ mod tests {
             kind: CommandKind::Local,
             source: CommandSource::Plugin,
         });
-        assert_eq!(dup.filter("").len(), 15);
+        assert_eq!(dup.filter("").len(), 16);
         assert_eq!(
             dup.get("models").unwrap().description,
             "Browse providers & switch model"
@@ -298,8 +305,22 @@ mod tests {
         assert_eq!(
             all,
             vec![
-                "auth", "clear", "compact", "context", "cost", "efforts", "help", "mcp", "models",
-                "queue", "sessions", "settings", "skills", "steps", "thinking"
+                "approvals",
+                "auth",
+                "clear",
+                "compact",
+                "context",
+                "cost",
+                "efforts",
+                "help",
+                "mcp",
+                "models",
+                "queue",
+                "sessions",
+                "settings",
+                "skills",
+                "steps",
+                "thinking"
             ]
         );
         let ci: Vec<_> = reg.filter("MO").iter().map(|c| c.name).collect();
@@ -331,7 +352,7 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "auth");
         // Bare slash lists everything.
-        assert_eq!(c.matches("/", &reg).len(), 15);
+        assert_eq!(c.matches("/", &reg).len(), 16);
     }
 
     #[test]

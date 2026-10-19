@@ -185,6 +185,16 @@ impl TuryaEngine {
         *self.provider.write().unwrap() = provider;
     }
 
+    /// Current approval mode.
+    pub fn permission_mode(&self) -> turya_protocol::PermissionMode {
+        self.permissions.mode()
+    }
+
+    /// Switch approval mode at runtime.
+    pub fn set_permission_mode(&self, mode: turya_protocol::PermissionMode) {
+        self.permissions.set_mode(mode);
+    }
+
     /// Update the per-turn step budgets (`/steps` in the TUI, carried by
     /// `UpdateConfig`). Each side is independent: `None` leaves it unchanged.
     /// Values clamp to a minimum of 1 — a zero budget would end every turn

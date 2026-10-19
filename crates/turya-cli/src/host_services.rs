@@ -514,6 +514,11 @@ impl HostServices {
                         via,
                     })
                     .await;
+                events
+                    .send(TuryaEvent::PermissionModeChanged {
+                        mode: self.engine.permission_mode().as_str().to_string(),
+                    })
+                    .await;
                 true
             }
             TuryaCommand::BeginAuthFlow { provider, method } => {
@@ -531,7 +536,7 @@ impl HostServices {
                 true
             }
             TuryaCommand::UpdateConfig {
-                permission_mode: _,
+                permission_mode,
                 provider,
                 model,
                 max_steps,
@@ -544,6 +549,22 @@ impl HostServices {
                 if max_steps.is_some() || max_tool_calls.is_some() {
                     self.engine.set_budgets(*max_steps, *max_tool_calls);
                 }
+                // Approval mode is engine-bound and persisted like the UI
+                // settings: apply it now, tell the client, and do not forward.
+                let mode_changed = if let Some(mode) = permission_mode {
+                    self.engine.set_permission_mode(*mode);
+                    let (mut cfg, _) = crate::config::TuryaConfig::load(&self.config_path);
+                    cfg.permission_mode = Some(mode.as_str().to_string());
+                    let _ = cfg.save(&self.config_path);
+                    events
+                        .send(TuryaEvent::PermissionModeChanged {
+                            mode: mode.as_str().to_string(),
+                        })
+                        .await;
+                    true
+                } else {
+                    false
+                };
                 // Appearance settings are persisted here so a restart keeps
                 // what the user just chose. The client already applied them
                 // locally, so this is a write, not a round trip.
@@ -551,11 +572,13 @@ impl HostServices {
                     self.persist_ui_settings(ui);
                 }
                 // Engine-bound switching; permission_mode passes through to session.
-                if provider.is_none() && model.is_none() {
+                if provider.is_none() && model.is_none() && !mode_changed {
                     return false;
                 }
-                self.switch_model(provider.clone(), model.clone(), events)
-                    .await;
+                if provider.is_some() || model.is_some() {
+                    self.switch_model(provider.clone(), model.clone(), events)
+                        .await;
+                }
                 true
             }
             _ => false,
@@ -698,6 +721,9 @@ impl HostServices {
         }
         if let Some(v) = ui.no_color {
             cfg.no_color = Some(v);
+        }
+        if let Some(v) = ui.auto_scroll {
+            cfg.auto_scroll = Some(v);
         }
         if let Err(e) = cfg.save(&self.config_path) {
             eprintln!("Turya: could not save settings: {e}");

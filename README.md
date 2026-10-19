@@ -144,6 +144,7 @@ rather than for agentic work.
 | `@` | Pick a file to attach to the next prompt |
 | `PageUp` / `PageDown` | Scroll the transcript |
 | Mouse wheel | Scroll, when the terminal supports capture (`/settings mouse`) |
+| Top bar / input box | While a turn runs: `⠋ working · provider/model`; the input box title becomes `⠋ working (Esc stop)` |
 | `Ctrl+E` | Show the full output of the last truncated tool call |
 | `Esc` | Close a popup, then stop the running turn. Never quits. |
 | `Ctrl+C` / `Ctrl+D` | Quit, from anywhere |
@@ -163,7 +164,8 @@ rather than for agentic work.
 | `/compact [focus]` | Summarise older turns to free context |
 | `/context` | Context usage against the model window |
 | `/sessions [id]` | List sessions; with an id, resume it |
-| `/settings [key value]` | Colour, tints and mouse capture. Saved to the config file |
+| `/settings [key value]` | Colour, tints, mouse capture and auto-scroll. Saved to the config file |
+| `/approvals [mode]` | Show or set approval mode: `open`, `review-for-me`, or `manual` |
 | `/skills` | Agent Skills found in this project, with the paths |
 | `/mcp` | MCP servers, the tools each one added, and why a failed one is missing |
 
