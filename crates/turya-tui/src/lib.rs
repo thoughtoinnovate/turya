@@ -18,15 +18,18 @@ use ratatui::{
 use std::io::stdout;
 use tokio::sync::mpsc;
 use turya_protocol::{
-    AgentMode, Attachment, Part, PermissionDecision, PermissionMode, Transcript, TuryaCommand,
-    TuryaEvent,
+    AgentMode, Attachment, Part, PermissionDecision, PermissionMode, RiskLevel, Transcript,
+    TuryaCommand, TuryaEvent,
 };
 
 pub mod slash;
 
 pub mod flows;
 
+mod scroll;
+
 use flows::{AuthFlow, AuthStage, BrowserFlow, BrowserMode, Flow};
+use scroll::Viewport;
 use slash::{Completer, SlashRegistry};
 
 /// Centered overlay rect sitting just above the input pane (which sits
@@ -292,6 +295,91 @@ impl Tints {
     }
 }
 
+/// A tool call the permission broker is holding for the user's answer. It
+/// carries everything the user must see to decide: which tool, how risky,
+/// and the exact arguments — `Allow 'run_bash'?` with no command visible is
+/// an approval the user cannot actually make.
+struct PendingPermission {
+    request_id: String,
+    action: String,
+    risk_level: RiskLevel,
+    /// Raw parameters JSON from the engine (`{"command":"ls -la"}`).
+    details: String,
+}
+
+/// Rows the permission prompt may spend in the transcript's pane before a
+/// `… more lines` tail takes over; keeps the transcript's minimum alive on
+/// short terminals.
+const MAX_PERMISSION_ROWS: usize = 10;
+
+/// Pull the `command` string out of the permission details JSON without a
+/// JSON parser dependency: a plain scan is presentation, not protocol
+/// parsing. Any payload this cannot decode falls back to the raw text.
+fn extract_command(details: &str) -> Option<String> {
+    const KEY: &str = "\"command\"";
+    let after_key = &details[details.find(KEY)? + KEY.len()..];
+    let colon = after_key.find(':')?;
+    let value = after_key[colon + 1..].trim_start();
+    if !value.starts_with('"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = value[1..].chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                'u' => {
+                    let hex: String = (&mut chars).take(4).collect();
+                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                }
+                simple @ ('"' | '\\' | '/' | 'b' | 'f') => out.push(match simple {
+                    'b' => '\u{8}',
+                    'f' => '\u{c}',
+                    other => other,
+                }),
+                _ => return None,
+            },
+            '"' => return Some(out),
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+/// Character-cell wrap for prompt rows. Controls the exact row split so the
+/// height and the pixels agree without relying on ratatui's unstable
+/// `line_count`.
+fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            rows.push(String::new());
+        }
+        for chunk in chars.chunks(width) {
+            rows.push(chunk.iter().collect());
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
+/// Prompt-facing name for a risk level.
+fn risk_name(risk: &RiskLevel) -> &'static str {
+    match risk {
+        RiskLevel::Low => "low",
+        RiskLevel::Moderate => "moderate",
+        RiskLevel::High => "high",
+        RiskLevel::Critical => "critical",
+    }
+}
+
 struct TLine {
     text: String,
     /// System toasts and separators: dimmed so content stays quiet.
@@ -404,7 +492,7 @@ pub struct TuiApp {
     /// Rows carry their own voice: system toasts and separators render
     /// dimmed so user/assistant/tool content stands out.
     transcript: Vec<TLine>,
-    pending_permission: Option<(String, String)>, // (request_id, action)
+    pending_permission: Option<PendingPermission>,
     /// call_id → tool name, filled on Initiated, drained on Completed, so
     /// result lines can name the tool (`ToolResult` carries no name).
     pending_tools: std::collections::HashMap<String, String>,
@@ -471,19 +559,14 @@ pub struct TuiApp {
     /// Spinner animation frame, advanced by the 120ms tick in `run()`.
     /// A plain counter (not time-derived) so headless tests set it directly.
     spin_tick: u64,
-    /// Manual scroll-back: lines the transcript is lifted above the bottom.
-    /// `0` = follow live output. PageUp/PageDown adjust, End/new prompt resets.
-    scroll_lines_up: usize,
-    /// Current animated viewport top row while auto-following.
-    scroll_offset: usize,
-    /// Desired viewport top row while auto-following.
-    scroll_target: usize,
+    /// Transcript viewport: follow mode, anchored row, and content height.
+    viewport: Viewport,
     /// Wrapped-row start offsets for each transcript line, cached by width.
     row_offsets: Vec<usize>,
     /// Width the cached row offsets were computed for.
     row_offsets_width: usize,
-    /// Whether row offsets need recomputation.
-    row_offsets_dirty: bool,
+    /// First logical line whose cached rows are stale. `None` = clean.
+    row_offsets_dirty_from: Option<usize>,
 }
 
 impl Default for TuiApp {
@@ -539,12 +622,10 @@ impl TuiApp {
             pending_auth: None,
             turn_active: false,
             spin_tick: 0,
-            scroll_lines_up: 0,
-            scroll_offset: 0,
-            scroll_target: 0,
+            viewport: Viewport::new(),
             row_offsets: Vec::new(),
             row_offsets_width: 0,
-            row_offsets_dirty: true,
+            row_offsets_dirty_from: Some(0),
         }
     }
 
@@ -556,7 +637,7 @@ impl TuiApp {
 
     fn log_line_as(&mut self, line: String, role: Speaker) {
         self.transcript.push(TLine::new(line, false, role));
-        self.row_offsets_dirty = true;
+        self.invalidate_row_offsets_from(self.transcript.len().saturating_sub(1));
     }
 
     /// Tints, or none at all when colour is off. Every styling decision goes
@@ -575,7 +656,7 @@ impl TuiApp {
     fn log_dim(&mut self, line: String) {
         self.transcript
             .push(TLine::new(line, true, Speaker::System));
-        self.row_offsets_dirty = true;
+        self.invalidate_row_offsets_from(self.transcript.len().saturating_sub(1));
     }
 
     /// Append a (possibly multi-line) block, preserving blank lines so
@@ -606,19 +687,20 @@ impl TuiApp {
     }
 
     fn push_block_as(&mut self, text: &str, dim: bool, role: Speaker) {
-        self.row_offsets_dirty = true;
+        let start = self.transcript.len();
         // Only assistant prose is markdown. Prompts, tool output and system
         // rows are literal: a user pasting `**stars**` must see the stars.
         if !dim && role == Speaker::Assistant && self.render_markdown {
             for line in render_markdown(text, &self.tints()) {
                 self.transcript.push(TLine::new(line, false, role));
             }
-            return;
+        } else {
+            for line in text.split('\n') {
+                self.transcript
+                    .push(TLine::new(line.to_string(), dim, role));
+            }
         }
-        for line in text.split('\n') {
-            self.transcript
-                .push(TLine::new(line.to_string(), dim, role));
-        }
+        self.invalidate_row_offsets_from(start);
     }
 
     /// Mark a block as the final answer, so it renders as markdown.
@@ -629,7 +711,6 @@ impl TuiApp {
     /// Stream one token chunk: extend the current content line, or start a
     /// new one when the transcript is empty or ends in a dimmed row.
     fn push_text(&mut self, chunk: &str) {
-        self.row_offsets_dirty = true;
         // Only extend an existing *assistant* line. A trailing blank line
         // from the user's prompt (or a dimmed/system row) must start a new
         // assistant line, otherwise the first token lands on the wrong row
@@ -655,6 +736,7 @@ impl TuiApp {
             self.transcript
                 .push(TLine::new(chunk.to_string(), false, Speaker::Assistant));
         }
+        self.invalidate_row_offsets_from(self.transcript.len().saturating_sub(1));
     }
 
     /// Swap the live plain-text stream for the rendered markdown block. The
@@ -668,7 +750,7 @@ impl TuiApp {
             return;
         }
         self.transcript.truncate(start);
-        self.row_offsets_dirty = true;
+        self.invalidate_row_offsets_from(start);
         let text = std::mem::take(&mut self.streaming);
         self.push_block_as(&text, false, Speaker::Assistant);
     }
@@ -716,7 +798,7 @@ impl TuiApp {
     /// Clear all transcript rows (`/clear`).
     fn clear_transcript(&mut self) {
         self.transcript.clear();
-        self.row_offsets_dirty = true;
+        self.invalidate_row_offsets_from(0);
     }
 
     // ---- prompt history (readline semantics) ----
@@ -803,8 +885,7 @@ impl TuiApp {
     /// `Ctrl+E` exactly like live ones.
     pub fn load_transcript(&mut self, transcript: &Transcript) {
         self.clear_transcript();
-        self.scroll_offset = 0;
-        self.scroll_target = 0;
+        self.scroll_to_bottom();
         for turn in &transcript.turns {
             for part in &turn.parts {
                 match part {
@@ -931,7 +1012,7 @@ impl TuiApp {
             // Matching on the tag rather than a remembered range is what makes
             // this safe after scrolling or other rows landing in between.
             self.transcript.retain(|l| l.owner != Some(id));
-            self.row_offsets_dirty = true;
+            self.invalidate_row_offsets_from(0);
             self.subagents[idx].expanded = false;
             self.log_dim(format!(
                 "── collapsed subagent {} ──",
@@ -957,24 +1038,42 @@ impl TuiApp {
         self.scroll_to_bottom();
     }
 
+    /// Mark cached wrapped-row heights stale from `line` onward. Streaming
+    /// touches only the last row, so this is what keeps a token from forcing
+    /// a rebuild of the whole transcript.
+    fn invalidate_row_offsets_from(&mut self, line: usize) {
+        self.row_offsets_dirty_from = Some(match self.row_offsets_dirty_from {
+            Some(existing) => existing.min(line),
+            None => line,
+        });
+    }
+
     fn ensure_row_offsets(&mut self, width: usize) {
+        // A cache that does not line up with the transcript is never trusted,
+        // even if a mutation forgot to invalidate it.
         if self.row_offsets.len() != self.transcript.len() + 1 {
-            self.row_offsets_dirty = true;
+            self.invalidate_row_offsets_from(0);
         }
-        if !self.row_offsets_dirty && self.row_offsets_width == width {
+        if self.row_offsets_width != width {
+            self.row_offsets_width = width;
+            self.invalidate_row_offsets_from(0);
+        }
+        let Some(from) = self.row_offsets_dirty_from else {
             return;
+        };
+        let from = from.min(self.transcript.len());
+        self.row_offsets.truncate(from + 1);
+        if self.row_offsets.is_empty() {
+            self.row_offsets.push(0);
         }
-        self.row_offsets.clear();
-        self.row_offsets.push(0);
-        let mut acc = 0usize;
-        for line in &self.transcript {
+        let mut acc = self.row_offsets.last().copied().unwrap_or(0);
+        for line in &self.transcript[from..] {
             let n = line.text.chars().count();
             let h = if n == 0 { 1 } else { n.div_ceil(width.max(1)) };
             acc += h;
             self.row_offsets.push(acc);
         }
-        self.row_offsets_width = width;
-        self.row_offsets_dirty = false;
+        self.row_offsets_dirty_from = None;
     }
 
     /// Should we capture the mouse? `auto` (the default) enables it only
@@ -1063,6 +1162,11 @@ impl TuiApp {
     pub fn apply_auto_scroll(&mut self, value: Option<bool>) {
         if let Some(v) = value {
             self.auto_scroll = v;
+            if v {
+                self.scroll_to_bottom();
+            } else {
+                self.viewport.hold();
+            }
         }
     }
 
@@ -1080,28 +1184,22 @@ impl TuiApp {
 
     /// Lift the transcript viewport up (read back history).
     fn scroll_up(&mut self) {
-        self.scroll_lines_up = self.scroll_lines_up.saturating_add(10);
+        self.viewport.scroll(-10);
     }
 
     /// Lower the viewport toward live output.
     fn scroll_down(&mut self) {
-        self.scroll_lines_up = self.scroll_lines_up.saturating_sub(10);
+        self.viewport.scroll(10);
     }
 
     /// Scroll by a signed number of wrapped lines (wheel and Shift+arrows).
     fn scroll_by(&mut self, delta: i32) {
-        if delta < 0 {
-            self.scroll_lines_up = self.scroll_lines_up.saturating_add((-delta) as usize);
-        } else {
-            self.scroll_lines_up = self.scroll_lines_up.saturating_sub(delta as usize);
-        }
+        self.viewport.scroll(delta);
     }
 
     /// Pin the viewport back to the live bottom.
     fn scroll_to_bottom(&mut self) {
-        self.scroll_lines_up = 0;
-        self.scroll_offset = 0;
-        self.scroll_target = 0;
+        self.viewport.pin_to_bottom();
     }
 
     /// Format a character count as estimated tokens (≈ chars/4).
@@ -1573,9 +1671,9 @@ impl TuiApp {
                                         Some(v) => {
                                             self.auto_scroll = v;
                                             if v {
-                                                self.scroll_lines_up = 0;
-                                                self.scroll_offset = 0;
-                                                self.scroll_target = 0;
+                                                self.scroll_to_bottom();
+                                            } else {
+                                                self.viewport.hold();
                                             }
                                             let _ = cmd_tx
                                                 .send(TuryaCommand::UpdateConfig {
@@ -2098,9 +2196,17 @@ impl TuiApp {
                 self.retain_output(&name, res);
             }
             TuryaEvent::PermissionRequested {
-                request_id, action, ..
+                request_id,
+                action,
+                risk_level,
+                details,
             } => {
-                self.pending_permission = Some((request_id.clone(), action.clone()));
+                self.pending_permission = Some(PendingPermission {
+                    request_id: request_id.clone(),
+                    action: action.clone(),
+                    risk_level: *risk_level,
+                    details: details.clone(),
+                });
             }
             TuryaEvent::SubagentStarted { name, task, .. } => {
                 // One dim line, then the tool row for `spawn_agent` stays in
@@ -2277,9 +2383,7 @@ impl TuiApp {
                 // Scroll lock resets — a new turn starts at the live bottom.
                 self.turn_active = true;
                 self.spin_tick = 0;
-                self.scroll_lines_up = 0;
-                self.scroll_offset = 0;
-                self.scroll_target = 0;
+                self.scroll_to_bottom();
             }
             TuryaEvent::TurnCompleted { .. } => {
                 self.turn_active = false;
@@ -2295,8 +2399,20 @@ impl TuiApp {
     }
     /// Input pane height: grows with the draft (Alt+Enter newlines) so
     /// every line stays visible, capped so the transcript keeps its rows.
-    /// Includes the 2 border rows.
-    fn input_height(&self) -> u16 {
+    /// A pending permission prompt replaces the input entirely and sizes
+    /// itself to the command it is asking about. Includes the 2 border rows.
+    fn input_height(&self, term_width: u16, term_height: u16) -> u16 {
+        if let Some(pending) = &self.pending_permission {
+            let width = (term_width.saturating_sub(2) as usize).max(1);
+            // The transcript keeps its minimum (5 rows + 2 borders) and the
+            // identity and status rows take one each; never exceed that.
+            let cap = term_height
+                .saturating_sub(9)
+                .min(MAX_PERMISSION_ROWS as u16)
+                .max(1) as usize;
+            let rows = self.permission_rows(pending, width, cap);
+            return rows.len() as u16 + 2;
+        }
         let base = self.input.lines().count().max(1) as u16 + 2;
         // A staged attachment or an open `@` picker needs its own rows, or it
         // would be drawn over the transcript.
@@ -2310,6 +2426,33 @@ impl TuiApp {
                 .unwrap_or(0)
         };
         (base + extra).min(10)
+    }
+
+    /// Body rows of the permission prompt: tool + risk head, the exact
+    /// command (or the raw parameter JSON when the details have no
+    /// `command`), then the key hints. Long payloads wrap to `width` and the
+    /// list is capped with a tail row that names what was hidden.
+    fn permission_rows(&self, p: &PendingPermission, width: usize, cap: usize) -> Vec<String> {
+        let mut rows = vec![format!("{} · {}", p.action, risk_name(&p.risk_level))];
+        let body = extract_command(&p.details).unwrap_or_else(|| p.details.clone());
+        for (i, line) in wrap_to_width(&body, width.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
+            rows.push(if i == 0 {
+                format!("$ {line}")
+            } else {
+                format!("  {line}")
+            });
+        }
+        rows.push(String::new());
+        rows.push("[y] allow once   [n] deny".to_string());
+        if rows.len() > cap {
+            let hidden = rows.len() - (cap - 1);
+            rows.truncate(cap - 1);
+            rows.push(format!("… +{hidden} more lines"));
+        }
+        rows
     }
 
     /// The `@` picker's rows, rendered directly under the input.
@@ -2332,7 +2475,7 @@ impl TuiApp {
     /// Render one full frame. Split out of `run()` so headless tests can
     /// drive the REAL draw path with ratatui's `TestBackend`.
     fn render(&mut self, f: &mut Frame) {
-        let input_h = self.input_height();
+        let input_h = self.input_height(f.area().width, f.area().height);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2344,40 +2487,18 @@ impl TuiApp {
             .split(f.area());
 
         // 1. Chat transcript (user messages, assistant tokens, tool
-        // activity, and toasts share one chronological stream), pinned to
-        // the bottom unless the user scrolled back (see scroll_lines_up).
+        // activity, and toasts share one chronological stream). The viewport
+        // follows the bottom until the user scrolls back; while they read
+        // history its absolute row is anchored, so new output cannot drag it.
         let inner_w = chunks[0].width.saturating_sub(2).max(1) as usize;
         let inner_h = chunks[0].height.saturating_sub(2) as usize;
         self.ensure_row_offsets(inner_w);
         let total = self.row_offsets.last().copied().unwrap_or(0).max(1);
         let max_off = total.saturating_sub(inner_h);
-        let auto_follow = self.auto_scroll && self.scroll_lines_up == 0;
-        let target = if auto_follow {
-            max_off
-        } else {
-            max_off.saturating_sub(self.scroll_lines_up)
-        };
-        if auto_follow {
-            const SCROLL_STEP: usize = 3;
-            const SCROLL_SNAP: usize = 12;
-            let diff = target.saturating_sub(self.scroll_offset);
-            if diff > SCROLL_SNAP {
-                // Initial load or a big jump: land on the bottom immediately.
-                self.scroll_offset = target;
-            } else if diff > 0 {
-                // Streaming growth: advance a few rows per frame for a
-                // gradual, non-jarring scroll.
-                self.scroll_offset = (self.scroll_offset + SCROLL_STEP.min(diff)).min(target);
-            } else if self.scroll_offset > target {
-                self.scroll_offset = target;
-            }
-        } else {
-            self.scroll_offset = target;
-        }
-        let off = self.scroll_offset.min(max_off);
+        let off = self.viewport.update(max_off);
         // Bottom-align short output so it sits just above the prompt box
         // instead of floating at the top of a tall pane. Only while following.
-        let padding = if auto_follow && off == 0 && total < inner_h {
+        let padding = if self.viewport.is_following() && off == 0 && total < inner_h {
             inner_h - total
         } else {
             0
@@ -2476,17 +2597,33 @@ impl TuiApp {
         }
 
         // 4. Input or Permission Prompt
-        if let Some((_, ref action)) = self.pending_permission {
-            let prompt = Paragraph::new(format!(
-                "Allow '{}'? Press [y] to allow, [n] to deny",
-                action
-            ))
-            .style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .block(
+        if let Some(ref pending) = self.pending_permission {
+            // Same inputs as `input_height`, so the rows and the box height
+            // always agree.
+            let width = input_area.width.saturating_sub(2).max(1) as usize;
+            let cap = f
+                .area()
+                .height
+                .saturating_sub(9)
+                .min(MAX_PERMISSION_ROWS as u16)
+                .max(1) as usize;
+            let lines: Vec<Line<'static>> = self
+                .permission_rows(pending, width, cap)
+                .into_iter()
+                .map(|row| {
+                    // The command stays plain so it reads as something
+                    // typed, not as another warning.
+                    let style = if row.starts_with("$ ") || row.starts_with("  ") {
+                        Style::default()
+                    } else {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    };
+                    Line::styled(row, style)
+                })
+                .collect();
+            let prompt = Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title("Permission Required"),
@@ -2634,17 +2771,17 @@ impl TuiApp {
                                 }
                             }
                         }
-                        if let Some((req_id, _)) = self.pending_permission.take() {
+                        if let Some(pending) = self.pending_permission.take() {
                             match key.code {
                                 KeyCode::Char('y') => {
                                     let _ = cmd_tx.send(TuryaCommand::ResolvePermission {
-                                        request_id: req_id,
+                                        request_id: pending.request_id,
                                         decision: PermissionDecision::AllowOnce,
                                     }).await;
                                 }
                                 KeyCode::Char('n') => {
                                     let _ = cmd_tx.send(TuryaCommand::ResolvePermission {
-                                        request_id: req_id,
+                                        request_id: pending.request_id,
                                         decision: PermissionDecision::Deny,
                                     }).await;
                                 }
@@ -2798,6 +2935,11 @@ impl TuiApp {
                     // Single home for ALL event handling (see feed_flow_event):
                     // the live loop and headless tests drive the same code.
                     self.feed_flow_event(&evt);
+                    // Streaming sends one event per token. Drain the burst so
+                    // it costs one redraw instead of one full frame per chunk.
+                    while let Ok(next) = event_rx.try_recv() {
+                        self.feed_flow_event(&next);
+                    }
                 }
                 _ = ticker.tick() => {
                     // Wrapping add: process uptime is not a crash reason.
@@ -2951,7 +3093,12 @@ mod tests {
         assert_eq!(app.esc_action(), EscAction::CloseFlow);
         app.flow = Flow::None;
         // Permission modal: Esc must not answer, must not abort.
-        app.pending_permission = Some(("req_1".to_string(), "run_bash".to_string()));
+        app.pending_permission = Some(PendingPermission {
+            request_id: "req_1".to_string(),
+            action: "run_bash".to_string(),
+            risk_level: RiskLevel::High,
+            details: "{\"command\":\"rm -rf /tmp/x\"}".to_string(),
+        });
         assert_eq!(app.esc_action(), EscAction::Ignore);
     }
 
@@ -3330,20 +3477,112 @@ mod tests {
     #[test]
     fn scroll_keys_lift_and_release_viewport() {
         let mut app = TuiApp::new();
-        assert_eq!(app.scroll_lines_up, 0);
+        for i in 0..60 {
+            app.log_line(format!("line {i:03}"));
+        }
+        let _ = rendered(&mut app, 80, 10);
+        assert!(app.viewport.is_following());
         app.scroll_up();
-        assert_eq!(app.scroll_lines_up, 10);
+        assert_eq!(app.viewport.lines_up(), 10);
         app.scroll_down();
-        assert_eq!(app.scroll_lines_up, 0);
+        assert!(app.viewport.is_following());
         app.scroll_up();
         app.scroll_to_bottom();
-        assert_eq!(app.scroll_lines_up, 0);
+        assert!(app.viewport.is_following());
+        assert_eq!(app.viewport.lines_up(), 0);
+    }
+
+    #[test]
+    fn overscroll_at_the_edges_is_not_accumulated() {
+        let mut app = TuiApp::new();
+        for i in 0..60 {
+            app.log_line(format!("line {i:03}"));
+        }
+        let _ = rendered(&mut app, 80, 10);
+        // Hammering up at the top must not build a debt: one step down moves.
+        for _ in 0..20 {
+            app.scroll_up();
+        }
+        assert_eq!(app.viewport.offset(), 0, "top is the clamp, not a counter");
+        app.scroll_down();
+        assert_eq!(app.viewport.offset(), 10, "the first reverse step moves");
+        // Hammering down at the bottom is equally free.
+        for _ in 0..20 {
+            app.scroll_down();
+        }
+        assert!(app.viewport.is_following());
+        app.scroll_up();
+        assert_eq!(app.viewport.lines_up(), 10, "the first reverse step moves");
     }
 
     #[test]
     fn auto_scroll_defaults_on() {
         let app = TuiApp::new();
         assert!(app.auto_scroll);
+    }
+
+    #[test]
+    fn permission_prompt_shows_the_exact_command() {
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&TuryaEvent::PermissionRequested {
+            request_id: "req_1".to_string(),
+            action: "run_bash".to_string(),
+            risk_level: RiskLevel::High,
+            details: "{\"command\":\"ls -la /tmp\"}".to_string(),
+        });
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("run_bash · high"), "tool+risk lost:\n{text}");
+        assert!(text.contains("$ ls -la /tmp"), "command lost:\n{text}");
+        assert!(text.contains("[y] allow once"), "hints lost:\n{text}");
+    }
+
+    #[test]
+    fn permission_prompt_wraps_multiline_commands() {
+        let mut app = TuiApp::new();
+        app.feed_flow_event(&TuryaEvent::PermissionRequested {
+            request_id: "req_2".to_string(),
+            action: "run_bash".to_string(),
+            risk_level: RiskLevel::High,
+            details: "{\"command\":\"echo one\\necho two\"}".to_string(),
+        });
+        let text = rendered(&mut app, 80, 24);
+        assert!(text.contains("$ echo one"), "first line lost:\n{text}");
+        assert!(text.contains("  echo two"), "continuation lost:\n{text}");
+    }
+
+    #[test]
+    fn permission_box_grows_for_the_command() {
+        let mut app = TuiApp::new();
+        assert_eq!(app.input_height(80, 24), 3);
+        app.feed_flow_event(&TuryaEvent::PermissionRequested {
+            request_id: "req_3".to_string(),
+            action: "run_bash".to_string(),
+            risk_level: RiskLevel::Critical,
+            details: "{\"command\":\"cmd\\narg\\narg\\narg\"}".to_string(),
+        });
+        assert!(app.input_height(80, 24) > 5, "the command needs its rows");
+    }
+
+    #[test]
+    fn extract_command_unescapes_and_falls_back() {
+        assert_eq!(extract_command("{\"command\":\"ls\"}"), Some("ls".into()));
+        assert_eq!(
+            extract_command("{\"command\":\"a\\\"b\"}"),
+            Some("a\"b".into())
+        );
+        assert_eq!(
+            extract_command("{\"command\":\"a\\nb\"}"),
+            Some("a\nb".into())
+        );
+        assert_eq!(
+            extract_command("{\"command\":\"\\u0041\"}"),
+            Some("A".into())
+        );
+        // No command key, or a mangled payload: fall back to the raw details.
+        assert_eq!(extract_command("{}"), None);
+        assert_eq!(extract_command("{\"cmd\":\"x\"}"), None);
+        assert_eq!(extract_command("{\"command\":\"o"), None);
+        assert_eq!(extract_command("{\"command\":y"), None);
     }
 
     #[tokio::test]
@@ -3384,16 +3623,16 @@ mod tests {
     #[test]
     fn input_height_grows_with_draft() {
         let mut app = TuiApp::new();
-        assert_eq!(app.input_height(), 3);
+        assert_eq!(app.input_height(80, 24), 3);
         app.input = "one\ntwo\nthree".to_string();
-        assert_eq!(app.input_height(), 5);
+        assert_eq!(app.input_height(80, 24), 5);
         app.input = (0..20)
             .map(|i| format!("l{i}"))
             .collect::<Vec<_>>()
             .join("\n");
         // Bounded, so a long draft cannot eat the transcript.
-        assert_eq!(app.input_height(), 10);
-        assert!(app.input_height() <= 10);
+        assert_eq!(app.input_height(80, 24), 10);
+        assert!(app.input_height(80, 24) <= 10);
     }
 
     #[test]
@@ -3755,17 +3994,21 @@ mod tests {
     #[test]
     fn wheel_scrolls_the_transcript() {
         let mut app = TuiApp::new();
+        for i in 0..60 {
+            app.log_line(format!("line {i:03}"));
+        }
+        let _ = rendered(&mut app, 80, 10);
         app.scroll_to_bottom();
         app.on_mouse(mouse(MouseEventKind::ScrollUp));
-        assert_eq!(app.scroll_lines_up, WHEEL_LINES);
+        assert_eq!(app.viewport.lines_up(), WHEEL_LINES);
         app.on_mouse(mouse(MouseEventKind::ScrollUp));
-        assert_eq!(app.scroll_lines_up, WHEEL_LINES * 2);
+        assert_eq!(app.viewport.lines_up(), WHEEL_LINES * 2);
         app.on_mouse(mouse(MouseEventKind::ScrollDown));
-        assert_eq!(app.scroll_lines_up, WHEEL_LINES);
+        assert_eq!(app.viewport.lines_up(), WHEEL_LINES);
         app.scroll_to_bottom();
         // Scrolling past the bottom is a no-op, never a wrap or a panic.
         app.on_mouse(mouse(MouseEventKind::ScrollDown));
-        assert_eq!(app.scroll_lines_up, 0);
+        assert_eq!(app.viewport.lines_up(), 0);
     }
 
     #[test]
@@ -3775,7 +4018,7 @@ mod tests {
             crossterm::event::MouseButton::Left,
         )));
         app.on_mouse(mouse(MouseEventKind::Moved));
-        assert_eq!(app.scroll_lines_up, 0, "we never consume clicks");
+        assert_eq!(app.viewport.lines_up(), 0, "we never consume clicks");
         assert!(app.input.is_empty(), "and never type anything");
     }
 
@@ -3784,7 +4027,7 @@ mod tests {
         let mut app = TuiApp::new();
         app.flow = Flow::Browser(flows::BrowserFlow::new(flows::BrowserMode::Models));
         app.on_mouse(mouse(MouseEventKind::ScrollUp));
-        assert_eq!(app.scroll_lines_up, 0, "the popup owns the wheel");
+        assert_eq!(app.viewport.lines_up(), 0, "the popup owns the wheel");
     }
 
     #[test]
@@ -4037,12 +4280,12 @@ mod tests {
     #[test]
     fn the_input_grows_a_row_for_staged_attachments() {
         let mut app = TuiApp::new();
-        let base = app.input_height();
+        let base = app.input_height(80, 24);
         app.attachments.push(Attachment {
             path: std::path::PathBuf::from("/tmp/x.png"),
             mime: "image/png".to_string(),
         });
-        assert!(app.input_height() > base, "the chip needs a row");
+        assert!(app.input_height(80, 24) > base, "the chip needs a row");
     }
     #[test]
     fn a_tool_result_collapses_to_a_head_plus_a_short_preview() {
