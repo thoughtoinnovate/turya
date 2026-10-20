@@ -393,9 +393,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let catalog = turya_catalog::Catalog::new(catalog_dir());
     let config_path = config_path();
-    // Apply persisted provider/model selection before the first turn.
-    let persisted = host_services::HostConfig::load(&config_path);
-    if persisted.provider.is_some() || persisted.model.is_some() {
+    // Apply persisted provider/model selection before the first turn. The
+    // settings were already read above: one file, one reader.
+    if settings.provider.is_some() || settings.model.is_some() {
         eprintln!("Turya: restoring saved provider/model selection");
     }
     let host = Arc::new(host_services::HostServices::new(

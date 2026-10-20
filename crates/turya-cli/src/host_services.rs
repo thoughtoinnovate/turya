@@ -29,48 +29,6 @@ struct PendingFlow {
 /// locked, so the two change together.
 pub const SLOT_NOT_REQUIRED: &str = "not required";
 
-/// Minimal `~/.turya/config.toml` (`provider = "…"`, `model = "…"`, line-based).
-#[derive(Debug, Default, Clone)]
-pub struct HostConfig {
-    pub provider: Option<String>,
-    pub model: Option<String>,
-}
-
-impl HostConfig {
-    pub fn load(path: &str) -> Self {
-        let mut cfg = Self::default();
-        if let Ok(text) = std::fs::read_to_string(path) {
-            for line in text.lines() {
-                let (k, v) = match line.split_once('=') {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let v = v.trim().trim_matches('"').to_string();
-                match k.trim() {
-                    "provider" => cfg.provider = Some(v),
-                    "model" => cfg.model = Some(v),
-                    _ => {}
-                }
-            }
-        }
-        cfg
-    }
-
-    pub fn save(&self, path: &str) {
-        let mut text = String::new();
-        if let Some(p) = &self.provider {
-            text.push_str(&format!("provider = \"{p}\"\n"));
-        }
-        if let Some(m) = &self.model {
-            text.push_str(&format!("model = \"{m}\"\n"));
-        }
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(path, text);
-    }
-}
-
 /// Where the host keeps durable state. Grouped so the "which file does what"
 /// question has one answer instead of two bare strings in a constructor.
 #[derive(Debug, Clone)]
@@ -664,7 +622,7 @@ impl HostServices {
 
     /// The provider/model the session is actually using.
     fn current_selection(&self) -> (String, String) {
-        let cfg = HostConfig::load(&self.config_path);
+        let cfg = crate::config::TuryaConfig::read(&self.config_path);
         (
             cfg.provider.unwrap_or_else(|| "anthropic".to_string()),
             cfg.model.unwrap_or_default(),
@@ -706,6 +664,9 @@ impl HostServices {
     /// Each field is applied only when present, so one `/settings` command
     /// never clears the slots the user did not mention.
     fn persist_ui_settings(&self, ui: &turya_protocol::UiSettings) {
+        // Load, not read: a file this build cannot understand is rejected
+        // (and kept as a backup) rather than quietly rewritten into a shape
+        // it never had. A current file is simply read.
         let (mut cfg, _) = crate::config::TuryaConfig::load(&self.config_path);
         if let Some(v) = &ui.theme {
             // The theme is opaque to the host: it stores what the UI plugin
@@ -762,7 +723,7 @@ impl HostServices {
         events: &HostEventSink,
     ) {
         // Resolve current selection from config when partially specified.
-        let cfg = HostConfig::load(&self.config_path);
+        let cfg = crate::config::TuryaConfig::read(&self.config_path);
         let id = provider
             .or(cfg.provider)
             .unwrap_or_else(|| "anthropic".to_string());
@@ -817,11 +778,15 @@ impl HostServices {
         match plugin.connect(creds, &model) {
             Ok(p) => {
                 self.engine.set_provider(p);
-                HostConfig {
-                    provider: Some(id.clone()),
-                    model: Some(model.clone()),
+                // One writer for the settings file: it keeps the version tag
+                // and every other setting. A file written by anything else
+                // looks foreign on the next launch and is thrown away.
+                let (mut cfg, _) = crate::config::TuryaConfig::load(&self.config_path);
+                cfg.provider = Some(id.clone());
+                cfg.model = Some(model.clone());
+                if let Err(e) = cfg.save(&self.config_path) {
+                    eprintln!("Turya: could not save the model selection: {e}");
                 }
-                .save(&self.config_path);
                 // Push truth (not optimism): clients correct their labels here.
                 let (_, _, via) = self.describe_selection();
                 events
@@ -845,7 +810,7 @@ impl HostServices {
     /// Current selection + credential source, without touching the network
     /// (no refresh, no listing). Answers `GetProviderState`.
     fn describe_selection(&self) -> (String, String, String) {
-        let cfg = HostConfig::load(&self.config_path);
+        let cfg = crate::config::TuryaConfig::read(&self.config_path);
         let id = cfg.provider.unwrap_or_else(|| "anthropic".to_string());
         let model = cfg.model.unwrap_or_else(|| {
             self.registry
@@ -1742,6 +1707,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switching_the_model_keeps_the_rest_of_the_settings() {
+        // The regression: switching the model used to write the settings file
+        // by hand, dropping the version tag and every other setting. The
+        // next launch then read the file as foreign and replaced it, so the
+        // user's provider, theme and approvals were all gone.
+        let _guard = ENV_GUARD.lock().await;
+        let saved = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::set_var("ANTHROPIC_API_KEY", "fake-key-for-offline-test");
+        let (host, tx, _rx, config) = harness_with_config(&["anthropic"]);
+        let sink = HostEventSink::new(tx);
+
+        let cfg = crate::config::TuryaConfig {
+            auto_scroll: Some(false),
+            permission_mode: Some("manual".to_string()),
+            theme: Some(
+                crate::config::theme_json_to_toml(&serde_json::json!({
+                    "pack": "default",
+                    "overrides": { "tool": { "fg": "mustard" } }
+                }))
+                .expect("theme"),
+            ),
+            ..crate::config::TuryaConfig::default()
+        };
+        cfg.save(&config).expect("save");
+
+        host.handle(
+            &TuryaCommand::UpdateConfig {
+                permission_mode: None,
+                provider: Some("anthropic".to_string()),
+                model: Some("claude-sonnet-4-5".to_string()),
+                max_steps: None,
+                max_tool_calls: None,
+                ui: None,
+            },
+            &sink,
+        )
+        .await;
+
+        let after = crate::config::TuryaConfig::read(&config);
+        assert_eq!(after.provider.as_deref(), Some("anthropic"));
+        assert_eq!(after.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(after.auto_scroll, Some(false), "the settings survive");
+        assert_eq!(after.permission_mode.as_deref(), Some("manual"));
+        assert!(after.theme.is_some(), "the theme survives");
+        // The file still carries its version, so the next launch keeps it.
+        let raw = std::fs::read_to_string(&config).expect("read");
+        assert!(raw.contains("version = 1"), "{raw}");
+
+        if let Some(key) = saved {
+            std::env::set_var("ANTHROPIC_API_KEY", key);
+        } else {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+    }
+
+    #[tokio::test]
     async fn successful_switch_pushes_provider_state() {
         let _guard = ENV_GUARD.lock().await;
         let saved = std::env::var("ANTHROPIC_API_KEY").ok();
@@ -1811,17 +1832,28 @@ mod tests {
     }
 
     #[test]
-    fn host_config_roundtrip() {
+    fn the_settings_file_has_one_writer_and_keeps_its_version() {
+        // A model switch used to write the file by hand, which dropped the
+        // version tag and every other setting: the next launch then treated
+        // the file as foreign and threw it away.
         let path = test_path("router-config.toml");
         let _ = std::fs::remove_file(&path);
-        HostConfig {
+        let cfg = crate::config::TuryaConfig {
             provider: Some("gemini".to_string()),
             model: Some("gemini-2.5-flash".to_string()),
-        }
-        .save(&path);
-        let back = HostConfig::load(&path);
+            auto_scroll: Some(false),
+            ..crate::config::TuryaConfig::default()
+        };
+        cfg.save(&path).expect("save");
+
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert!(raw.contains("version = 1"), "{raw}");
+        assert!(raw.contains("auto_scroll = false"), "{raw}");
+
+        let back = crate::config::TuryaConfig::read(&path);
         assert_eq!(back.provider.as_deref(), Some("gemini"));
         assert_eq!(back.model.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(back.auto_scroll, Some(false));
         let _ = std::fs::remove_file(path);
     }
 

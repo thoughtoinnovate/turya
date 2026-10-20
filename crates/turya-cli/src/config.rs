@@ -163,6 +163,20 @@ impl TuryaConfig {
         }
     }
 
+    /// Read the settings without touching the file.
+    ///
+    /// Internal reads — saving a setting, switching a model — must never
+    /// decide to replace the user's settings: that decision belongs to
+    /// startup, where the outcome is reported. A file this cannot read is
+    /// simply not there as far as this read is concerned.
+    pub fn read(path: impl AsRef<Path>) -> TuryaConfig {
+        let path = path.as_ref();
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return TuryaConfig::default();
+        };
+        toml::from_str::<TuryaConfig>(&raw).unwrap_or_default()
+    }
+
     /// Write settings atomically: a crash mid-write must not leave a
     /// half-written file that the next launch has to discard.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), String> {
@@ -171,7 +185,15 @@ impl TuryaConfig {
             std::fs::create_dir_all(dir).map_err(|e| format!("cannot create config dir: {e}"))?;
         }
         let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("toml.tmp");
+        // A temp name of its own: two writers must not share one scratch
+        // file, or the second rename finds nothing to move.
+        static WRITES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let scratch = format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let tmp = path.with_extension(scratch);
         std::fs::write(&tmp, body).map_err(|e| format!("cannot write config: {e}"))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace config: {e}"))?;
         Ok(())
@@ -339,6 +361,35 @@ mod tests {
         let empty = theme_json_to_toml(&serde_json::json!({ "pack": serde_json::Value::Null }))
             .expect_err("nulls cannot be stored");
         assert!(empty.contains("empty values"), "{empty}");
+    }
+
+    #[test]
+    fn a_file_without_a_version_is_replaced_not_guessed() {
+        // A file that carries no version tag is not a current file: it is
+        // replaced, and the old one is kept. Guessing would be worse.
+        let path = tmp("untagged");
+        std::fs::write(&path, "provider = \"gemini\"\n").unwrap();
+        let (cfg, outcome) = TuryaConfig::load(&path);
+        assert!(
+            matches!(outcome, Some(LoadOutcome::Replaced { found: 0, .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(cfg.provider, None, "the untagged values are not trusted");
+        assert!(path.with_file_name("config.toml.old").exists());
+    }
+
+    #[test]
+    fn reading_the_settings_never_touches_the_file() {
+        // An internal read must not be the thing that replaces the file.
+        let path = tmp("read-only");
+        std::fs::write(&path, "provider = \"gemini\"\n").unwrap();
+        let cfg = TuryaConfig::read(&path);
+        assert_eq!(cfg.provider.as_deref(), Some("gemini"));
+        assert!(path.exists(), "the file is still there");
+        assert!(
+            !path.with_file_name("config.toml.old").exists(),
+            "nothing was backed up"
+        );
     }
 
     #[test]

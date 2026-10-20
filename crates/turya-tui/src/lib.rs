@@ -3777,6 +3777,35 @@ mod tests {
         assert_eq!(app.transcript_text().trim(), "");
     }
 
+    #[tokio::test]
+    async fn the_newest_text_is_visible_when_the_transcript_overflows() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // The viewport follows the bottom, so a streamed answer stays in
+        // sight even when the transcript is already taller than the pane.
+        let mut app = TuiApp::new();
+        app.push_block_as(&format_user_message("hi"), false, Voice::User);
+        for i in 0..40 {
+            app.log_line(format!("old line {i}"));
+        }
+        for i in 0..60 {
+            app.push_text(&format!("token{i} "));
+        }
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            text.contains("token59"),
+            "the newest text is on screen: {text}"
+        );
+        assert!(
+            !text.contains("old line 0"),
+            "the top scrolled away: {text}"
+        );
+    }
+
     #[test]
     fn token_stream_starts_new_line_after_dim() {
         let mut app = TuiApp::new();
