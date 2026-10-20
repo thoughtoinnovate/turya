@@ -329,7 +329,7 @@ struct SubagentView {
 /// Gutter + label for a user prompt. A vertical rule and a word, readable in
 /// monochrome, which is what makes "my messages" findable when scrolling.
 fn format_user_message(prompt: &str) -> String {
-    format!("\n┃ You\n┃ {prompt}\n")
+    format!("\n┃ {prompt}\n")
 }
 
 /// Truncate to `max` bytes on a char boundary (pure).
@@ -3248,7 +3248,7 @@ mod tests {
         assert!(app.transcript_text().contains("understand codebase"));
         // The gutter replaces the old emoji: readable in monochrome, and a
         // stable column to scan when scrolling.
-        assert!(app.transcript_text().contains("┃ You"));
+        assert!(app.transcript_text().contains("┃"));
         match rx.recv().await.expect("expected a command") {
             TuryaCommand::SubmitPrompt { prompt, .. } => {
                 assert_eq!(prompt, "understand codebase")
@@ -3889,13 +3889,14 @@ mod tests {
         assert_eq!(app.input, "remember me");
     }
     #[test]
-    fn user_prompts_carry_a_gutter_and_label() {
+    fn user_prompts_carry_a_gutter() {
         // Identity must not depend on colour: this string is what the user
-        // scans for when scrolling back through a long session.
+        // scans for when scrolling back through a long session. The colour
+        // says who is speaking; the gutter survives monochrome.
         let line = format_user_message("fix the bug");
         assert!(line.contains("┃"), "gutter rule present: {line:?}");
         assert!(line.contains("fix the bug"), "content kept");
-        assert!(line.contains("You"), "label present: {line:?}");
+        assert!(!line.contains("You"), "no label above the prompt: {line:?}");
     }
 
     #[test]
