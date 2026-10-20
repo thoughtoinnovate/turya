@@ -164,7 +164,7 @@ rather than for agentic work.
 | `/compact [focus]` | Summarise older turns to free context |
 | `/context` | Context usage against the model window |
 | `/sessions [id]` | List sessions; with an id, resume it |
-| `/settings [key value]` | Colour, tints, mouse capture and auto-scroll. Saved to the config file |
+| `/settings [key value]` | Theme, colour, mouse capture and auto-scroll. Saved to the config file |
 | `/approvals [mode]` | Show or set approval mode: `open`, `review-for-me`, or `manual` |
 | `/skills` | Agent Skills found in this project, with the paths |
 | `/mcp` | MCP servers, the tools each one added, and why a failed one is missing |
@@ -233,7 +233,33 @@ An attached image is displayed inline on terminals that can do it — Kitty,
 Ghostty, WezTerm, rio, and iTerm2 — and otherwise shown as a line saying why
 it is not being displayed. Nothing is emitted when output is redirected, and
 `TURYA_IMAGES=off` turns it off deliberately. `NO_COLOR`, or
-`/settings no_color on`, removes all colour including tints and dimming.
+`/settings no_color on`, removes all colour including the theme and dimming.
+
+### Theme
+
+The transcript is painted by a theme: a named pack plus, if you want, a
+colour per voice. The voices are `user`, `assistant`, `tool` and `system`;
+each takes a foreground (`fg`) and a background (`bg`).
+
+```
+/settings theme high-contrast      # a named pack: default, high-contrast
+/settings tool.fg mustard           # one slot of one voice
+/settings user.bg #1b2735           # hex, a colour name, or none
+/settings tool.fg reset             # back to the pack's own colour
+```
+
+`/settings` on its own shows the theme in effect. Colours accept the usual
+terminal names, `#rrggbb`, `mustard`, and `none` for "no colour of my own";
+an unknown name is refused rather than guessed. The theme is saved to
+`config.toml` as a plain table, so it can also be edited by hand:
+
+```toml
+[theme]
+pack = "default"
+
+[theme.overrides.tool]
+fg = "mustard"
+```
 
 ## Cutting a Release
 

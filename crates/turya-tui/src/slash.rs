@@ -145,7 +145,7 @@ impl SlashRegistry {
             SlashCommand {
                 name: "settings",
                 description: "Show and change settings: /settings [key value]",
-                hint: "user_bg #1b2735",
+                hint: "tool.fg mustard",
                 kind: CommandKind::Local,
                 source: CommandSource::Builtin,
             },

@@ -3420,6 +3420,7 @@ dependencies = [
  "crossterm",
  "futures",
  "ratatui",
+ "serde",
  "serde_json",
  "tokio",
  "tui-markdown",

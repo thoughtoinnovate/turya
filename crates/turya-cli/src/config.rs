@@ -53,12 +53,10 @@ pub struct TuryaConfig {
     pub ollama_host: Option<String>,
     /// Extra skill directories.
     pub skills_paths: Option<Vec<String>>,
-    /// Optional background tints, hex or `none`. Default: none, because a
-    /// hard-pinned background is invisible on some themes and hostile on
-    /// others. Identity is carried by the gutter glyph, not a wash.
-    pub user_bg: Option<String>,
-    pub assistant_bg: Option<String>,
-    pub tool_bg: Option<String>,
+    /// The theme, stored as the UI plugin handed it over. The host does not
+    /// read it: it is an opaque table in the settings file, and only the UI
+    /// knows what a theme means.
+    pub theme: Option<toml::Value>,
     /// Set when the user asks for no colour at all (`NO_COLOR`).
     pub no_color: Option<bool>,
     /// Follow new output to the bottom of the transcript.
@@ -83,9 +81,7 @@ impl Default for TuryaConfig {
             ollama_host: None,
             mcp_servers: None,
             skills_paths: None,
-            user_bg: None,
-            assistant_bg: None,
-            tool_bg: None,
+            theme: None,
             no_color: Some(false),
             auto_scroll: Some(true),
         }
@@ -191,6 +187,72 @@ impl TuryaConfig {
     }
 }
 
+/// Turn an opaque theme snapshot into TOML so it can live in the settings
+/// file next to everything else.
+///
+/// The host never looks inside a theme, so this conversion is deliberately
+/// dumb: JSON objects become tables, arrays become arrays, and anything TOML
+/// cannot say (a null, a date) is refused rather than mangled.
+pub fn theme_json_to_toml(value: &serde_json::Value) -> Result<toml::Value, String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut table = toml::map::Map::new();
+            for (key, item) in map {
+                table.insert(key.clone(), theme_json_to_toml(item)?);
+            }
+            Ok(toml::Value::Table(table))
+        }
+        serde_json::Value::Array(items) => {
+            let mut array = Vec::with_capacity(items.len());
+            for item in items {
+                array.push(theme_json_to_toml(item)?);
+            }
+            Ok(toml::Value::Array(array))
+        }
+        serde_json::Value::String(text) => Ok(toml::Value::String(text.clone())),
+        serde_json::Value::Bool(flag) => Ok(toml::Value::Boolean(*flag)),
+        serde_json::Value::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                Ok(toml::Value::Integer(int))
+            } else if let Some(float) = number.as_f64() {
+                Ok(toml::Value::Float(float))
+            } else {
+                Err(format!(
+                    "cannot store the number {number} in the settings file"
+                ))
+            }
+        }
+        serde_json::Value::Null => Err("the theme must not contain empty values".to_string()),
+    }
+}
+
+/// Read a stored theme back out of the settings file.
+pub fn theme_toml_to_json(value: &toml::Value) -> Result<serde_json::Value, String> {
+    match value {
+        toml::Value::Table(table) => {
+            let mut map = serde_json::Map::new();
+            for (key, item) in table {
+                map.insert(key.clone(), theme_toml_to_json(item)?);
+            }
+            Ok(serde_json::Value::Object(map))
+        }
+        toml::Value::Array(items) => {
+            let mut array = Vec::with_capacity(items.len());
+            for item in items {
+                array.push(theme_toml_to_json(item)?);
+            }
+            Ok(serde_json::Value::Array(array))
+        }
+        toml::Value::String(text) => Ok(serde_json::Value::String(text.clone())),
+        toml::Value::Integer(int) => Ok(serde_json::Value::from(*int)),
+        toml::Value::Float(float) => Ok(serde_json::Number::from_f64(*float)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null)),
+        toml::Value::Boolean(flag) => Ok(serde_json::Value::Bool(*flag)),
+        toml::Value::Datetime(_) => Err("the theme must not contain dates".to_string()),
+    }
+}
+
 fn backup_path(path: &Path) -> std::path::PathBuf {
     let name = path
         .file_name()
@@ -223,11 +285,16 @@ mod tests {
     #[test]
     fn round_trips_through_disk() {
         let path = tmp("round");
+        let theme = theme_json_to_toml(&serde_json::json!({
+            "pack": "default",
+            "overrides": { "tool": { "fg": "mustard" } }
+        }))
+        .expect("theme");
         let cfg = TuryaConfig {
             provider: Some("gemini".to_string()),
             model: Some("gemini-flash-lite-latest".to_string()),
             max_steps: Some(12),
-            user_bg: Some("#1b2735".to_string()),
+            theme: Some(theme),
             ..TuryaConfig::default()
         };
         cfg.save(&path).expect("save");
@@ -237,7 +304,41 @@ mod tests {
         assert_eq!(loaded.provider.as_deref(), Some("gemini"));
         assert_eq!(loaded.model.as_deref(), Some("gemini-flash-lite-latest"));
         assert_eq!(loaded.max_steps, Some(12));
-        assert_eq!(loaded.user_bg.as_deref(), Some("#1b2735"));
+        // The theme survives as the table the UI plugin handed over, and it
+        // is still readable by the UI plugin.
+        let stored = loaded.theme.expect("theme");
+        let back = theme_toml_to_json(&stored).expect("json");
+        assert_eq!(back["pack"], serde_json::json!("default"));
+        assert_eq!(
+            back["overrides"]["tool"]["fg"],
+            serde_json::json!("mustard")
+        );
+    }
+
+    #[test]
+    fn the_theme_is_stored_as_a_readable_table() {
+        let path = tmp("theme-table");
+        let theme = theme_json_to_toml(&serde_json::json!({
+            "pack": "default",
+            "overrides": { "tool": { "fg": "mustard" } }
+        }))
+        .expect("theme");
+        let cfg = TuryaConfig {
+            theme: Some(theme),
+            ..TuryaConfig::default()
+        };
+        cfg.save(&path).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert!(raw.contains("[theme]"), "{raw}");
+        assert!(raw.contains("pack = \"default\""), "{raw}");
+        assert!(raw.contains("fg = \"mustard\""), "{raw}");
+    }
+
+    #[test]
+    fn a_theme_the_settings_file_cannot_hold_is_refused() {
+        let empty = theme_json_to_toml(&serde_json::json!({ "pack": serde_json::Value::Null }))
+            .expect_err("nulls cannot be stored");
+        assert!(empty.contains("empty values"), "{empty}");
     }
 
     #[test]

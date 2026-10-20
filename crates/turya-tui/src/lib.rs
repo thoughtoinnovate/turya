@@ -28,9 +28,12 @@ pub mod flows;
 
 mod scroll;
 
+mod theme;
+
 use flows::{AuthFlow, AuthStage, BrowserFlow, BrowserMode, Flow};
 use scroll::Viewport;
 use slash::{Completer, SlashRegistry};
+use theme::{Palette, Theme, Voice};
 
 /// Centered overlay rect sitting just above the input pane (which sits
 /// above the 1-row status bar). `reserved_bottom` is the input height + 1
@@ -164,35 +167,14 @@ fn guess_mime(path: &std::path::Path) -> String {
     .to_string()
 }
 
-/// Who a transcript row belongs to. Identity is carried by a gutter glyph and
-/// a label, never by colour alone: that survives monochrome terminals, every
-/// theme, and colour-vision differences.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Speaker {
-    User,
-    Assistant,
-    Tool,
-    System,
-}
-
-/// Optional background tints, off by default. A hard-pinned background is
-/// invisible on some themes and hostile on others, so these stay opt-in
-/// (`/settings`); the default identity is the gutter.
-#[derive(Debug, Clone, Copy, Default)]
-struct Tints {
-    user: Option<Color>,
-    assistant: Option<Color>,
-    tool: Option<Color>,
-}
-
 /// Convert a markdown block into plain terminal lines.
 ///
-/// Styles are dropped on purpose: the transcript already colours by role, and
-/// layering markdown emphasis on top of it produces noise nobody can read in
-/// a terminal. What the renderer buys us is structure - real indentation for
+/// Styles are dropped on purpose: the transcript already colours by voice, and
+/// layering markdown emphasis on top of it produces noise nobody can read in a
+/// terminal. What the renderer buys us is structure - real indentation for
 /// lists, stripped heading hashes, aligned code blocks - which is the part
 /// that makes a model answer scannable. The raw text is always still stored.
-fn render_markdown(text: &str, _tints: &Tints) -> Vec<String> {
+fn render_markdown(text: &str) -> Vec<String> {
     let rendered = tui_markdown::from_str(text).to_string();
     let mut out = Vec::new();
     let mut in_fence = false;
@@ -221,78 +203,6 @@ fn render_markdown(text: &str, _tints: &Tints) -> Vec<String> {
         out.push(String::new());
     }
     out
-}
-
-/// Render a tint for display: hex back, or a readable name.
-fn tint_name(c: Option<Color>) -> String {
-    match c {
-        None => "none".to_string(),
-        Some(Color::Rgb(r, g, b)) => format!("#{r:02x}{g:02x}{b:02x}"),
-        Some(other) => format!("{other:?}").to_lowercase(),
-    }
-}
-
-impl Tints {
-    /// The tint for a role, if the user enabled one.
-    fn for_role(&self, role: Speaker) -> Option<Color> {
-        match role {
-            Speaker::User => self.user,
-            Speaker::Assistant => self.assistant,
-            Speaker::Tool => self.tool,
-            // System chrome stays on the terminal's own background.
-            Speaker::System => None,
-        }
-    }
-
-    /// Apply settings: any unset or unparsable value means "no tint".
-    fn from_settings(user: Option<&str>, assistant: Option<&str>, tool: Option<&str>) -> Self {
-        Self {
-            user: user.and_then(Self::parse),
-            assistant: assistant.and_then(Self::parse),
-            tool: tool.and_then(Self::parse),
-        }
-    }
-
-    /// Hex (`#rrggbb`) or a ratatui colour name, or `none`. Returns `None`
-    /// for anything unrecognised rather than guessing a colour.
-    fn parse(raw: &str) -> Option<Color> {
-        let raw = raw.trim();
-        if raw.is_empty() || raw.eq_ignore_ascii_case("none") || raw.eq_ignore_ascii_case("default")
-        {
-            return None;
-        }
-        if let Some(hex) = raw.strip_prefix('#') {
-            if hex.len() == 6 {
-                if let Ok(v) = u32::from_str_radix(hex, 16) {
-                    return Some(Color::Rgb(
-                        (v >> 16) as u8,
-                        ((v >> 8) & 0xff) as u8,
-                        (v & 0xff) as u8,
-                    ));
-                }
-            }
-            return None;
-        }
-        match raw.to_ascii_lowercase().as_str() {
-            "black" => Some(Color::Black),
-            "red" => Some(Color::Red),
-            "green" => Some(Color::Green),
-            "yellow" => Some(Color::Yellow),
-            "blue" => Some(Color::Blue),
-            "magenta" => Some(Color::Magenta),
-            "cyan" => Some(Color::Cyan),
-            "gray" | "grey" => Some(Color::Gray),
-            "darkgray" | "darkgrey" => Some(Color::DarkGray),
-            "lightred" => Some(Color::LightRed),
-            "lightgreen" => Some(Color::LightGreen),
-            "lightyellow" => Some(Color::LightYellow),
-            "lightblue" => Some(Color::LightBlue),
-            "lightmagenta" => Some(Color::LightMagenta),
-            "lightcyan" => Some(Color::LightCyan),
-            "white" => Some(Color::White),
-            _ => None,
-        }
-    }
 }
 
 /// A tool call the permission broker is holding for the user's answer. It
@@ -384,7 +294,7 @@ struct TLine {
     text: String,
     /// System toasts and separators: dimmed so content stays quiet.
     dim: bool,
-    role: Speaker,
+    role: Voice,
     /// Which expandable subagent view owns this line, if any.
     ///
     /// Owned by id rather than by line index: the user scrolls, appends and
@@ -395,7 +305,7 @@ struct TLine {
 }
 
 impl TLine {
-    fn new(text: String, dim: bool, role: Speaker) -> Self {
+    fn new(text: String, dim: bool, role: Voice) -> Self {
         Self {
             text,
             dim,
@@ -514,8 +424,11 @@ pub struct TuiApp {
     reasoning_supported: Option<bool>,
     /// Write recall history to disk. Off in tests so they stay hermetic.
     persist_history: bool,
-    /// Optional background tints; off unless the user opts in.
-    tints: Tints,
+    /// The theme in effect: a named pack plus the user's overrides.
+    theme: Theme,
+    /// The colours the theme resolves to. Kept next to the theme so a change
+    /// is one resolve away, and the transcript never recomputes it per row.
+    palette: Palette,
     /// Prompts waiting for the current turn to finish (`/queue`).
     queued: usize,
     /// call_id → when the tool started, so a completion can say how long it
@@ -605,7 +518,10 @@ impl TuiApp {
             history_cursor: None,
             stashed_draft: String::new(),
             persist_history: false,
-            tints: Tints::default(),
+            theme: Theme::default(),
+            // The default pack's colours, resolved: a fresh client paints
+            // exactly what Turya has always painted.
+            palette: Palette::resolve(&Theme::default()).0,
             mouse: Some("auto".to_string()),
             auto_scroll: true,
             permission_mode: PermissionMode::ReviewForMe,
@@ -632,37 +548,53 @@ impl TuiApp {
     /// Append one line to the transcript (the single home for chat, tool
     /// activity, and toasts — there is no separate tool box).
     fn log_line(&mut self, line: String) {
-        self.log_line_as(line, Speaker::Assistant);
+        self.log_line_as(line, Voice::Assistant);
     }
 
-    fn log_line_as(&mut self, line: String, role: Speaker) {
+    fn log_line_as(&mut self, line: String, role: Voice) {
         self.transcript.push(TLine::new(line, false, role));
         self.invalidate_row_offsets_from(self.transcript.len().saturating_sub(1));
     }
 
-    /// Tints, or none at all when colour is off. Every styling decision goes
-    /// through here so `NO_COLOR` cannot be honoured in one place and ignored
-    /// in another.
-    fn tints(&self) -> Tints {
-        if self.color {
-            self.tints
-        } else {
-            Tints::default()
+    /// The colours a row paints with.
+    ///
+    /// Every styling decision goes through here: the transcript's own render
+    /// path and the viewport's must agree, and `NO_COLOR` cannot be honoured
+    /// in one place and ignored in another.
+    fn voice_style(&self, role: Voice, dim: bool) -> Style {
+        if !self.color {
+            return Style::default();
         }
+        // The background belongs to the row's own voice: a dimmed assistant
+        // block keeps the assistant's background. The foreground is the
+        // dimming: a dimmed row speaks in the system voice, which is what
+        // dimming has always meant and why that voice is dim by default.
+        let bg = self.palette.style(role).bg;
+        let fg = self
+            .palette
+            .style(if dim { Voice::System } else { role })
+            .fg;
+        let mut out = Style::default();
+        if let Some(bg) = bg {
+            out = out.bg(bg);
+        }
+        if let Some(fg) = fg {
+            out = out.fg(fg);
+        }
+        out
     }
 
     /// Append a dimmed system toast (routing notices, usage hints).
     /// Warnings, errors, and confirmations stay full-bright.
     fn log_dim(&mut self, line: String) {
-        self.transcript
-            .push(TLine::new(line, true, Speaker::System));
+        self.transcript.push(TLine::new(line, true, Voice::System));
         self.invalidate_row_offsets_from(self.transcript.len().saturating_sub(1));
     }
 
     /// Append a (possibly multi-line) block, preserving blank lines so
     /// rendering matches the old plain-string transcript exactly.
     fn push_block(&mut self, text: &str, dim: bool) {
-        self.push_block_as(text, dim, Speaker::Assistant)
+        self.push_block_as(text, dim, Voice::Assistant)
     }
 
     /// Show an image inline when the terminal can, and say plainly when it
@@ -686,12 +618,12 @@ impl TuiApp {
         }
     }
 
-    fn push_block_as(&mut self, text: &str, dim: bool, role: Speaker) {
+    fn push_block_as(&mut self, text: &str, dim: bool, role: Voice) {
         let start = self.transcript.len();
         // Only assistant prose is markdown. Prompts, tool output and system
         // rows are literal: a user pasting `**stars**` must see the stars.
-        if !dim && role == Speaker::Assistant && self.render_markdown {
-            for line in render_markdown(text, &self.tints()) {
+        if !dim && role == Voice::Assistant && self.render_markdown {
+            for line in render_markdown(text) {
                 self.transcript.push(TLine::new(line, false, role));
             }
         } else {
@@ -705,7 +637,7 @@ impl TuiApp {
 
     /// Mark a block as the final answer, so it renders as markdown.
     pub fn push_assistant_answer(&mut self, text: &str) {
-        self.push_block_as(text, false, Speaker::Assistant);
+        self.push_block_as(text, false, Voice::Assistant);
     }
 
     /// Stream one token chunk: extend the current content line, or start a
@@ -718,7 +650,7 @@ impl TuiApp {
         let append = self
             .transcript
             .last()
-            .map(|l| !l.dim && l.role == Speaker::Assistant)
+            .map(|l| !l.dim && l.role == Voice::Assistant)
             .unwrap_or(false);
         if self.stream_start.is_none() {
             self.stream_start = Some(if append {
@@ -734,7 +666,7 @@ impl TuiApp {
             }
         } else {
             self.transcript
-                .push(TLine::new(chunk.to_string(), false, Speaker::Assistant));
+                .push(TLine::new(chunk.to_string(), false, Voice::Assistant));
         }
         self.invalidate_row_offsets_from(self.transcript.len().saturating_sub(1));
     }
@@ -752,7 +684,7 @@ impl TuiApp {
         self.transcript.truncate(start);
         self.invalidate_row_offsets_from(start);
         let text = std::mem::take(&mut self.streaming);
-        self.push_block_as(&text, false, Speaker::Assistant);
+        self.push_block_as(&text, false, Voice::Assistant);
     }
 
     /// Plain-text view of the transcript: test assertions and scroll math.
@@ -771,26 +703,13 @@ impl TuiApp {
         self.transcript
             .iter()
             .map(|l| {
-                let mut style = Style::default();
-                // `NO_COLOR` means no escapes at all, so this is the one place
-                // that decides: tints, dimming and role colours all live under
-                // this check rather than each honouring it separately.
+                // `NO_COLOR` means no escapes at all: the style helper
+                // decides, so colour, dimming and the voices can never be
+                // honoured in one place and ignored in another.
                 if !self.color {
                     return Line::raw(l.text.clone());
                 }
-                // A tint is an *addition* to the gutter, never the carrier of
-                // identity: with tints off the roles are still distinct.
-                if let Some(bg) = self.tints.for_role(l.role) {
-                    style = style.bg(bg);
-                }
-                if l.dim {
-                    style = style.fg(Color::DarkGray);
-                } else if l.role == Speaker::User {
-                    style = style.fg(Color::Cyan);
-                } else if l.role == Speaker::Tool {
-                    style = style.fg(Color::Gray);
-                }
-                Line::styled(l.text.as_str(), style)
+                Line::styled(l.text.as_str(), self.voice_style(l.role, l.dim))
             })
             .collect()
     }
@@ -893,7 +812,7 @@ impl TuiApp {
                         self.push_block(text, false);
                     }
                     Part::UserText { text } => {
-                        self.push_block_as(&format_user_message(text), false, Speaker::User);
+                        self.push_block_as(&format_user_message(text), false, Voice::User);
                     }
                     Part::Reasoning { .. } | Part::Instruction { .. } => {
                         // Harness/model scaffolding, not user-facing prose.
@@ -924,7 +843,7 @@ impl TuiApp {
                             error: None,
                         };
                         for line in format_tool_result(&name, &res) {
-                            self.log_line_as(line, Speaker::Tool);
+                            self.log_line_as(line, Voice::Tool);
                         }
                         if *truncated {
                             self.retain_output(&name, &res);
@@ -1148,15 +1067,65 @@ impl TuiApp {
 
     /// Apply persisted presentation settings from the host.
     /// Colour is deliberately not touched here: the host applies it
-    /// separately from the saved value, so changing a tint cannot quietly
+    /// separately from the saved value, so changing the theme cannot quietly
     /// undo a `NO_COLOR` decision.
-    pub fn apply_settings(&mut self, tints: Option<(&str, &str, &str)>, mouse: Option<&str>) {
-        if let Some((user, assistant, tool)) = tints {
-            self.tints = Tints::from_settings(Some(user), Some(assistant), Some(tool));
-        }
+    pub fn apply_settings(&mut self, mouse: Option<&str>) {
         if let Some(m) = mouse {
             self.mouse = Some(m.to_string());
         }
+    }
+
+    /// Apply a theme the host stored.
+    ///
+    /// The snapshot is opaque to the host and to the kernel: only this client
+    /// knows what a theme is. A theme that cannot be read is reported and the
+    /// default pack stands — the transcript must stay readable even when the
+    /// settings file says something the user did not mean.
+    pub fn apply_theme(&mut self, snapshot: Option<&serde_json::Value>) {
+        let theme = match snapshot {
+            None => Theme::default(),
+            Some(value) => match Theme::from_snapshot(value) {
+                Ok(theme) => theme,
+                Err(e) => {
+                    self.log_dim(format!("⚠ {e}; using the '{}' theme", theme::DEFAULT_PACK));
+                    Theme::default()
+                }
+            },
+        };
+        self.set_theme(theme);
+    }
+
+    /// Adopt a theme and repaint with it.
+    fn set_theme(&mut self, theme: Theme) {
+        let (palette, problems) = Palette::resolve(&theme);
+        for problem in problems {
+            self.log_dim(format!("⚠ theme: {problem}"));
+        }
+        self.theme = theme;
+        self.palette = palette;
+    }
+
+    /// The theme in effect, for the settings report and for saving.
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// Hand the theme to the host so it survives a restart. The host stores
+    /// it as it is: only this client knows what a theme means.
+    async fn save_theme(&self, cmd_tx: &mpsc::Sender<TuryaCommand>) {
+        let _ = cmd_tx
+            .send(TuryaCommand::UpdateConfig {
+                permission_mode: None,
+                provider: None,
+                model: None,
+                max_steps: None,
+                max_tool_calls: None,
+                ui: Some(turya_protocol::UiSettings {
+                    theme: Some(self.theme.snapshot()),
+                    ..Default::default()
+                }),
+            })
+            .await;
     }
 
     pub fn apply_auto_scroll(&mut self, value: Option<bool>) {
@@ -1295,7 +1264,7 @@ impl TuiApp {
         self.push_block_as(
             &format_user_message(&format!("{prompt}{chips}")),
             false,
-            Speaker::User,
+            Voice::User,
         );
         let attachments = std::mem::take(&mut self.attachments);
         // Images render where they were attached, so the picture sits next to
@@ -1551,17 +1520,24 @@ impl TuiApp {
                         let mut parts = args.split_whitespace();
                         match (parts.next(), parts.next()) {
                             (None, _) => {
-                                let t = self.tints;
                                 self.log_dim(format!(
                                     "colour: {} (NO_COLOR or /settings no_color off)",
                                     if self.color_enabled() { "on" } else { "off" }
                                 ));
                                 self.log_dim(format!(
-                                    "tints: user={} assistant={} tool={} (none = terminal default)",
-                                    tint_name(t.user),
-                                    tint_name(t.assistant),
-                                    tint_name(t.tool)
+                                    "theme: {} (packs: {})",
+                                    self.theme.pack,
+                                    theme::pack_names().join(", ")
                                 ));
+                                for voice in Voice::ALL {
+                                    let style = self.palette.style(voice);
+                                    self.log_dim(format!(
+                                        "{}: fg={} bg={}",
+                                        voice.name(),
+                                        theme::color_name(style.fg),
+                                        theme::color_name(style.bg)
+                                    ));
+                                }
                                 self.log_dim(format!(
                                     "mouse: {} ({})",
                                     self.mouse.clone().unwrap_or_else(|| "auto".into()),
@@ -1576,8 +1552,8 @@ impl TuiApp {
                                     if self.auto_scroll { "on" } else { "off" }
                                 ));
                                 self.log_dim(
-                                    "set one with: /settings user_bg #1b2735  \
-                                 (/settings user_bg none to clear)"
+                                    "set one with: /settings tool.fg mustard  \
+                                 (/settings tool.fg reset to go back to the theme)"
                                         .to_string(),
                                 );
                             }
@@ -1696,41 +1672,81 @@ impl TuiApp {
                                     }
                                     return;
                                 }
-                                let parsed = Tints::parse(value);
-                                let slot = match key {
-                                    "user_bg" => &mut self.tints.user,
-                                    "assistant_bg" => &mut self.tints.assistant,
-                                    "tool_bg" => &mut self.tints.tool,
-                                    _ => {
+                                // The theme: a named pack, or one slot of one
+                                // voice. The client owns the whole vocabulary;
+                                // the host only stores what it is given.
+                                if key == "theme" {
+                                    if !theme::is_known_pack(value) {
                                         self.log_dim(format!(
-                                        "ℹ unknown setting '{key}'; try no_color, user_bg, assistant_bg, tool_bg"
-                                    ));
+                                            "ℹ unknown theme '{}'; try {}",
+                                            value,
+                                            theme::pack_names().join(", ")
+                                        ));
                                         return;
                                     }
-                                };
-                                *slot = parsed;
-                                self.log_dim(format!("→ {key} = {}", tint_name(parsed)));
-                                // Applied here, saved there: the user sees the
-                                // change now and keeps it after a restart.
-                                let _ = cmd_tx
-                                    .send(TuryaCommand::UpdateConfig {
-                                        permission_mode: None,
-                                        provider: None,
-                                        model: None,
-                                        max_steps: None,
-                                        max_tool_calls: None,
-                                        ui: Some(turya_protocol::UiSettings {
-                                            user_bg: (key == "user_bg").then(|| value.to_string()),
-                                            assistant_bg: (key == "assistant_bg")
-                                                .then(|| value.to_string()),
-                                            tool_bg: (key == "tool_bg").then(|| value.to_string()),
-                                            ..Default::default()
-                                        }),
-                                    })
-                                    .await;
+                                    let mut next = self.theme.clone();
+                                    next.pack = value.to_string();
+                                    self.set_theme(next);
+                                    self.log_dim(format!("→ theme = {}", self.theme.pack));
+                                    self.save_theme(cmd_tx).await;
+                                    return;
+                                }
+                                if let Some((voice, slot)) = theme::parse_slot_key(key) {
+                                    let value = value.trim();
+                                    if value.eq_ignore_ascii_case(theme::RESET) {
+                                        let mut next = self.theme.clone();
+                                        next.overrides.slots_mut(voice).set(slot, None);
+                                        self.set_theme(next);
+                                        self.log_dim(format!(
+                                            "→ {key} = {} (the theme's colour)",
+                                            key
+                                        ));
+                                        self.save_theme(cmd_tx).await;
+                                        return;
+                                    }
+                                    match theme::parse_color(value) {
+                                        Err(e) => {
+                                            self.log_dim(format!("ℹ {e}"));
+                                            return;
+                                        }
+                                        Ok(color) => {
+                                            let mut next = self.theme.clone();
+                                            // The override keeps the text the
+                                            // user typed, so the settings file
+                                            // stays readable — and `none` stays
+                                            // "no colour of my own" rather than
+                                            // "whatever the theme says".
+                                            next.overrides
+                                                .slots_mut(voice)
+                                                .set(slot, Some(value.to_string()));
+                                            self.set_theme(next);
+                                            self.log_dim(format!(
+                                                "→ {key} = {}",
+                                                theme::color_name(color)
+                                            ));
+                                            self.save_theme(cmd_tx).await;
+                                        }
+                                    }
+                                    return;
+                                }
+                                self.log_dim(format!(
+                                    "ℹ unknown setting '{key}'; try no_color, auto_scroll, theme, \
+                                     or a colour slot such as tool.fg"
+                                ));
                             }
-                            (Some(key), None) => self
-                                .log_dim(format!("ℹ {key} needs a value (e.g. #1b2735 or none)")),
+                            (Some(key), None) => {
+                                if key == "theme" {
+                                    self.log_dim(format!(
+                                        "ℹ theme = {} (packs: {})",
+                                        self.theme.pack,
+                                        theme::pack_names().join(", ")
+                                    ));
+                                } else {
+                                    self.log_dim(format!(
+                                        "ℹ {key} needs a value (e.g. mustard, #1b2735, none or reset)"
+                                    ));
+                                }
+                            }
                         }
                     }
                     "sessions" => {
@@ -2178,7 +2194,7 @@ impl TuiApp {
             TuryaEvent::ToolCallInitiated(call) => {
                 // A one-line head, not a growing log: the tool's own output is
                 // folded away and only shown when the user asks for it.
-                self.log_line_as(format!("▸ {}", call.tool_name), Speaker::Tool);
+                self.log_line_as(format!("▸ {}", call.tool_name), Voice::Tool);
                 self.pending_tools
                     .insert(call.call_id.clone(), call.tool_name.clone());
                 self.tool_started
@@ -2191,7 +2207,7 @@ impl TuiApp {
                     .unwrap_or_else(|| "tool".to_string());
                 let elapsed = self.tool_started.remove(&res.call_id).map(|t| t.elapsed());
                 for line in format_tool_result_timed(&name, res, elapsed) {
-                    self.log_line_as(line, Speaker::Tool);
+                    self.log_line_as(line, Voice::Tool);
                 }
                 self.retain_output(&name, res);
             }
@@ -2247,10 +2263,7 @@ impl TuiApp {
                     self.subagents.remove(0);
                 }
                 let hint = if expandable { "  (Ctrl+E)" } else { "" };
-                self.log_line_as(
-                    format!("▹ subagent {name}: {headline}{hint}"),
-                    Speaker::User,
-                );
+                self.log_line_as(format!("▹ subagent {name}: {headline}{hint}"), Voice::User);
             }
             TuryaEvent::McpStatus { servers } => {
                 if servers.is_empty() {
@@ -2262,9 +2275,7 @@ impl TuiApp {
                     // A server that failed says so here rather than leaving the
                     // user to wonder why its tools are missing.
                     match s.error {
-                        Some(e) => {
-                            self.log_line_as(format!("✗ MCP {} — {e}", s.name), Speaker::User)
-                        }
+                        Some(e) => self.log_line_as(format!("✗ MCP {} — {e}", s.name), Voice::User),
                         None => {
                             self.log_line_as(
                                 format!(
@@ -2273,7 +2284,7 @@ impl TuiApp {
                                     s.tools.len(),
                                     s.command
                                 ),
-                                Speaker::User,
+                                Voice::User,
                             );
                             for t in s.tools {
                                 self.log_dim(format!("  {t}"));
@@ -2290,10 +2301,7 @@ impl TuiApp {
                     );
                 } else {
                     for s in skills {
-                        self.log_line_as(
-                            format!("◆ {} — {}", s.name, s.description),
-                            Speaker::User,
-                        );
+                        self.log_line_as(format!("◆ {} — {}", s.name, s.description), Voice::User);
                     }
                     // Discovery problems are shown, never swallowed: a skill
                     // that exists but does not load is a real problem.
@@ -2519,19 +2527,7 @@ impl TuiApp {
             let mut rows = 0usize;
             for i in start..self.transcript.len() {
                 let tline = &self.transcript[i];
-                let mut style = Style::default();
-                if self.color {
-                    if let Some(bg) = self.tints.for_role(tline.role) {
-                        style = style.bg(bg);
-                    }
-                    if tline.dim {
-                        style = style.fg(Color::DarkGray);
-                    } else if tline.role == Speaker::User {
-                        style = style.fg(Color::Cyan);
-                    } else if tline.role == Speaker::Tool {
-                        style = style.fg(Color::Gray);
-                    }
-                }
+                let style = self.voice_style(tline.role, tline.dim);
                 chat_lines.push(Line::styled(tline.text.as_str(), style));
                 let h = if i + 1 < self.row_offsets.len() {
                     self.row_offsets[i + 1] - self.row_offsets[i]
@@ -3898,16 +3894,16 @@ mod tests {
         // scans for when scrolling back through a long session.
         let line = format_user_message("fix the bug");
         assert!(line.contains("┃"), "gutter rule present: {line:?}");
-        assert!(line.contains("You"), "label present: {line:?}");
         assert!(line.contains("fix the bug"), "content kept");
+        assert!(line.contains("You"), "label present: {line:?}");
     }
 
     #[test]
     fn roles_map_to_distinct_styles() {
         let mut app = TuiApp::new();
-        app.log_line_as("user text".to_string(), Speaker::User);
-        app.log_line_as("model text".to_string(), Speaker::Assistant);
-        app.log_line_as("tool text".to_string(), Speaker::Tool);
+        app.log_line_as("user text".to_string(), Voice::User);
+        app.log_line_as("model text".to_string(), Voice::Assistant);
+        app.log_line_as("tool text".to_string(), Voice::Tool);
         app.log_dim("system text".to_string());
 
         let rows = app.transcript_lines();
@@ -3932,29 +3928,33 @@ mod tests {
     }
 
     #[test]
-    fn tints_are_opt_in_and_must_parse() {
-        assert_eq!(Tints::parse("none"), None);
-        assert_eq!(Tints::parse(""), None);
-        assert_eq!(Tints::parse("default"), None);
-        assert_eq!(Tints::parse("chartreuse"), None, "unknown is not guessed");
-        assert_eq!(Tints::parse("cyan"), Some(Color::Cyan));
-        assert_eq!(Tints::parse("#112233"), Some(Color::Rgb(0x11, 0x22, 0x33)));
-        assert_eq!(Tints::parse("#12345"), None, "malformed hex is refused");
-
-        let tints = Tints::from_settings(Some("#112233"), None, Some("blue"));
-        assert_eq!(tints.user, Some(Color::Rgb(0x11, 0x22, 0x33)));
-        assert_eq!(tints.assistant, None);
-        assert_eq!(tints.tool, Some(Color::Blue));
-        // System chrome never picks up a tint.
-        assert_eq!(tints.for_role(Speaker::System), None);
+    fn colours_must_parse_or_they_are_refused() {
+        assert_eq!(theme::parse_color("none"), Ok(None));
+        assert_eq!(theme::parse_color(""), Ok(None));
+        assert_eq!(theme::parse_color("default"), Ok(None));
+        assert_eq!(theme::parse_color("cyan"), Ok(Some(Color::Cyan)));
+        assert_eq!(
+            theme::parse_color("#112233"),
+            Ok(Some(Color::Rgb(0x11, 0x22, 0x33)))
+        );
+        assert!(
+            theme::parse_color("chartreuse").is_err(),
+            "unknown is not guessed"
+        );
+        assert!(
+            theme::parse_color("#12345").is_err(),
+            "malformed hex is refused"
+        );
     }
 
     #[test]
-    fn an_enabled_tint_reaches_only_that_role() {
+    fn a_background_reaches_only_the_voice_that_asked_for_it() {
         let mut app = TuiApp::new();
-        app.tints = Tints::from_settings(Some("#101820"), None, None);
-        app.log_line_as("mine".to_string(), Speaker::User);
-        app.log_line_as("theirs".to_string(), Speaker::Assistant);
+        let mut theme = Theme::default();
+        theme.overrides.user.bg = Some("#101820".to_string());
+        app.set_theme(theme);
+        app.log_line_as("mine".to_string(), Voice::User);
+        app.log_line_as("theirs".to_string(), Voice::Assistant);
         let rows = app.transcript_lines();
         let bg_of = |needle: &str| {
             rows.iter()
@@ -3963,16 +3963,22 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(bg_of("mine"), Some(Color::Rgb(0x10, 0x18, 0x20)));
-        assert_eq!(bg_of("theirs"), None, "one role's tint, not everyone's");
+        assert_eq!(
+            bg_of("theirs"),
+            None,
+            "one voice's background, not everyone's"
+        );
     }
 
     #[test]
-    fn a_tint_never_drops_the_role_colour() {
-        // Tints are additive: turning one on must not make a user prompt stop
-        // looking like a user prompt.
+    fn a_background_never_drops_the_voice_colour() {
+        // Backgrounds are additive: turning one on must not make a user
+        // prompt stop looking like a user prompt.
         let mut app = TuiApp::new();
-        app.tints = Tints::from_settings(Some("#101820"), None, None);
-        app.log_line_as("mine".to_string(), Speaker::User);
+        let mut theme = Theme::default();
+        theme.overrides.user.bg = Some("#101820".to_string());
+        app.set_theme(theme);
+        app.log_line_as("mine".to_string(), Voice::User);
         let rows = app.transcript_lines();
         let row = rows
             .iter()
@@ -3980,6 +3986,135 @@ mod tests {
             .unwrap();
         assert_eq!(row.style.fg, Some(Color::Cyan));
         assert!(row.style.bg.is_some());
+    }
+
+    #[test]
+    fn a_theme_survives_the_trip_through_the_host() {
+        // The host stores the theme as opaque data; a restart hands that data
+        // back and the same colours must come out.
+        let mut app = TuiApp::new();
+        let mut theme = Theme::default();
+        theme.overrides.tool.fg = Some("mustard".to_string());
+        app.set_theme(theme);
+        let snapshot = app.theme().snapshot();
+
+        let mut restarted = TuiApp::new();
+        restarted.apply_theme(Some(&snapshot));
+        restarted.log_line_as("tool text".to_string(), Voice::Tool);
+        let rows = restarted.transcript_lines();
+        let tool = rows
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("tool text")))
+            .unwrap();
+        assert_eq!(tool.style.fg, Some(Color::Rgb(0xc8, 0xa0, 0x28)));
+    }
+
+    #[tokio::test]
+    async fn the_drawn_transcript_paints_the_theme() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // The draw path is the one the user sees: if it ignored the theme,
+        // every other test here would be telling a comfortable lie.
+        let mut app = TuiApp::new();
+        let mut theme = Theme::default();
+        theme.overrides.tool.fg = Some("mustard".to_string());
+        app.set_theme(theme);
+        app.log_line_as("tool text".to_string(), Voice::Tool);
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area.width as usize;
+        let mut painted = None;
+        for row in buffer.content.chunks(width) {
+            let text: String = row.iter().map(|c| c.symbol()).collect();
+            if let Some(x) = text.find("tool text") {
+                painted = Some(row[x].fg);
+                break;
+            }
+        }
+        assert_eq!(
+            painted,
+            Some(Color::Rgb(0xc8, 0xa0, 0x28)),
+            "the drawn row wears the theme's colour"
+        );
+    }
+
+    #[test]
+    fn a_theme_override_reaches_the_transcript() {
+        let mut app = TuiApp::new();
+        let mut theme = Theme::default();
+        theme.overrides.tool.fg = Some("mustard".to_string());
+        app.set_theme(theme);
+        app.log_line_as("tool text".to_string(), Voice::Tool);
+        app.log_line_as("user text".to_string(), Voice::User);
+        let rows = app.transcript_lines();
+        let style_of = |needle: &str| {
+            rows.iter()
+                .find(|l| l.spans.iter().any(|s| s.content.contains(needle)))
+                .map(|l| l.style)
+                .unwrap()
+        };
+        assert_eq!(style_of("tool text").fg, Some(Color::Rgb(0xc8, 0xa0, 0x28)));
+        assert_eq!(style_of("user text").fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn a_broken_theme_keeps_the_transcript_readable_and_says_so() {
+        let mut app = TuiApp::new();
+        let mut theme = Theme::default();
+        theme.overrides.tool.fg = Some("chartreuse".to_string());
+        app.set_theme(theme);
+        app.log_line_as("tool text".to_string(), Voice::Tool);
+        let rows = app.transcript_lines();
+        let tool = rows
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("tool text")))
+            .unwrap();
+        assert_eq!(tool.style.fg, Some(Color::Gray), "the pack colour stands");
+        assert!(
+            app.transcript_text().contains("chartreuse"),
+            "the user is told what is wrong: {}",
+            app.transcript_text()
+        );
+    }
+
+    #[test]
+    fn a_theme_the_host_cannot_read_is_reported() {
+        let mut app = TuiApp::new();
+        app.apply_theme(Some(&serde_json::json!({ "pack": 7 })));
+        assert!(
+            app.transcript_text().contains("theme"),
+            "{}",
+            app.transcript_text()
+        );
+        assert_eq!(app.theme().pack, theme::DEFAULT_PACK);
+    }
+
+    #[test]
+    fn the_transcript_and_the_viewport_paint_a_row_the_same_way() {
+        // Two render paths, one decision: if they ever disagree, a row
+        // changes colour when it scrolls.
+        let mut app = TuiApp::new();
+        let mut theme = Theme::default();
+        theme.overrides.user.fg = Some("mustard".to_string());
+        theme.overrides.assistant.bg = Some("#101820".to_string());
+        app.set_theme(theme);
+        app.log_line_as("mine".to_string(), Voice::User);
+        app.log_dim("toast".to_string());
+        let rows = app.transcript_lines();
+        for row in &rows {
+            let style = app.voice_style(
+                if row.spans[0].content.contains("mine") {
+                    Voice::User
+                } else {
+                    Voice::System
+                },
+                !row.spans[0].content.contains("mine"),
+            );
+            assert_eq!(row.style, style, "both paths must agree");
+        }
     }
 
     #[test]
@@ -4047,26 +4182,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_report_tints_and_mouse() {
+    async fn settings_report_the_theme_and_the_mouse() {
         let mut app = TuiApp::new();
-        app.dispatch_slash("settings", "user_bg #101820", &mpsc::channel(1).0)
+        app.dispatch_slash("settings", "user.bg #101820", &mpsc::channel(1).0)
             .await;
-        assert_eq!(app.tints.user, Some(Color::Rgb(0x10, 0x18, 0x20)));
+        assert_eq!(
+            app.theme().overrides.user.bg.as_deref(),
+            Some("#101820"),
+            "the override is remembered"
+        );
         let (tx, mut rx) = mpsc::channel(8);
         app.dispatch_slash("settings", "", &tx).await;
         let text = app.transcript_text();
-        assert!(text.contains("tints:"), "{text}");
+        assert!(text.contains("theme:"), "{text}");
+        assert!(text.contains("user: fg="), "{text}");
         assert!(text.contains("mouse:"), "{text}");
         // Bare /settings is a report: it sends nothing to the engine.
         assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn settings_rejects_an_unknown_tint_without_guessing() {
+    async fn settings_rejects_an_unknown_colour_without_guessing() {
         let mut app = TuiApp::new();
-        app.dispatch_slash("settings", "user_bg notacolor", &mpsc::channel(1).0)
+        app.dispatch_slash("settings", "user.fg notacolor", &mpsc::channel(1).0)
             .await;
-        assert_eq!(app.tints.user, None, "unparsable means no tint");
+        assert_eq!(app.theme().overrides.user.fg, None, "nothing is stored");
+        assert!(
+            app.transcript_text().contains("notacolor"),
+            "the user is told: {}",
+            app.transcript_text()
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_sets_a_voice_colour_and_asks_the_host_to_keep_it() {
+        let mut app = TuiApp::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.dispatch_slash("settings", "tool.fg mustard", &tx).await;
+        assert_eq!(app.theme().overrides.tool.fg.as_deref(), Some("mustard"));
+        let cmd = rx.try_recv().expect("the host is told");
+        let turya_protocol::TuryaCommand::UpdateConfig { ui, .. } = cmd else {
+            panic!("expected a settings update");
+        };
+        let theme = ui.expect("ui settings").theme.expect("a theme");
+        assert_eq!(
+            theme["overrides"]["tool"]["fg"],
+            serde_json::json!("mustard")
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_none_means_no_colour_at_all() {
+        let mut app = TuiApp::new();
+        app.dispatch_slash("settings", "tool.fg none", &mpsc::channel(1).0)
+            .await;
+        assert_eq!(app.theme().overrides.tool.fg.as_deref(), Some("none"));
+        app.log_line_as("tool text".to_string(), Voice::Tool);
+        let rows = app.transcript_lines();
+        let tool = rows
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("tool text")))
+            .unwrap();
+        assert_eq!(tool.style.fg, None, "no colour of its own");
+    }
+
+    #[tokio::test]
+    async fn settings_can_go_back_to_the_themes_own_colour() {
+        let mut app = TuiApp::new();
+        app.dispatch_slash("settings", "tool.fg mustard", &mpsc::channel(1).0)
+            .await;
+        app.dispatch_slash("settings", "tool.fg reset", &mpsc::channel(1).0)
+            .await;
+        assert_eq!(app.theme().overrides.tool.fg, None, "the override is gone");
+    }
+
+    #[tokio::test]
+    async fn settings_switches_the_theme_pack() {
+        let mut app = TuiApp::new();
+        app.dispatch_slash("settings", "theme high-contrast", &mpsc::channel(1).0)
+            .await;
+        assert_eq!(app.theme().pack, "high-contrast");
+        app.dispatch_slash("settings", "theme nosuchpack", &mpsc::channel(1).0)
+            .await;
+        assert_eq!(
+            app.theme().pack,
+            "high-contrast",
+            "a bad pack changes nothing"
+        );
+        assert!(app.transcript_text().contains("nosuchpack"));
     }
 
     fn mouse(kind: MouseEventKind) -> MouseEvent {
@@ -4083,7 +4286,7 @@ mod tests {
         app.push_block_as(
             "## Findings\n\n- first item\n- second item\n",
             false,
-            Speaker::Assistant,
+            Voice::Assistant,
         );
         let text = app.transcript_text();
         assert!(text.contains("Findings"), "heading text kept: {text}");
@@ -4100,7 +4303,7 @@ mod tests {
         app.push_block_as(
             "Run it:\n\n```sh\nmake test\n```\n",
             false,
-            Speaker::Assistant,
+            Voice::Assistant,
         );
         let text = app.transcript_text();
         assert!(text.contains("make test"), "code content kept: {text}");
@@ -4111,14 +4314,14 @@ mod tests {
     fn user_text_is_never_markdown() {
         // A user pasting `**bold**` must see the asterisks, not lose them.
         let mut app = TuiApp::new();
-        app.push_block_as("**not bold**", false, Speaker::User);
+        app.push_block_as("**not bold**", false, Voice::User);
         assert!(app.transcript_text().contains("**not bold**"));
     }
 
     #[test]
     fn tool_output_is_never_markdown() {
         let mut app = TuiApp::new();
-        app.push_block_as("## not a heading", false, Speaker::Tool);
+        app.push_block_as("## not a heading", false, Voice::Tool);
         assert!(app.transcript_text().contains("## not a heading"));
     }
 
@@ -4159,7 +4362,7 @@ mod tests {
     #[test]
     fn an_unterminated_code_fence_never_panics() {
         // A truncated stream is normal: the turn ended mid-answer.
-        let out = render_markdown("```rust\nfn main() {\n    let x = 1;", &Tints::default());
+        let out = render_markdown("```rust\nfn main() {\n    let x = 1;");
         assert!(!out.is_empty(), "something always renders");
         assert!(out.iter().any(|l| l.contains("fn main")));
     }
@@ -4480,7 +4683,7 @@ mod settings_tests {
         // turn it back on behind their back.
         let mut app = TuiApp::new();
         app.apply_color(Some(true));
-        app.apply_settings(Some(("none", "none", "none")), Some("auto"));
+        app.apply_settings(Some("auto"));
         assert!(
             !app.color_enabled(),
             "applying other settings must not silently re-enable colour"

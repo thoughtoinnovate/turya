@@ -42,11 +42,14 @@ pub enum RiskLevel {
 
 /// Everything `/settings` can change, in one shape because it is written as
 /// one file. `None` on a field leaves it alone.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UiSettings {
-    pub user_bg: Option<String>,
-    pub assistant_bg: Option<String>,
-    pub tool_bg: Option<String>,
+    /// The theme, as an opaque snapshot.
+    ///
+    /// The kernel and the host never look inside it: the UI plugin owns the
+    /// vocabulary, and the host only stores what it is handed. Keeping it
+    /// opaque is what lets a theme grow without the protocol growing with it.
+    pub theme: Option<serde_json::Value>,
     /// `auto` | `on` | `off`.
     pub mouse: Option<String>,
     pub no_color: Option<bool>,
@@ -723,6 +726,33 @@ mod tests {
         };
         let serialized = serde_json::to_string(&cmd).unwrap();
         assert!(serialized.contains("SubmitPrompt"));
+    }
+
+    #[test]
+    fn a_theme_survives_the_protocol_as_opaque_data() {
+        // The kernel never reads a theme: it is carried as-is, so the UI
+        // plugin can grow its vocabulary without the protocol growing.
+        let theme = serde_json::json!({
+            "pack": "default",
+            "overrides": { "tool": { "fg": "mustard" } }
+        });
+        let cmd = TuryaCommand::UpdateConfig {
+            permission_mode: None,
+            provider: None,
+            model: None,
+            max_steps: None,
+            max_tool_calls: None,
+            ui: Some(UiSettings {
+                theme: Some(theme.clone()),
+                ..Default::default()
+            }),
+        };
+        let serialized = serde_json::to_string(&cmd).unwrap();
+        let back: TuryaCommand = serde_json::from_str(&serialized).unwrap();
+        let TuryaCommand::UpdateConfig { ui, .. } = back else {
+            panic!("expected a settings update");
+        };
+        assert_eq!(ui.expect("ui").theme, Some(theme));
     }
 
     #[test]

@@ -420,16 +420,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut app = TuiApp::new_restoring();
-    // Presentation settings from the config file: tints are opt-in, and the
-    // mouse mode is `auto` unless the user pinned it.
-    app.apply_settings(
-        Some((
-            settings.user_bg.as_deref().unwrap_or("none"),
-            settings.assistant_bg.as_deref().unwrap_or("none"),
-            settings.tool_bg.as_deref().unwrap_or("none"),
-        )),
-        settings.mouse.as_deref(),
-    );
+    // Presentation settings from the config file: the theme is whatever the
+    // UI plugin last saved, and the mouse mode is `auto` unless the user
+    // pinned it.
+    app.apply_settings(settings.mouse.as_deref());
+    // The theme is stored as an opaque table: the host hands it over without
+    // reading it, and the UI plugin decides what it means.
+    if let Some(theme) = &settings.theme {
+        match config::theme_toml_to_json(theme) {
+            Ok(snapshot) => app.apply_theme(Some(&snapshot)),
+            Err(e) => eprintln!("Turya: cannot read the saved theme: {e}"),
+        }
+    }
     // The saved colour mode, resolved the same way the host resolves it, so a
     // restart keeps a `NO_COLOR` decision the user made with `/settings`.
     app.apply_color(settings.no_color);

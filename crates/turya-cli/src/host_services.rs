@@ -707,14 +707,13 @@ impl HostServices {
     /// never clears the slots the user did not mention.
     fn persist_ui_settings(&self, ui: &turya_protocol::UiSettings) {
         let (mut cfg, _) = crate::config::TuryaConfig::load(&self.config_path);
-        if let Some(v) = &ui.user_bg {
-            cfg.user_bg = Some(v.clone());
-        }
-        if let Some(v) = &ui.assistant_bg {
-            cfg.assistant_bg = Some(v.clone());
-        }
-        if let Some(v) = &ui.tool_bg {
-            cfg.tool_bg = Some(v.clone());
+        if let Some(v) = &ui.theme {
+            // The theme is opaque to the host: it stores what the UI plugin
+            // handed over and never looks inside it.
+            match crate::config::theme_json_to_toml(v) {
+                Ok(table) => cfg.theme = Some(table),
+                Err(e) => eprintln!("Turya: cannot save the theme: {e}"),
+            }
         }
         if let Some(v) = &ui.mouse {
             cfg.mouse = Some(v.clone());
@@ -1359,6 +1358,19 @@ mod tests {
         mpsc::Sender<TuryaEvent>,
         mpsc::Receiver<TuryaEvent>,
     ) {
+        let (host, tx, rx, _config) = harness_with_config(providers);
+        (host, tx, rx)
+    }
+
+    /// The same harness, with the path of the settings file it writes to.
+    fn harness_with_config(
+        providers: &[&str],
+    ) -> (
+        HostServices,
+        mpsc::Sender<TuryaEvent>,
+        mpsc::Receiver<TuryaEvent>,
+        String,
+    ) {
         let registry = Arc::new(ProviderRegistry::new());
         for id in providers {
             match *id {
@@ -1382,19 +1394,20 @@ mod tests {
             turya_protocol::PermissionMode::Open,
         ));
         let (tx, rx) = mpsc::channel(32);
+        let config = test_path("router-config.toml");
         let host = HostServices::new(
             registry,
             store,
             catalog,
             engine,
             HostPaths {
-                config: test_path("router-config.toml"),
+                config: config.clone(),
                 db: "/tmp/turya-host-router-test.db".to_string(),
             },
             Vec::new(),
             Arc::new(std::sync::Mutex::new(turya_mcp::McpRegistry::empty())),
         );
-        (host, tx, rx)
+        (host, tx, rx, config)
     }
 
     fn drain(rx: &mut mpsc::Receiver<TuryaEvent>) -> Vec<TuryaEvent> {
@@ -1506,6 +1519,37 @@ mod tests {
             e,
             TuryaEvent::Error { message } if message.contains("unknown provider")
         )));
+    }
+
+    #[tokio::test]
+    async fn a_theme_from_the_client_is_stored_as_it_is() {
+        let (host, tx, _rx, config) = harness_with_config(&["anthropic"]);
+        let sink = HostEventSink::new(tx);
+        let theme = serde_json::json!({
+            "pack": "default",
+            "overrides": { "tool": { "fg": "mustard" } }
+        });
+        host.handle(
+            &TuryaCommand::UpdateConfig {
+                permission_mode: None,
+                provider: None,
+                model: None,
+                max_steps: None,
+                max_tool_calls: None,
+                ui: Some(turya_protocol::UiSettings {
+                    theme: Some(theme.clone()),
+                    ..Default::default()
+                }),
+            },
+            &sink,
+        )
+        .await;
+        // The host stores the theme without reading it: what comes back is
+        // exactly what the client sent.
+        let (cfg, _) = crate::config::TuryaConfig::load(&config);
+        let stored = cfg.theme.expect("the theme is saved");
+        let back = crate::config::theme_toml_to_json(&stored).expect("readable");
+        assert_eq!(back, theme);
     }
 
     #[tokio::test]
