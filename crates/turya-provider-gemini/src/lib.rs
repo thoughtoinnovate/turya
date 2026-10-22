@@ -30,17 +30,25 @@ pub struct GeminiProvider {
     effort: std::sync::RwLock<Option<String>>,
 }
 
-/// Thinking budgets for each effort level. A fixed scale, documented here
-/// because it *is* a choice: `0` disables thinking, and the top of the range
-/// is deliberately bounded so a "high" request cannot stall a long turn.
-const EFFORT_BUDGETS: [(&str, i64); 3] = [("low", 1024), ("medium", 8192), ("high", 24576)];
+/// The level the API gets when the user set none. Verified against the
+/// live endpoint: `thinkingLevel: "low"` cuts a trivial prompt's
+/// time-to-first-token from tens of seconds (the model's untamed default)
+/// to under a second, without hiding the user's `/efforts` choice.
+const DEFAULT_THINKING: &str = "low";
 
-/// Map an effort level to a thinking-token budget.
-pub fn thinking_budget(level: &str) -> Option<i64> {
-    EFFORT_BUDGETS
+/// Map a `/efforts` level to Gemini's `thinkingLevel` wire value.
+/// Verified against the live endpoint: `low`, `medium`, `high` and
+/// `minimal` are accepted; `none` and `dynamic` are rejected with 400.
+/// An unknown level is not guessed.
+pub fn thinking_level(level: &str) -> Option<&'static str> {
+    ["low", "medium", "high"]
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(level))
-        .map(|(_, budget)| *budget)
+        .find(|name| name.eq_ignore_ascii_case(level))
+        .map(|n| match &**n {
+            "low" => "low",
+            "medium" => "medium",
+            _ => "high",
+        })
 }
 
 impl GeminiProvider {
@@ -143,12 +151,21 @@ impl GeminiProvider {
             "contents": contents,
             "tools": [{"functionDeclarations": Self::function_declarations(tools)}],
         });
-        let effort = self.effort.read().unwrap().clone();
-        if let Some(budget) = effort.as_deref().and_then(thinking_budget) {
-            body["generationConfig"] = json!({
-                "thinkingConfig": { "thinkingBudget": budget }
-            });
-        }
+        // Thinking is always configured: the gemini-3 family thinks for
+        // tens of seconds by default (an entirely server-side delay —
+        // streaming, transports and small prompts all measure fine), so
+        // sending the level explicitly is the difference between a turn
+        // that starts in under a second and one that stares at "working".
+        let level = self
+            .effort
+            .read()
+            .unwrap()
+            .as_deref()
+            .and_then(thinking_level)
+            .unwrap_or(DEFAULT_THINKING);
+        body["generationConfig"] = json!({
+            "thinkingConfig": { "thinkingLevel": level }
+        });
         body
     }
 
@@ -389,13 +406,19 @@ impl ProviderPlugin for GeminiPlugin {
 
     fn models(&self) -> Vec<ModelInfo> {
         // Curated static fallback (live discovery unions over this in STEP 4).
-        ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"]
-            .into_iter()
-            .map(|id| ModelInfo {
-                id: id.to_string(),
-                display_name: id.to_string(),
-            })
-            .collect()
+        // 2.x family is retired for new API keys (404); the current
+        // generate-capable family is 3.x (probe-checked 2026-10-20).
+        [
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+        ]
+        .into_iter()
+        .map(|id| ModelInfo {
+            id: id.to_string(),
+            display_name: id.to_string(),
+        })
+        .collect()
     }
 
     fn auth_methods(&self) -> Vec<AuthMethodKind> {
@@ -698,41 +721,46 @@ mod tests {
         assert_eq!(bearer.as_deref(), Some("Bearer ya29.test"));
     }
     #[test]
-    fn effort_levels_map_to_thinking_budgets() {
-        assert_eq!(thinking_budget("low"), Some(1024));
-        assert_eq!(thinking_budget("MEDIUM"), Some(8192));
-        assert_eq!(thinking_budget("high"), Some(24576));
+    fn effort_levels_map_to_thinking_levels() {
+        assert_eq!(thinking_level("low"), Some("low"));
+        assert_eq!(thinking_level("MEDIUM"), Some("medium"));
+        assert_eq!(thinking_level("high"), Some("high"));
         assert_eq!(
-            thinking_budget("extreme"),
+            thinking_level("extreme"),
             None,
             "unknown level is not guessed"
         );
     }
 
     #[test]
-    fn setting_an_effort_changes_the_request() {
+    fn thinking_is_configured_on_every_request() {
         let provider = GeminiProvider::new("k".to_string(), "m".to_string());
         let mut t = Transcript::new("s");
         t.push(turya_protocol::Part::UserText {
             text: "hi".to_string(),
         });
-        let plain = provider.request_body(&t, &[]);
-        assert!(
-            plain.get("generationConfig").is_none(),
-            "no effort means the provider default"
+
+        // No /efforts yet: the fast default, not the model's own
+        // tens-of-seconds scheme.
+        let body = provider.request_body(&t, &[]);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            DEFAULT_THINKING
         );
 
         provider.set_effort(Some("high".to_string()));
-        let thinking = provider.request_body(&t, &[]);
+        let body = provider.request_body(&t, &[]);
         assert_eq!(
-            thinking["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            24576
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
         );
 
+        // Explicit none: back to the fast default, never an unset body.
         provider.set_effort(None);
-        assert!(provider
-            .request_body(&t, &[])
-            .get("generationConfig")
-            .is_none());
+        let body = provider.request_body(&t, &[]);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            DEFAULT_THINKING
+        );
     }
 }
