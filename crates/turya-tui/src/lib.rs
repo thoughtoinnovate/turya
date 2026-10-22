@@ -1,12 +1,11 @@
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -28,9 +27,12 @@ pub mod flows;
 
 mod scroll;
 
+mod input;
+
 mod theme;
 
 use flows::{AuthFlow, AuthStage, BrowserFlow, BrowserMode, Flow};
+use input::{drain_batch, Squashed, WHEEL_LINES};
 use scroll::Viewport;
 use slash::{Completer, SlashRegistry};
 use theme::{Palette, Theme, Voice};
@@ -139,9 +141,6 @@ struct StoredOutput {
 /// Bound the retained full text: expansion is for reading, not paging
 /// megabytes through the transcript.
 const MAX_STORED_OUTPUT_CHARS: usize = 4000;
-/// Wrapped lines per wheel notch. Three reads as "a real scroll" without
-/// overshooting a short transcript.
-const WHEEL_LINES: usize = 3;
 /// Bound the retained entries: old outputs age out, newest survive.
 const MAX_OUTPUT_ENTRIES: usize = 20;
 
@@ -1027,10 +1026,25 @@ impl TuiApp {
             MouseEventKind::ScrollDown => WHEEL_LINES as i32,
             _ => return,
         };
-        // A flow owns the keyboard, so it owns the wheel too: scroll its
-        // list rather than the transcript behind the popup.
+        self.on_wheel_delta(delta);
+    }
+
+    /// Move the view by a wheel run: a squashed drag is one call with a
+    /// summed delta, so fifty notches cost one move, not fifty.
+    ///
+    /// A flow owns the keyboard, so it owns the wheel too: scroll its list
+    /// rather than the transcript behind the popup — one notch, one
+    /// selection step, a run of notches stepwise (the same outcome as the
+    /// unsquashed sequence, minus the intermediate renders).
+    fn on_wheel_delta(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
         if !matches!(self.flow, Flow::None) {
-            self.flow_scroll(delta);
+            let step = if delta < 0 { -1 } else { 1 };
+            for _ in 0..delta.unsigned_abs() {
+                self.flow_scroll(step);
+            }
             return;
         }
         self.scroll_by(delta);
@@ -2721,9 +2735,14 @@ impl TuiApp {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        let mut reader = EventStream::new();
-        // Spinner clock: the loop redraws every iteration, so advancing the
-        // frame here animates the top bar (~8fps) with negligible cost.
+        // Terminal input arrives on a dedicated reader thread and is batched:
+        // one loop iteration handles EVERY event the terminal queued, then
+        // redraws once. A drag is one viewport move, not one frame per notch,
+        // and keys typed mid-drag land on the next frame instead of waiting
+        // behind a replay of scrolling.
+        let (mut input_rx, input_stop) = input::spawn_reader();
+        // Spinner clock: advancing the frame here animates the top bar
+        // (~8fps) with negligible cost.
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
 
         // Ask the host for the current selection so the status bar shows
@@ -2731,200 +2750,14 @@ impl TuiApp {
         let _ = cmd_tx.send(TuryaCommand::GetProviderState).await;
 
         loop {
-            terminal.draw(|f| {
-                self.render(f);
-            })?;
-
             tokio::select! {
-                Some(Ok(event)) = reader.next() => {
-                    if let Event::Mouse(mouse) = event {
-                        // Wheel events route to whatever has focus: a popup
-                        // scrolls its own list, otherwise the transcript does.
-                        self.on_mouse(mouse);
-                        continue;
-                    }
-                    if let Event::Key(key) = event {
-                        // Explicit quit wins everywhere (modal, flow, completer).
-                        if is_quit_key(&key) {
-                            break;
-                        }
-                        // Esc never quits: it unwinds UI state, then stops
-                        // the running turn. Permission modals must be answered.
-                        if key.code == KeyCode::Esc {
-                            match self.esc_action() {
-                                EscAction::CloseCompleter => {
-                                    self.completer = None;
-                                    continue;
-                                }
-                                EscAction::CloseFlow => {
-                                    self.handle_flow_key(KeyCode::Esc, &cmd_tx).await;
-                                    continue;
-                                }
-                                EscAction::Ignore => continue,
-                                EscAction::AbortTurn => {
-                                    let _ = cmd_tx.send(TuryaCommand::AbortTurn).await;
-                                    continue;
-                                }
-                            }
-                        }
-                        if let Some(pending) = self.pending_permission.take() {
-                            match key.code {
-                                KeyCode::Char('y') => {
-                                    let _ = cmd_tx.send(TuryaCommand::ResolvePermission {
-                                        request_id: pending.request_id,
-                                        decision: PermissionDecision::AllowOnce,
-                                    }).await;
-                                }
-                                KeyCode::Char('n') => {
-                                    let _ = cmd_tx.send(TuryaCommand::ResolvePermission {
-                                        request_id: pending.request_id,
-                                        decision: PermissionDecision::Deny,
-                                    }).await;
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-
-                        match key.code {
-                            // Open flows own the keyboard (except permission modals above).
-                            _ if !matches!(self.flow, Flow::None) => {
-                                self.handle_flow_key(key.code, &cmd_tx).await;
-                                continue;
-                            }
-                            // Slash-command session: route keys through the completer.
-                            _ if self.completer.is_some() => {
-                                let comp = self.completer.as_mut().unwrap();
-                                let matches = comp.matches(&self.input, &self.registry);
-                                match key.code {
-                                    KeyCode::Char(c) => {
-                                        self.input.push(c);
-                                        comp.reset();
-                                    }
-                                    KeyCode::Backspace => {
-                                        self.input.pop();
-                                        if self.input.is_empty() {
-                                            self.completer = None;
-                                        } else {
-                                            comp.reset();
-                                        }
-                                    }
-                                    KeyCode::Up => comp.move_selection(-1, matches.len()),
-                                    KeyCode::Down | KeyCode::Tab => {
-                                        comp.move_selection(1, matches.len())
-                                    }
-                                    KeyCode::Enter => {
-                                        // Bare "/" keeps legacy behavior: submit as prompt.
-                                        if self.input.trim() == "/" {
-                                            self.completer = None;
-                                            let prompt = std::mem::take(&mut self.input);
-                                            self.submit_prompt(prompt, &cmd_tx).await;
-                                        } else if let Some((name, args)) =
-                                            slash::dispatch_completion(
-                                                &self.input,
-                                                &matches,
-                                                comp.selected,
-                                            )
-                                        {
-                                            self.completer = None;
-                                            self.input.clear();
-                                            self.dispatch_slash(&name, &args, &cmd_tx).await;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                continue;
-                            }
-                            KeyCode::Char('/') if self.input.is_empty() => {
-                                self.completer = Some(Completer::new());
-                                self.input.push('/');
-                            }
-                            // Ctrl+E expands the last truncated tool output.
-                            // Checked before the generic Char arm; quit keys
-                            // (Ctrl+C/D) are handled far above, no conflict.
-                            KeyCode::Char(c)
-                                if (c == 'e' || c == 'E')
-                                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                self.expand_last_output();
-                            }
-                            // `@` opens a file picker in place. This is the
-                            // attachment method that works everywhere:
-                            // clipboard image paste fails over SSH, in some
-                            // Windows terminals and under some tmux setups,
-                            // but a path on disk is just a path.
-                            KeyCode::Char('@') => {
-                                self.input.push('@');
-                                self.on_input_edited();
-                                self.refresh_at_completer();
-                            }
-                            KeyCode::Tab if self.at_completer.is_some() => {
-                                self.accept_at_completion();
-                            }
-                            KeyCode::Backspace if self.at_completer.is_some() => {
-                                self.input.pop();
-                                self.on_input_edited();
-                                if self.input.ends_with('@') {
-                                    self.at_completer = None;
-                                } else {
-                                    self.refresh_at_completer();
-                                }
-                            }
-                            KeyCode::Esc if self.at_completer.is_some() => {
-                                self.at_completer = None;
-                                continue;
-                            }
-                            KeyCode::Enter if self.at_completer.is_some() => {
-                                // Enter with the picker open attaches the
-                                // highlighted file and keeps editing, rather
-                                // than submitting a half-typed @word.
-                                self.accept_at_completion();
-                                continue;
-                            }
-                            KeyCode::Up if self.at_completer.is_some() => {
-                                self.move_at_selection(-1);
-                                continue;
-                            }
-                            KeyCode::Down if self.at_completer.is_some() => {
-                                self.move_at_selection(1);
-                                continue;
-                            }
-                            KeyCode::Char(c) => {
-                                self.input.push(c);
-                                self.on_input_edited();
-                                if self.at_completer.is_some() {
-                                    self.refresh_at_completer();
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                self.input.pop();
-                                self.on_input_edited();
-                            }
-                            KeyCode::PageUp => self.scroll_up(),
-                            KeyCode::PageDown => self.scroll_down(),
-                            KeyCode::End => self.scroll_to_bottom(),
-                            // Readline-style prompt recall, only when the
-                            // input owns the arrow keys (no flow, no
-                            // completer), so the browsers keep theirs.
-                            KeyCode::Up if self.input_owns_arrows() => {
-                                self.recall_older();
-                            }
-                            KeyCode::Down if self.input_owns_arrows() => {
-                                self.recall_newer();
-                            }
-                            // Alt+Enter inserts a newline (multiline draft);
-                            // most terminals deliver it as Enter+ALT.
-                            KeyCode::Enter
-                                if key.modifiers.contains(KeyModifiers::ALT) =>
-                            {
-                                self.input.push('\n');
-                            }
-                            KeyCode::Enter if !self.input.trim().is_empty() => {
-                                let prompt = std::mem::take(&mut self.input);
-                                self.submit_prompt(prompt, &cmd_tx).await;
-                            }
-                            _ => {}
-                        }
+                Some(event) = input_rx.recv() => {
+                    // Every key and wheel notch queued this instant, one
+                    // frame. Wheel runs are further squashed into single
+                    // viewport moves (see input::squash).
+                    let batch = drain_batch(event, &mut input_rx);
+                    if self.apply_input(batch, &cmd_tx).await {
+                        break;
                     }
                 }
                 Some(evt) = event_rx.recv() => {
@@ -2942,7 +2775,18 @@ impl TuiApp {
                     self.spin_tick = self.spin_tick.wrapping_add(1);
                 }
             }
+
+            // One frame per batch of work, never per event: the draw after
+            // the select is the loop's only paint.
+            terminal.draw(|f| {
+                self.render(f);
+            })?;
         }
+
+        // Stop the input thread so it cannot outlive the TUI by more than
+        // one poll interval; the channel the reader pushes into is closed
+        // on run's exit either way.
+        input_stop.store(true, std::sync::atomic::Ordering::Relaxed);
 
         if self.mouse_enabled() {
             let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
@@ -2950,6 +2794,207 @@ impl TuiApp {
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         Ok(())
+    }
+
+    /// Dispatch one squashed input batch: wheel runs become single viewport
+    /// moves, keys route through `on_key` in order. Returns true to quit.
+    async fn apply_input(
+        &mut self,
+        batch: Vec<Event>,
+        cmd_tx: &mpsc::Sender<TuryaCommand>,
+    ) -> bool {
+        for squashed in input::squash(batch) {
+            match squashed {
+                Squashed::Wheel(delta) => self.on_wheel_delta(delta),
+                Squashed::Other(Event::Key(key)) => {
+                    if self.on_key(&key, cmd_tx).await {
+                        return true;
+                    }
+                }
+                // Clicks and drags reach the wheel filter, which drops them
+                // (see `on_mouse`): the terminal's own text selection wins.
+                Squashed::Other(Event::Mouse(mouse)) => self.on_mouse(mouse),
+                // Resize, focus and paste stay ignored, as before.
+                Squashed::Other(_) => {}
+            }
+        }
+        false
+    }
+
+    /// Handle one key press. `bool` = quit the session (the explicit quit
+    /// keys win everywhere: modal, flow, completer).
+    async fn on_key(&mut self, key: &KeyEvent, cmd_tx: &mpsc::Sender<TuryaCommand>) -> bool {
+        // Explicit quit wins everywhere (modal, flow, completer).
+        if is_quit_key(key) {
+            return true;
+        }
+        // Esc never quits: it unwinds UI state, then stops the running
+        // turn. Permission modals must be answered.
+        if key.code == KeyCode::Esc {
+            match self.esc_action() {
+                EscAction::CloseCompleter => {
+                    self.completer = None;
+                    return false;
+                }
+                EscAction::CloseFlow => {
+                    self.handle_flow_key(KeyCode::Esc, cmd_tx).await;
+                    return false;
+                }
+                EscAction::Ignore => return false,
+                EscAction::AbortTurn => {
+                    let _ = cmd_tx.send(TuryaCommand::AbortTurn).await;
+                    return false;
+                }
+            }
+        }
+        if let Some(pending) = self.pending_permission.take() {
+            match key.code {
+                KeyCode::Char('y') => {
+                    let _ = cmd_tx
+                        .send(TuryaCommand::ResolvePermission {
+                            request_id: pending.request_id,
+                            decision: PermissionDecision::AllowOnce,
+                        })
+                        .await;
+                }
+                KeyCode::Char('n') => {
+                    let _ = cmd_tx
+                        .send(TuryaCommand::ResolvePermission {
+                            request_id: pending.request_id,
+                            decision: PermissionDecision::Deny,
+                        })
+                        .await;
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        match key.code {
+            // Open flows own the keyboard (except permission modals above).
+            _ if !matches!(self.flow, Flow::None) => {
+                self.handle_flow_key(key.code, cmd_tx).await;
+            }
+            // Slash-command session: route keys through the completer.
+            _ if self.completer.is_some() => {
+                let comp = self.completer.as_mut().unwrap();
+                let matches = comp.matches(&self.input, &self.registry);
+                match key.code {
+                    KeyCode::Char(c) => {
+                        self.input.push(c);
+                        comp.reset();
+                    }
+                    KeyCode::Backspace => {
+                        self.input.pop();
+                        if self.input.is_empty() {
+                            self.completer = None;
+                        } else {
+                            comp.reset();
+                        }
+                    }
+                    KeyCode::Up => comp.move_selection(-1, matches.len()),
+                    KeyCode::Down | KeyCode::Tab => comp.move_selection(1, matches.len()),
+                    KeyCode::Enter => {
+                        // Bare "/" keeps legacy behavior: submit as prompt.
+                        if self.input.trim() == "/" {
+                            self.completer = None;
+                            let prompt = std::mem::take(&mut self.input);
+                            self.submit_prompt(prompt, cmd_tx).await;
+                        } else if let Some((name, args)) =
+                            slash::dispatch_completion(&self.input, &matches, comp.selected)
+                        {
+                            self.completer = None;
+                            self.input.clear();
+                            self.dispatch_slash(&name, &args, cmd_tx).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            KeyCode::Char('/') if self.input.is_empty() => {
+                self.completer = Some(Completer::new());
+                self.input.push('/');
+            }
+            // Ctrl+E expands the last truncated tool output.
+            // Checked before the generic Char arm; quit keys
+            // (Ctrl+C/D) are handled far above, no conflict.
+            KeyCode::Char(c)
+                if (c == 'e' || c == 'E') && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.expand_last_output();
+            }
+            // `@` opens a file picker in place. This is the
+            // attachment method that works everywhere:
+            // clipboard image paste fails over SSH, in some
+            // Windows terminals and under some tmux setups,
+            // but a path on disk is just a path.
+            KeyCode::Char('@') => {
+                self.input.push('@');
+                self.on_input_edited();
+                self.refresh_at_completer();
+            }
+            KeyCode::Tab if self.at_completer.is_some() => {
+                self.accept_at_completion();
+            }
+            KeyCode::Backspace if self.at_completer.is_some() => {
+                self.input.pop();
+                self.on_input_edited();
+                if self.input.ends_with('@') {
+                    self.at_completer = None;
+                } else {
+                    self.refresh_at_completer();
+                }
+            }
+            KeyCode::Esc if self.at_completer.is_some() => {
+                self.at_completer = None;
+            }
+            KeyCode::Enter if self.at_completer.is_some() => {
+                // Enter with the picker open attaches the
+                // highlighted file and keeps editing, rather
+                // than submitting a half-typed @word.
+                self.accept_at_completion();
+            }
+            KeyCode::Up if self.at_completer.is_some() => {
+                self.move_at_selection(-1);
+            }
+            KeyCode::Down if self.at_completer.is_some() => {
+                self.move_at_selection(1);
+            }
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                self.on_input_edited();
+                if self.at_completer.is_some() {
+                    self.refresh_at_completer();
+                }
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+                self.on_input_edited();
+            }
+            KeyCode::PageUp => self.scroll_up(),
+            KeyCode::PageDown => self.scroll_down(),
+            KeyCode::End => self.scroll_to_bottom(),
+            // Readline-style prompt recall, only when the
+            // input owns the arrow keys (no flow, no
+            // completer), so the browsers keep theirs.
+            KeyCode::Up if self.input_owns_arrows() => {
+                self.recall_older();
+            }
+            KeyCode::Down if self.input_owns_arrows() => {
+                self.recall_newer();
+            }
+            // Alt+Enter inserts a newline (multiline draft);
+            // most terminals deliver it as Enter+ALT.
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.input.push('\n');
+            }
+            KeyCode::Enter if !self.input.trim().is_empty() => {
+                let prompt = std::mem::take(&mut self.input);
+                self.submit_prompt(prompt, cmd_tx).await;
+            }
+            _ => {}
+        }
+        false
     }
 }
 
@@ -4174,6 +4219,33 @@ mod tests {
         // Scrolling past the bottom is a no-op, never a wrap or a panic.
         app.on_mouse(mouse(MouseEventKind::ScrollDown));
         assert_eq!(app.viewport.lines_up(), 0);
+    }
+
+    #[test]
+    fn a_squashed_drag_is_one_move_and_the_key_still_lands() {
+        // The end-to-end shape of the batched loop: twenty wheel notches of
+        // a drag plus a key typed mid-drag are ONE input batch. The drag
+        // collapses to a single viewport move and the keystroke is not
+        // trapped behind a notch-by-notch replay.
+        let mut app = TuiApp::new();
+        for i in 0..200 {
+            app.log_line(format!("line {i:04}"));
+        }
+        let _ = rendered(&mut app, 80, 10);
+        app.scroll_to_bottom();
+        let events: Vec<Event> = std::iter::repeat_n(mouse(MouseEventKind::ScrollUp), 20)
+            .map(Event::Mouse)
+            .chain(std::iter::once(Event::Key(KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::NONE,
+            ))))
+            .collect();
+        let (tx, _rx) = mpsc::channel(1);
+        futures::executor::block_on(app.apply_input(events, &tx));
+        assert_eq!(app.input, "h", "the mid-drag keystroke is not lost");
+        // Twenty notches × WHEEL_LINES, in a single move: not twenty
+        // separate steps replayed from a queue.
+        assert_eq!(app.viewport.lines_up(), 20 * WHEEL_LINES);
     }
 
     #[test]

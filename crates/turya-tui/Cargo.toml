@@ -1,13 +1,13 @@
 [package]
 name = "turya-tui"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 
 [dependencies]
 turya-protocol = { path = "../turya-protocol" }
 turya-image = { path = "../turya-image" }
 ratatui = "0.28"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = "0.28"
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }

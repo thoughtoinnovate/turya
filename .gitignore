@@ -10,3 +10,6 @@ credentials.json
 *.key
 *.log
 .DS_Store
+# Agent session scratch (plans, opencode state)
+.opencode/
+.plans/
