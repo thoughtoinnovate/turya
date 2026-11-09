@@ -1175,7 +1175,9 @@ impl TuiApp {
         self.viewport.scroll(10);
     }
 
-    /// Scroll by a signed number of wrapped lines (wheel and Shift+arrows).
+    /// Scroll by a signed number of wrapped lines. The wheel path (a
+    /// squashed drag) and dashed keyboard steps (PageUp/PageDown) both
+    /// land here; Shift+arrows belong to prompt recall, not scroll.
     fn scroll_by(&mut self, delta: i32) {
         self.viewport.scroll(delta);
     }
@@ -1599,9 +1601,9 @@ impl TuiApp {
                                             self.log_dim(format!(
                                                 "→ mouse = {m} ({})",
                                                 if self.mouse_enabled() {
-                                                    "captured on this terminal"
+                                                    "captured: wheel scrolls; Shift selects where the terminal allows it"
                                                 } else {
-                                                    "not captured here"
+                                                    "free: select & copy with the mouse; scroll with PageUp/PageDown"
                                                 }
                                             ));
                                         }
@@ -2725,10 +2727,16 @@ impl TuiApp {
         enable_raw_mode()?;
         let mut stdout = stdout();
         // Mouse capture is opt-out: wheel scrolling is what people expect in
-        // 2026, but it also disables the terminal's own text selection. Where
-        // capture is unreliable (tmux/screen without mouse mode) it is worse
-        // than nothing, so we probe and can be turned off in /settings.
-        if self.mouse_enabled() {
+        // 2026, but it also disables the terminal's own text selection — the
+        // one thing you cannot get back while captured (walking back: hold
+        // Shift to select where the terminal allows it). Where capture is
+        // unreliable (tmux/screen without mouse mode) it is worse than
+        // nothing, so we probe and it can be changed in /settings.
+        // `captured` mirrors what the terminal was last told, so a
+        // mid-session `/settings mouse` flips capture live, not at the
+        // next restart.
+        let mut captured = self.mouse_enabled();
+        if captured {
             execute!(stdout, EnableMouseCapture)?;
         }
         execute!(stdout, EnterAlternateScreen)?;
@@ -2776,6 +2784,19 @@ impl TuiApp {
                 }
             }
 
+            // A mid-session /settings mouse flip applies now, not at the
+            // next restart: reconcile what the terminal was last told with
+            // what the user just asked for.
+            let want = self.mouse_enabled();
+            if want != captured {
+                if want {
+                    execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                } else {
+                    execute!(terminal.backend_mut(), DisableMouseCapture)?;
+                }
+                captured = want;
+            }
+
             // One frame per batch of work, never per event: the draw after
             // the select is the loop's only paint.
             terminal.draw(|f| {
@@ -2788,7 +2809,7 @@ impl TuiApp {
         // on run's exit either way.
         input_stop.store(true, std::sync::atomic::Ordering::Relaxed);
 
-        if self.mouse_enabled() {
+        if captured {
             let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
         }
         disable_raw_mode()?;
