@@ -15,6 +15,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io::{stdout, Write};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use turya_protocol::{
     AgentMode, Attachment, Part, PermissionDecision, PermissionMode, RiskLevel, Transcript,
@@ -262,6 +263,52 @@ fn extract_command(details: &str) -> Option<String> {
     None
 }
 
+/// The one wrap the whole chat subsystem agrees on. The row-offset model
+/// counts these rows, the pane paints exactly these rows, and the copy
+/// slices exactly these rows — so a press maps to the row the pointer is
+/// over, the highlight is on that row, and the copied text is what the
+/// highlight crossed.
+///
+/// Word-preferential: an overflowing run breaks at its last space so words
+/// survive, spaces are kept (the space trails the row) so a copied
+/// selection stays true to the text, and a word longer than the pane still
+/// hard-breaks on the width column. Character = cell everywhere.
+fn wrap_rows(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let mut cur = String::new();
+        let mut last_space: Option<usize> = None;
+        for ch in line.chars() {
+            if cur.chars().count() == width {
+                match last_space {
+                    Some(sp) => {
+                        let head: String = cur.chars().take(sp + 1).collect();
+                        cur = cur.chars().skip(sp + 1).collect();
+                        rows.push(head);
+                        last_space = None;
+                    }
+                    None => rows.push(std::mem::take(&mut cur)),
+                }
+            }
+            if ch == ' ' {
+                last_space = Some(cur.chars().count());
+            }
+            cur.push(ch);
+        }
+        rows.push(cur);
+    }
+    rows
+}
+
+/// A transcript line that is pure decoration: every character is a rule
+/// glyph. Separators are not content — selection skips them so a copied
+/// match never carries wall decorations, and the highlight shows exactly
+/// that by not reversing them either.
+fn is_rule_line(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| matches!(c, '─' | '━' | '═' | '—'))
+}
+
 /// Character-cell wrap for prompt rows. Controls the exact row split so the
 /// height and the pixels agree without relying on ratatui's unstable
 /// `line_count`.
@@ -486,6 +533,13 @@ pub struct TuiApp {
     /// Where the chat pane placed its cells the last frame: the one mapping
     /// mouse screen coordinates are meaningful through.
     chat_geometry: ChatGeometry,
+    /// A press that landed on the pane's blank bottom-alignment rows. It
+    /// owns nothing yet; the moment its drag crosses text the selection
+    /// anchors there. Released without ever meeting text: a plain click.
+    mouse_pending: bool,
+    /// Transient status-bar toast: (message, raised at). Renders on the
+    /// identity bar and self-clears after the TTL — never a transcript row.
+    notice: Option<(String, Instant)>,
     /// Wrapped-row start offsets for each transcript line, cached by width.
     row_offsets: Vec<usize>,
     /// Width the cached row offsets were computed for.
@@ -554,6 +608,8 @@ impl TuiApp {
             mouse_selection: None,
             clipboard_out: None,
             chat_geometry: ChatGeometry::EMPTY,
+            mouse_pending: false,
+            notice: None,
             row_offsets: Vec::new(),
             row_offsets_width: 0,
             row_offsets_dirty_from: Some(0),
@@ -605,6 +661,28 @@ impl TuiApp {
         self.transcript.push(TLine::new(line, true, Voice::System));
         self.invalidate_row_offsets_from(self.transcript.len().saturating_sub(1));
     }
+
+    /// Raise a transient status-bar toast and let the 120ms ticker retire
+    /// it — nothing is appended to the transcript, so quiet notices cannot
+    /// pile up on the scrolling wall (and cannot end up in a selection).
+    fn toast(&mut self, msg: impl Into<String>) {
+        self.notice = Some((msg.into(), Instant::now()));
+    }
+
+    /// Expire a raised notice. Called from render, where the 120ms ticker
+    /// guarantees a frame arrives shortly after the deadline even while
+    /// the user is not touching anything.
+    fn expire_notice(&mut self) {
+        let dead = self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > Self::NOTICE_TTL);
+        if dead {
+            self.notice = None;
+        }
+    }
+
+    const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
     /// Append a (possibly multi-line) block, preserving blank lines so
     /// rendering matches the old plain-string transcript exactly.
@@ -1002,9 +1080,7 @@ impl TuiApp {
         }
         let mut acc = self.row_offsets.last().copied().unwrap_or(0);
         for line in &self.transcript[from..] {
-            let n = line.text.chars().count();
-            let h = if n == 0 { 1 } else { n.div_ceil(width.max(1)) };
-            acc += h;
+            acc += wrap_rows(&line.text, width).len().max(1);
             self.row_offsets.push(acc);
         }
         self.row_offsets_dirty_from = None;
@@ -1042,23 +1118,33 @@ impl TuiApp {
             MouseEventKind::ScrollUp => self.on_wheel_delta(-(WHEEL_LINES as i32)),
             MouseEventKind::ScrollDown => self.on_wheel_delta(WHEEL_LINES as i32),
             // Press sets the anchor; popups keep owning clicks, never the
-            // transcript behind them.
+            // transcript behind them. On the blank bottom-alignment rows the
+            // press only arms pending: real text has not been reached.
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                match self.chat_cell(mouse.column, mouse.row) {
-                    Some(cell) => self.mouse_selection = Some(MouseSelection::from(cell)),
-                    None => self.mouse_selection = None,
-                }
+                // Press sets the anchor; popups keep owning clicks, never the
+                // transcript behind them. On the blank bottom-alignment rows
+                // the press only arms pending: real text has not been reached.
+                let cell = self.chat_cell(mouse.column, mouse.row);
+                self.mouse_pending = cell.is_none();
+                self.mouse_selection = cell.map(MouseSelection::from);
             }
-            // Drag moves the head.
+            // Drag moves the head; a drag that enters text after arming on
+            // blank rows anchors the selection at that first met cell.
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
                 let cell = self.chat_cell(mouse.column, mouse.row);
                 if let (Some(sel), Some(cell)) = (self.mouse_selection.as_mut(), cell) {
                     sel.head = cell;
+                } else if self.mouse_pending {
+                    if let Some(cell) = self.chat_cell(mouse.column, mouse.row) {
+                        self.mouse_selection = Some(MouseSelection::from(cell));
+                        self.mouse_pending = false;
+                    }
                 }
             }
             // Release finalises: copy the covered text through the loop's
             // OSC 52 pass. A zero-width drag (a plain click) clears instead.
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                self.mouse_pending = false;
                 let Some(sel) = &self.mouse_selection else {
                     return;
                 };
@@ -1070,7 +1156,7 @@ impl TuiApp {
                 if !text.is_empty() {
                     let n = text.chars().count();
                     self.clipboard_out = Some(selection::osc52(&text));
-                    self.log_dim(format!("→ copied {n} chars to the clipboard"));
+                    self.toast(format!("→ copied {n} chars to the clipboard"));
                 }
             }
             // The rest stays inert: the terminal's own selection machinery
@@ -1100,7 +1186,14 @@ impl TuiApp {
             return None;
         }
         let total = self.row_offsets.last().copied().unwrap_or(0).max(1);
-        let abs = (g.off + (row - g.y) as usize).min(total.saturating_sub(1));
+        // The bottom-aligned blank rows above the text hold no word: presses
+        // there select nothing directly — the pending flag arms so a drag
+        // that later crosses text still selects from where text begins.
+        let depth = (row - g.y) as usize;
+        if depth < g.padding {
+            return None;
+        }
+        let abs = (g.off + depth - g.padding).min(total.saturating_sub(1));
         Some((abs, (column - g.x) as usize))
     }
 
@@ -1127,11 +1220,12 @@ impl TuiApp {
             .min(self.transcript.len().saturating_sub(1));
 
         for i in line_lo..=line_hi {
-            let chars: Vec<char> = self.transcript[i].text.chars().collect();
-            let mut rows: Vec<String> = chars.chunks(w).map(|c| c.iter().collect()).collect();
-            if rows.is_empty() {
-                rows.push(String::new());
+            // Separators are decoration, not sentences: a selection may
+            // cross them, the copy pretends they do not exist.
+            if is_rule_line(&self.transcript[i].text) {
+                continue;
             }
+            let rows = wrap_rows(&self.transcript[i].text, w);
             let line_end = self.row_offsets[i + 1];
             for (k, row_text) in rows.iter().enumerate() {
                 let abs = self.row_offsets[i] + k;
@@ -2654,6 +2748,13 @@ impl TuiApp {
         let total = self.row_offsets.last().copied().unwrap_or(0).max(1);
         let max_off = total.saturating_sub(inner_h);
         let off = self.viewport.update(max_off);
+        // Bottom-align short output so it sits just above the prompt box
+        // instead of floating at the top of a tall pane. Only while following.
+        let padding = if self.viewport.is_following() && off == 0 && total < inner_h {
+            inner_h - total
+        } else {
+            0
+        };
         // Publish where the visible rows live this frame: mouse events map
         // through nothing else.
         self.chat_geometry = ChatGeometry {
@@ -2662,15 +2763,13 @@ impl TuiApp {
             width: chunks[0].width.saturating_sub(2),
             height: chunks[0].height.saturating_sub(2),
             off,
-        };
-        // Bottom-align short output so it sits just above the prompt box
-        // instead of floating at the top of a tall pane. Only while following.
-        let padding = if self.viewport.is_following() && off == 0 && total < inner_h {
-            inner_h - total
-        } else {
-            0
+            padding,
         };
         // Render only the visible window instead of the whole transcript.
+        // Every line is painted PRE-WRAPPED by `wrap_rows` — the same rows
+        // the model counted — so ratatui never re-wraps and the painted
+        // layout equals the model rows: press maps to the row the pointer
+        // is over, highlight and copy agree with what is on screen.
         let mut chat_lines: Vec<Line<'_>> = Vec::with_capacity(inner_h + 2);
         let mut top_partial = 0usize;
         if !self.transcript.is_empty() {
@@ -2683,27 +2782,28 @@ impl TuiApp {
                     .min(self.transcript.len().saturating_sub(1));
             }
             top_partial = off.saturating_sub(self.row_offsets[start]);
+            let (sel_lo, sel_hi) = self
+                .mouse_selection
+                .as_ref()
+                .map(|s| s.rows())
+                .unwrap_or((usize::MAX, 0));
             let mut rows = 0usize;
             for i in start..self.transcript.len() {
                 let tline = &self.transcript[i];
-                let mut style = self.voice_style(tline.role, tline.dim);
-                // Selection highlight, whole lines: the copy path is exact
-                // in rows and columns, the paint marks what was crossed.
-                if let Some(sel) = &self.mouse_selection {
-                    let first = self.row_offsets[i];
-                    let last = self.row_offsets.get(i + 1).copied().unwrap_or(first + 1) - 1;
-                    let (sel_lo, sel_hi) = sel.rows();
-                    if !(sel_hi < first || sel_lo > last) {
+                let first = self.row_offsets[i];
+                let base = self.voice_style(tline.role, tline.dim);
+                // A selection crossing a rule line never paints it: what is
+                // highlighted is what will be copied.
+                let decorative = is_rule_line(&tline.text);
+                for (k, row_text) in wrap_rows(&tline.text, inner_w).into_iter().enumerate() {
+                    let mut style = base;
+                    let abs = first + k;
+                    if abs >= sel_lo && abs <= sel_hi && !decorative {
                         style = style.add_modifier(Modifier::REVERSED);
                     }
+                    chat_lines.push(Line::styled(row_text, style));
                 }
-                chat_lines.push(Line::styled(tline.text.as_str(), style));
-                let h = if i + 1 < self.row_offsets.len() {
-                    self.row_offsets[i + 1] - self.row_offsets[i]
-                } else {
-                    1
-                };
-                rows += h;
+                rows += self.row_offsets[i + 1] - first;
                 if rows >= inner_h.saturating_add(top_partial) {
                     break;
                 }
@@ -2727,11 +2827,14 @@ impl TuiApp {
 
         // 2. Identity bar (borderless): static identity when idle, spinner plus
         // live state while a turn runs. Sits just above the prompt so the
-        // loading indicator is in the user's line of sight.
-        f.render_widget(
-            Paragraph::new(self.top_line()).style(Style::default().fg(Color::Cyan)),
-            chunks[1],
-        );
+        // loading indicator is in the user's line of sight. While a toast is
+        // raised it speaks here instead — quiet notices say it once and go.
+        self.expire_notice();
+        let bar: Line<'_> = match &self.notice {
+            Some((msg, _)) => Line::styled(msg.clone(), Style::default().fg(Color::Green)),
+            None => Line::styled(self.top_line(), Style::default().fg(Color::Cyan)),
+        };
+        f.render_widget(Paragraph::new(bar), chunks[1]);
 
         // 3b. Staged attachments + the @ picker, between transcript and
         // input, so the user can see what they are about to send.
@@ -4420,22 +4523,24 @@ mod tests {
         assert!(g.width > 0, "render publishes the chat geometry");
 
         let d = crossterm::event::MouseButton::Left;
-        // Press on the first visible chat cell (inside the pane, not on
-        // its border).
+        // Press on the first PAINTED chat cell: short output is bottom-
+        // aligned, so the padding rows at the top of the pane hold no text
+        // (a press there pins to the top of the text).
+        let row0 = g.y + g.padding as u16;
         let down = crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(d),
-            column: g.x,
-            row: g.y,
+            column: g.x.saturating_add(2),
+            row: row0,
             modifiers: KeyModifiers::NONE,
         };
         app.on_mouse(down);
         let anchor = app.mouse_selection.clone().expect("press sets the anchor");
-        // Drag two rows deeper.
-        let row2 = g.y + 2;
+        // Drag to a deeper text row (the middle line wraps, so row0+2 is
+        // still its own text).
         let drag = crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Drag(d),
-            column: g.x,
-            row: row2,
+            column: g.x.saturating_add(12),
+            row: row0 + 2,
             modifiers: KeyModifiers::NONE,
         };
         app.on_mouse(drag);
@@ -4492,6 +4597,200 @@ mod tests {
             lines.len() <= 2,
             "no break invented inside the wrap: {text:?}"
         );
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_keeps_every_character() {
+        let rows = wrap_rows("alpha beta gamma", 6);
+        assert_eq!(
+            rows,
+            vec![
+                "alpha ".to_string(),
+                "beta ".to_string(),
+                "gamma".to_string()
+            ],
+            "words survive, the space trails the row it ends"
+        );
+        assert_eq!(
+            rows.concat(),
+            "alpha beta gamma",
+            "nothing is invented away"
+        );
+    }
+
+    #[test]
+    fn wrap_hard_breaks_a_word_longer_than_the_pane() {
+        assert_eq!(
+            wrap_rows("aaaaabbbbbccccc", 10),
+            vec!["aaaaabbbbb", "ccccc"]
+        );
+    }
+
+    #[test]
+    fn wrap_keeps_blank_and_short_lines_one_row() {
+        assert_eq!(wrap_rows("", 5), vec![String::new()]);
+        assert_eq!(wrap_rows("hi", 5), vec!["hi"]);
+    }
+
+    #[test]
+    fn highlight_lands_on_the_painted_row_the_pointer_pressed() {
+        let mut app = TuiApp::new();
+        // Word-wrapped material: the pane paints whatever wrap_rows produced,
+        // so painted rows and model rows can only agree while one wrap owns
+        // both. A divergence here is exactly the "selection lives below the
+        // pointer" bug.
+        app.log_line("approach backfield castled drumbeat".to_string());
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let g = app.chat_geometry;
+        // First press inside the blank bottom-alignment rows: it owns
+        // nothing at all.
+        app.on_mouse(mouse_at(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            g.x + 2,
+            g.y,
+        ));
+        assert!(
+            app.mouse_selection.is_none() && app.mouse_pending,
+            "blank press arms pending, not a selection"
+        );
+        // Then the pointer reaches the first text row: the selection
+        // anchors exactly there.
+        let row0 = g.y + g.padding as u16;
+        app.on_mouse(mouse_at(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            g.x + 2,
+            row0,
+        ));
+        app.on_mouse(mouse_at(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            g.x + 8,
+            row0 + 1,
+        ));
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let (sel_lo, sel_hi) = app.mouse_selection.as_ref().unwrap().rows();
+        let mut seen: Vec<u16> = Vec::new();
+        for (i, cell) in buf.content.iter().enumerate() {
+            if cell.style().add_modifier.contains(Modifier::REVERSED) {
+                let (_, y) = buf.pos_of(i);
+                let depth = (y - g.y) as usize;
+                let abs = g.off + depth.saturating_sub(g.padding);
+                assert!(
+                    (sel_lo..=sel_hi).contains(&abs),
+                    "reversed cell at pane row {} maps to abs {abs}, selection is {sel_lo}..={sel_hi}",
+                    depth
+                );
+                if !seen.contains(&y) {
+                    seen.push(y);
+                }
+            }
+        }
+        // Every crossed wrapped row that is visible paints highlighted, and
+        // nothing else does.
+        let now_line = self_driftless(&app);
+        assert_eq!(
+            seen.len(),
+            (sel_hi - sel_lo + 1).min(g.height as usize),
+            "painted rows {seen:?} vs selection {sel_lo}..={sel_hi} of line {now_line}"
+        );
+    }
+
+    #[test]
+    fn a_copied_selection_skips_the_decorative_rules() {
+        let mut app = TuiApp::new();
+        app.log_line("line one".to_string());
+        app.log_dim("────────────────────────────────────────".to_string());
+        app.log_line("line three".to_string());
+        let _ = rendered(&mut app, 60, 10);
+        let g = app.chat_geometry;
+        let sel = MouseSelection {
+            anchor: (g.off, 0),
+            head: (g.off + 3, 4),
+        };
+        let text = app.selection_text(&sel);
+        assert_eq!(
+            text, "line one\nline three",
+            "the rule line is window dressing, not content: {text:?}"
+        );
+    }
+
+    #[test]
+    fn selection_never_paints_a_rule_line_reversed() {
+        let mut app = TuiApp::new();
+        app.log_line("before the rule".to_string());
+        app.log_dim("────────────────────────────────────────".to_string());
+        app.log_line("after the rule".to_string());
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let g = app.chat_geometry;
+        let row0 = g.y + g.padding as u16;
+        app.on_mouse(mouse_at(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            g.x + 1,
+            row0,
+        ));
+        app.on_mouse(mouse_at(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            g.x + 9,
+            row0 + 2,
+        ));
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let rule_abs = app.row_offsets[1];
+        for (i, cell) in buf.content.iter().enumerate() {
+            if cell.style().add_modifier.contains(Modifier::REVERSED) {
+                let (_, y) = buf.pos_of(i);
+                let depth = (y as usize).saturating_sub(g.y as usize);
+                let abs = g.off + depth.saturating_sub(g.padding);
+                assert_ne!(
+                    abs, rule_abs,
+                    "the separator (abs row {rule_abs}) must not highlight as content"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_copied_toast_replaces_the_bar_then_expires() {
+        let mut app = TuiApp::new();
+        app.log_line("first".to_string());
+        app.log_line("second line to copy".to_string());
+        let _ = rendered(&mut app, 50, 10);
+        let g = app.chat_geometry;
+        let row0 = g.y + g.padding as u16;
+        let d = crossterm::event::MouseButton::Left;
+        app.on_mouse(mouse_at(MouseEventKind::Down(d), g.x + 1, row0));
+        app.on_mouse(mouse_at(MouseEventKind::Drag(d), g.x + 9, row0 + 1));
+        app.on_mouse(mouse_at(MouseEventKind::Up(d), g.x + 9, row0 + 1));
+        assert!(app.mouse_selection.is_some(), "release keeps the highlight");
+        assert!(app.notice.is_some(), "the notice is raised");
+        // The bar shows the toast...
+        let pane = rendered(&mut app, 50, 10);
+        assert!(pane.contains("→ copied"), "toast visible: {pane:?}");
+        // ...the transcript did not gain a row for it...
+        assert!(
+            !app.transcript_text().contains("→ copied"),
+            "no permanent copied line"
+        );
+        // ...and once the TTL passes the identity bar returns.
+        if let Some((_, at)) = app.notice.as_mut() {
+            *at -= std::time::Duration::from_secs(10);
+        }
+        let pane = rendered(&mut app, 50, 10);
+        assert!(pane.contains("Turya v"), "identity restored: {pane:?}");
+        assert!(app.notice.is_none(), "expired notice cleared");
+    }
+
+    // Small helper so the assertion above can name the line it checks.
+    fn self_driftless(app: &TuiApp) -> &str {
+        if app.transcript.is_empty() {
+            ""
+        } else {
+            &app.transcript[0].text
+        }
     }
 
     #[test]
@@ -4671,6 +4970,15 @@ mod tests {
             kind,
             column: 0,
             row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
             modifiers: KeyModifiers::NONE,
         }
     }

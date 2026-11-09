@@ -58,6 +58,11 @@ pub(crate) struct ChatGeometry {
     pub(crate) height: u16,
     /// Absolute wrapped row shown at the top of the pane.
     pub(crate) off: usize,
+    /// Blank rows painted ABOVE the text while short output is bottom-
+    /// aligned. Screen rows before the padding hold no text, and without
+    /// this count a press there would map below the pointer exactly like
+    /// the row-model drift bug of v0.1.9.
+    pub(crate) padding: usize,
 }
 
 impl ChatGeometry {
@@ -69,6 +74,7 @@ impl ChatGeometry {
         width: 0,
         height: 0,
         off: 0,
+        padding: 0,
     };
 }
 
