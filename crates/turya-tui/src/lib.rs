@@ -14,7 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
-use std::io::stdout;
+use std::io::{stdout, Write};
 use tokio::sync::mpsc;
 use turya_protocol::{
     AgentMode, Attachment, Part, PermissionDecision, PermissionMode, RiskLevel, Transcript,
@@ -29,11 +29,15 @@ mod scroll;
 
 mod input;
 
+mod selection;
+
 mod theme;
 
 use flows::{AuthFlow, AuthStage, BrowserFlow, BrowserMode, Flow};
 use input::{drain_batch, Squashed, WHEEL_LINES};
 use scroll::Viewport;
+use selection::ChatGeometry;
+use selection::MouseSelection;
 use slash::{Completer, SlashRegistry};
 use theme::{Palette, Theme, Voice};
 
@@ -473,6 +477,15 @@ pub struct TuiApp {
     spin_tick: u64,
     /// Transcript viewport: follow mode, anchored row, and content height.
     viewport: Viewport,
+    /// In-progress mouse selection over the transcript, in absolute
+    /// wrapped-row coordinates. `None` = nothing selected.
+    mouse_selection: Option<MouseSelection>,
+    /// Clipboard payload waiting for the loop's pass (OSC 52 must be
+    /// written by whoever owns the terminal backend; `on_mouse` does not).
+    clipboard_out: Option<String>,
+    /// Where the chat pane placed its cells the last frame: the one mapping
+    /// mouse screen coordinates are meaningful through.
+    chat_geometry: ChatGeometry,
     /// Wrapped-row start offsets for each transcript line, cached by width.
     row_offsets: Vec<usize>,
     /// Width the cached row offsets were computed for.
@@ -538,6 +551,9 @@ impl TuiApp {
             turn_active: false,
             spin_tick: 0,
             viewport: Viewport::new(),
+            mouse_selection: None,
+            clipboard_out: None,
+            chat_geometry: ChatGeometry::EMPTY,
             row_offsets: Vec::new(),
             row_offsets_width: 0,
             row_offsets_dirty_from: Some(0),
@@ -1017,16 +1033,134 @@ impl TuiApp {
         }
     }
 
-    /// Mouse input. Only the wheel is consumed: clicks would steal the
-    /// terminal's own text selection, which is the one thing a user cannot
-    /// get back.
+    /// Mouse input: the wheel scrolls, and a click-drag-release inside the
+    /// chat pane establishes a selection. Because the captured protocol
+    /// bundles wheel and button events, turya builds the selection itself
+    /// (see `selection.rs`) instead of leaving clicks to the terminal.
     fn on_mouse(&mut self, mouse: MouseEvent) {
-        let delta = match mouse.kind {
-            MouseEventKind::ScrollUp => -(WHEEL_LINES as i32),
-            MouseEventKind::ScrollDown => WHEEL_LINES as i32,
-            _ => return,
-        };
-        self.on_wheel_delta(delta);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.on_wheel_delta(-(WHEEL_LINES as i32)),
+            MouseEventKind::ScrollDown => self.on_wheel_delta(WHEEL_LINES as i32),
+            // Press sets the anchor; popups keep owning clicks, never the
+            // transcript behind them.
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                match self.chat_cell(mouse.column, mouse.row) {
+                    Some(cell) => self.mouse_selection = Some(MouseSelection::from(cell)),
+                    None => self.mouse_selection = None,
+                }
+            }
+            // Drag moves the head.
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                let cell = self.chat_cell(mouse.column, mouse.row);
+                if let (Some(sel), Some(cell)) = (self.mouse_selection.as_mut(), cell) {
+                    sel.head = cell;
+                }
+            }
+            // Release finalises: copy the covered text through the loop's
+            // OSC 52 pass. A zero-width drag (a plain click) clears instead.
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                let Some(sel) = &self.mouse_selection else {
+                    return;
+                };
+                if sel.anchor == sel.head {
+                    self.mouse_selection = None;
+                    return;
+                }
+                let text = self.selection_text(sel);
+                if !text.is_empty() {
+                    let n = text.chars().count();
+                    self.clipboard_out = Some(selection::osc52(&text));
+                    self.log_dim(format!("→ copied {n} chars to the clipboard"));
+                }
+            }
+            // The rest stays inert: the terminal's own selection machinery
+            // would claim these if it were not being read from.
+            _ => {}
+        }
+    }
+
+    /// Map a mouse screen position to transcript coordinates: absolute
+    /// wrapped row + column inside the pane. `None` when the point is not
+    /// over chat cells, a popup owns the area, or nothing is rendered yet.
+    fn chat_cell(&self, column: u16, row: u16) -> Option<(usize, usize)> {
+        if !matches!(self.flow, Flow::None) || self.at_completer.is_some() {
+            return None;
+        }
+        if self.transcript.is_empty() {
+            return None;
+        }
+        let g = &self.chat_geometry;
+        if g.width == 0 || g.height == 0 {
+            return None;
+        }
+        if row < g.y || row >= g.y.saturating_add(g.height) {
+            return None;
+        }
+        if column < g.x || column >= g.x.saturating_add(g.width) {
+            return None;
+        }
+        let total = self.row_offsets.last().copied().unwrap_or(0).max(1);
+        let abs = (g.off + (row - g.y) as usize).min(total.saturating_sub(1));
+        Some((abs, (column - g.x) as usize))
+    }
+
+    /// The exact text a selection covers: full crossed lines, character
+    /// columns honoured at the two ends, no fabricated breaks inside a
+    /// line's wrapped rows. Layout mirrors the row-offset model, so what
+    /// is copied is what was highlighted.
+    fn selection_text(&self, sel: &MouseSelection) -> String {
+        let (lo, hi) = sel.rows();
+        let ((start_row, start_col), (end_row, end_col)) = sel.ordered();
+        let w = self.row_offsets_width.max(1);
+        let total = self.row_offsets.last().copied().unwrap_or(0).max(1);
+        let hi = hi.min(total.saturating_sub(1));
+        let mut out = String::new();
+
+        let line_lo = self
+            .row_offsets
+            .partition_point(|&o| o <= lo)
+            .saturating_sub(1);
+        let line_hi = self
+            .row_offsets
+            .partition_point(|&o| o <= hi)
+            .saturating_sub(1)
+            .min(self.transcript.len().saturating_sub(1));
+
+        for i in line_lo..=line_hi {
+            let chars: Vec<char> = self.transcript[i].text.chars().collect();
+            let mut rows: Vec<String> = chars.chunks(w).map(|c| c.iter().collect()).collect();
+            if rows.is_empty() {
+                rows.push(String::new());
+            }
+            let line_end = self.row_offsets[i + 1];
+            for (k, row_text) in rows.iter().enumerate() {
+                let abs = self.row_offsets[i] + k;
+                if abs < lo || abs > hi {
+                    continue;
+                }
+                let from = if abs == start_row { start_col } else { 0 };
+                let to = if abs == end_row {
+                    (end_col + 1).min(row_text.chars().count())
+                } else {
+                    usize::MAX
+                };
+                let piece: String = row_text
+                    .chars()
+                    .enumerate()
+                    .skip_while(|(c, _)| *c < from)
+                    .take_while(|(c, _)| *c < to)
+                    .map(|(_, ch)| ch)
+                    .collect();
+                out.push_str(&piece);
+                // A newline marks the end of a LOGICAL line, never a
+                // wrapped continuation: highlight lives in model rows,
+                // the copy holds to the real text layout.
+                if abs + 1 == line_end && abs < hi {
+                    out.push('\n');
+                }
+            }
+        }
+        out
     }
 
     /// Move the view by a wheel run: a squashed drag is one call with a
@@ -2520,6 +2654,15 @@ impl TuiApp {
         let total = self.row_offsets.last().copied().unwrap_or(0).max(1);
         let max_off = total.saturating_sub(inner_h);
         let off = self.viewport.update(max_off);
+        // Publish where the visible rows live this frame: mouse events map
+        // through nothing else.
+        self.chat_geometry = ChatGeometry {
+            x: chunks[0].x.saturating_add(1),
+            y: chunks[0].y.saturating_add(1),
+            width: chunks[0].width.saturating_sub(2),
+            height: chunks[0].height.saturating_sub(2),
+            off,
+        };
         // Bottom-align short output so it sits just above the prompt box
         // instead of floating at the top of a tall pane. Only while following.
         let padding = if self.viewport.is_following() && off == 0 && total < inner_h {
@@ -2543,7 +2686,17 @@ impl TuiApp {
             let mut rows = 0usize;
             for i in start..self.transcript.len() {
                 let tline = &self.transcript[i];
-                let style = self.voice_style(tline.role, tline.dim);
+                let mut style = self.voice_style(tline.role, tline.dim);
+                // Selection highlight, whole lines: the copy path is exact
+                // in rows and columns, the paint marks what was crossed.
+                if let Some(sel) = &self.mouse_selection {
+                    let first = self.row_offsets[i];
+                    let last = self.row_offsets.get(i + 1).copied().unwrap_or(first + 1) - 1;
+                    let (sel_lo, sel_hi) = sel.rows();
+                    if !(sel_hi < first || sel_lo > last) {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                }
                 chat_lines.push(Line::styled(tline.text.as_str(), style));
                 let h = if i + 1 < self.row_offsets.len() {
                     self.row_offsets[i + 1] - self.row_offsets[i]
@@ -2797,6 +2950,16 @@ impl TuiApp {
                 captured = want;
             }
 
+            // Copy requests land here, where the backend handle lives:
+            // OSC 52 asks the terminal to store the payload in its own
+            // clipboard; unsupported terminals silently ignore it.
+            if let Some(b64) = self.clipboard_out.take() {
+                let backend = terminal.backend_mut();
+                if write!(backend, "{b64}").is_ok() {
+                    let _ = backend.flush();
+                }
+            }
+
             // One frame per batch of work, never per event: the draw after
             // the select is the loop's only paint.
             terminal.draw(|f| {
@@ -2852,6 +3015,7 @@ impl TuiApp {
         // Esc never quits: it unwinds UI state, then stops the running
         // turn. Permission modals must be answered.
         if key.code == KeyCode::Esc {
+            self.mouse_selection = None;
             match self.esc_action() {
                 EscAction::CloseCompleter => {
                     self.completer = None;
@@ -4242,6 +4406,113 @@ mod tests {
         assert_eq!(app.viewport.lines_up(), 0);
     }
 
+    #[test]
+    fn selection_lifecycle_press_drag_release_copies_the_marked_text() {
+        let mut app = TuiApp::new();
+        app.log_line("first".to_string());
+        app.log_line(
+            "a middle line long enough to wrap around more than a single row at this narrow width"
+                .to_string(),
+        );
+        app.log_line("third".to_string());
+        let _ = rendered(&mut app, 50, 14);
+        let g = app.chat_geometry;
+        assert!(g.width > 0, "render publishes the chat geometry");
+
+        let d = crossterm::event::MouseButton::Left;
+        // Press on the first visible chat cell (inside the pane, not on
+        // its border).
+        let down = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(d),
+            column: g.x,
+            row: g.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(down);
+        let anchor = app.mouse_selection.clone().expect("press sets the anchor");
+        // Drag two rows deeper.
+        let row2 = g.y + 2;
+        let drag = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(d),
+            column: g.x,
+            row: row2,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(drag);
+        let sel = app.mouse_selection.clone().expect("drag moves the head");
+        assert_ne!(sel.head, anchor.head, "the head followed the drag");
+        // Release: the copy is queued for the loop's OSC 52 pass and the
+        // highlight persists.
+        app.on_mouse(mouse(crossterm::event::MouseEventKind::Up(d)));
+        let text = app.selection_text(
+            app.mouse_selection
+                .as_ref()
+                .expect("release keeps the highlight"),
+        );
+        assert!(!text.is_empty());
+        assert!(app.clipboard_out.is_some(), "OSC 52 payload queued");
+
+        // The exact characters: from the start of the first selected row
+        // through to the end of the last crossed row's column.
+        let transcript = app.transcript_text();
+        let sought: &str = text.strip_suffix('\n').unwrap_or(&text);
+        assert!(
+            transcript.contains(sought),
+            "copied text comes from the transcript: {sought:?}"
+        );
+
+        // A second plain click clears the selection instead of copying.
+        app.clipboard_out = None;
+        app.on_mouse(mouse(crossterm::event::MouseEventKind::Down(d)));
+        assert!(app.mouse_selection.is_none(), "plain click clears");
+    }
+
+    #[test]
+    fn selection_text_joins_wrapped_rows_without_fabricated_breaks() {
+        // One long logical line wrapped across rows must copy as ONE line:
+        // no newline may be invented between its wrapped rows.
+        let mut app = TuiApp::new();
+        app.log_line("aaaa bbbb cccc dddd eeee ffff gggg hhhh".to_string());
+        app.log_line("next".to_string());
+        let _ = rendered(&mut app, 30, 8);
+        let g = app.chat_geometry;
+        // Select rows 0..=2 of the pane (the logical line wraps to 2 rows,
+        // row 2 is the next line's first row).
+        let sel = MouseSelection {
+            anchor: (g.off, 0),
+            head: (g.off + 2, 3),
+        };
+        let text = app.selection_text(&sel);
+        assert!(
+            text.contains("aaaa bbbb cccc dddd eeee ffff gggg hhhh"),
+            "wrapped rows joined, got {text:?}"
+        );
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert!(
+            lines.len() <= 2,
+            "no break invented inside the wrap: {text:?}"
+        );
+    }
+
+    #[test]
+    fn clicks_and_selections_outside_the_chat_pane_do_nothing() {
+        let mut app = TuiApp::new();
+        app.log_line("some text".to_string());
+        let _ = rendered(&mut app, 60, 12);
+        let d = crossterm::event::MouseButton::Left;
+        // A click over the border column, or below the pane, maps nowhere.
+        assert!(
+            app.chat_cell(0, app.chat_geometry.y).is_none(),
+            "border column"
+        );
+        assert!(
+            app.chat_cell(app.chat_geometry.x, 0).is_none(),
+            "top border row"
+        );
+        // No popup state means coordinates map; but with no render yet, nothing.
+        assert!(TuiApp::new().chat_cell(5, 5).is_none(), "never rendered");
+        let _ = d;
+    }
     #[test]
     fn a_squashed_drag_is_one_move_and_the_key_still_lands() {
         // The end-to-end shape of the batched loop: twenty wheel notches of

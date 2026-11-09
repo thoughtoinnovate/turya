@@ -1,6 +1,6 @@
 [package]
 name = "turya-tui"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 
 [dependencies]
@@ -13,3 +13,4 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tui-markdown = { version = "0.3", default-features = false }
+base64 = "0.22"

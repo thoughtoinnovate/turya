@@ -144,7 +144,8 @@ rather than for agentic work.
 | `@` | Pick a file to attach to the next prompt |
 | `PageUp` / `PageDown` | Scroll the transcript |
 | Mouse wheel | Scroll, when the terminal supports capture (`/settings mouse`) |
-| `Shift` + mouse select | Copy text, where the terminal honours it (Windows Terminal: `Ctrl+Shift`). `/settings mouse off` frees the mouse for native select & copy at any time — no restart needed |
+| Click-drag in the chat | Select text in the transcript — outlined while selected, copied to the system clipboard when you release (OSC 52; kitty, iTerm2, Windows Terminal, foot...). A plain click clears it. `Esc` also clears |
+| `Shift` + mouse select | Terminal-native selection still works where the terminal honours it (Windows Terminal: `Ctrl+Shift`), and `/settings mouse off` frees the mouse entirely — no restart needed |
 | Top bar / input box | While a turn runs: `⠋ working · provider/model`; the input box title becomes `⠋ working (Esc stop)` |
 | `Ctrl+E` | Show the full output of the last truncated tool call |
 | `Esc` | Close a popup, then stop the running turn. Never quits. |
